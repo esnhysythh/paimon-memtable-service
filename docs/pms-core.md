@@ -63,28 +63,48 @@ class WALManagerImpl implements WALManager {
 
 ### 3.1 MemTableEngine
 
-管理内存中的数据缓冲，基于 SkipList 实现。
+管理内存中的数据缓冲，基于 SkipList 实现。接口拆分为 `CurMemTable`（可写）和 `ImmutableMemTable`（只读 + 引用计数），由 `CurMemTable.freeze()` 产生 `ImmutableMemTable`。
 
-**接口**：
+**CurMemTable 接口**：
 
 ```java
-interface IMemTable {
-    void put(byte[] schemaId, byte[] key, byte[] value);
-    byte[] get(byte[] key);
-    void freeze();           // 冻结为 immutable
-    long estimatedSize();    // 估算当前内存占用
-    int entryCount();        // 当前条目数
+interface CurMemTable {
+    void put(Key key, Value value);
+    void delete(Key key);
+    Value get(Key key);
+    ImmutableMemTable freeze();  // 冻结为 immutable，返回只读实例
+    long estimatedSize();
+    int entryCount();
+    Iterator<Entry> iterator();
+}
+```
+
+- schemaId 校验由上层 BucketDirector 处理，不在此接口传递。
+- Key 使用无符号字节比较（与 Paimon 主键序一致），参见 [paimon-primary-key-encoding.md](../../references/paimon-primary-key-encoding.md)。
+
+**ImmutableMemTable 接口**：
+
+```java
+interface ImmutableMemTable {
+    Value get(Key key);
+    Iterator<Entry> iterator();
+    long estimatedSize();
+    int entryCount();
+    void incrementRef();
+    void decrementRef();
+    long refCount();
 }
 ```
 
 **实现**：
 
-- **CurMemTable**：当前活跃的可写 MemTable。
-  - 底层 `ConcurrentSkipListMap<ByteBuffer, byte[]>`，线程安全。
+- **SkipListCurMemTable**：当前活跃的可写 MemTable。
+  - 底层 `ConcurrentSkipListMap<Key, Value>`，线程安全。
   - 写入前检查容量：`entryCount() < config.memtableMaxEntries()` 且 `estimatedSize() < config.memtableMaxSizeMb() * 1024 * 1024`。
+  - `freeze()` 原子替换内部 Map 引用，返回持有旧 Map 的 `SkipListImmutableMemTable`。
 
-- **ImmutableMemTable**：冻结后的只读 MemTable。
-  - 构造时接收 `CurMemTable` 的内部 SkipList 引用（浅拷贝，零开销）。
+- **SkipListImmutableMemTable**：冻结后的只读 MemTable。
+  - 构造时接收 `SkipListCurMemTable` 的内部 SkipList 引用（浅拷贝，零开销）。
   - 维护 `AtomicLong refCount`，查询进入时 `incrementRef()`，离开时 `decrementRef()`。
   - `refCount` 归零后可安全退役（释放内存）。
 

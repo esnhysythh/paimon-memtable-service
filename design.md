@@ -82,3 +82,4 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 | [pms-client.md](docs/pms-client.md) | 客户端 SDK |
 | [flink-connector-pms.md](docs/flink-connector-pms.md) | Flink Connector |
 | [pms-testing.md](docs/pms-testing.md) | 测试策略 |
+| [paimon-primary-key-encoding.md](references/paimon-primary-key-encoding.md) | Paimon 主键序列化与排序语义参考 |
