@@ -24,6 +24,7 @@ record PMSConfig(
     // ── WAL ──
     String walDir,                   // WAL 目录（V1 单盘）
     int walFileSizeMb,               // WAL 文件滚动大小，默认 256
+    boolean walUseMmap,              // 是否使用 MMap 写入（默认 false，FileChannel 更安全跨平台）
 
     // ── 本地存储 ──
     long storageSinkedMaxSizeMb,     // sinkedSST 总大小上限，默认 10240
@@ -61,6 +62,8 @@ class WALManagerImpl implements WALManager {
 
 ## 3. 核心组件与接口定义
 
+**数据语义约束**：PMS 内部和 Sink 到 Paimon 的数据处理均遵循 Paimon Deduplicate Merge Engine 规则——同一主键只保留最新记录，最新记录为 DELETE 则删除全部同主键记录。不允许其他 Merge Engine。这保证了 PMS 内部数据处理和查询的简单性：同一 Key 取最新值即可，归并时最新 Key 胜出，无需特殊合并函数。
+
 ### 3.1 MemTableEngine
 
 管理内存中的数据缓冲，基于 SkipList 实现。接口拆分为 `CurMemTable`（可写）和 `ImmutableMemTable`（只读 + 引用计数），由 `CurMemTable.freeze()` 产生 `ImmutableMemTable`。
@@ -79,7 +82,7 @@ interface CurMemTable {
 }
 ```
 
-- schemaId 校验由上层 BucketDirector 处理，不在此接口传递。
+- Schema 校验由上层处理，不在此接口传递。V1 中 PMS 绑定单表，Schema 不变（变更即 Fatal Error）。
 - Key 使用无符号字节比较（与 Paimon 主键序一致），参见 [paimon-primary-key-encoding.md](../../references/paimon-primary-key-encoding.md)。
 
 **ImmutableMemTable 接口**：
@@ -170,45 +173,75 @@ interface LocalStorageManager {
 
 ### 3.3 WALManager
 
-V1 采用单盘 WAL，保证数据持久性和崩溃恢复能力。
+V1 采用单盘 WAL，保证数据持久性和崩溃恢复能力。底层 I/O 和记录分片采用 LevelDB WAL 格式（32KB Block 对齐、CRC32C 逐 chunk 校验、FULL/FIRST/MIDDLE/LAST 分片重组），PMS 在其 payload 内定义应用层记录类型。
 
 > **后续演进**：双盘 WAL（主盘 + 备盘同步写、互恢复）作为后续演进方向。双盘写入时主盘写成功即视为写入成功，备盘失败仅记录告警不阻塞写入；`SINK_SUCCESS` 记录需双盘都写成功。
 
-**记录类型**：
+**为什么数据记录和控制记录必须在同一个 WAL 流中**：
+
+WAL 中存在两类性质不同的记录——数据记录（DATA）和控制记录（SINK_PREPARE / SINK_SUCCESS）。它们必须在同一个有序流中，原因：
+1. **时序依赖**：SINK_PREPARE 必须在被 sink 的数据之后、新写入数据之前，恢复时才能判断哪些数据已进入 Sink 流程。
+2. **截断判定**：SINK_SUCCESS(snapshotId=N) 意味着"此之前的所有 DATA 都已安全提交到 Paimon"，截断旧 WAL 以此为界。这要求 data 和 control 在同一时序流中才能成立。
+3. 若分为两个文件，崩溃后可能数据文件已写但控制文件未写，时序信息丢失，无法正确恢复。
+
+**应用层记录类型**：
 
 | 类型 | 值 | 说明 |
 |------|---|------|
-| DATA_RECORD | 0x01 | 写入的数据（schemaId + key + value） |
-| SINK_START | 0x02 | 标记 Sink 流程开始 |
-| SINK_PREPARE | 0x03 | Paimon 返回的 CommitMessage 字节流 |
-| SINK_SUCCESS | 0x04 | 成功提交的 Snapshot ID + 关联元信息 |
+| DATA | 0x00 | 数据记录（Upsert 或 Delete），由 valueLen 区分 |
+| SINK_PREPARE | 0x01 | Paimon 返回的 CommitMessage 字节流 |
+| SINK_SUCCESS | 0x02 | 成功提交的 Snapshot ID |
 
-**WAL 记录格式**：
+说明：
+- DATA 记录中，Upsert 与 Delete 不占独立类型，通过 `valueLen >= 0` 表示 Upsert，`valueLen = -1` 表示 Delete。这与 Paimon Deduplicate Merge Engine 语义一致（后写覆盖，最新为 DELETE 则删除全部同主键记录）。
+- 不再需要 SINK_START：SINK_PREPARE 的存在本身已说明有 Sink 在进行中，SINK_START 不提供额外信息。
+- 不再需要 schemaId：V1 中 PMS 绑定单表、Schema 不变（变更即 Fatal Error），每条记录重复写 schemaId 是浪费。Schema 校验在启动恢复时做一次即可。
+
+**WAL 记录格式（双层结构）**：
 
 ```
-┌──────────┬──────────┬────────────┬──────────┬──────────┐
-│ RecordType│ Length   │ Payload    │ CRC32    │ Magic    │
-│ (1 byte) │ (4 byte) │ (N bytes)  │ (4 byte) │ (2 byte) │
-└──────────┴──────────┴────────────┴──────────┴──────────┘
+LevelDB 传输层（由 LogWriter/LogReader 处理）：
+┌──────────┬──────────┬──────────┬─────────────┐
+│ CRC32C   │ Length   │ ChunkType│ Payload     │
+│ (4 byte) │ (2 byte) │ (1 byte) │ (N bytes)   │
+└──────────┴──────────┴──────────┴─────────────┘
+Block = 32KB，Header = 7 bytes
+ChunkType: FULL(1) / FIRST(2) / MIDDLE(3) / LAST(4)
+CRC32C = masked CRC32C(ChunkType + Payload)
 ```
 
-| 字段 | 大小 | 说明 |
-|------|------|------|
-| RecordType | 1 byte | 记录类型 |
-| Length | 4 byte | Payload 长度 |
-| Payload | N bytes | 记录内容 |
-| CRC32 | 4 byte | 覆盖 `RecordType + Length + Payload` 的 CRC32 校验和 |
-| Magic | 2 byte | 固定值 `0xPM`（0x504D），用于检测写入截断 |
+```
+PMS 应用层 Payload（由 WALManager 序列化/反序列化）：
+
+DATA (type=0x00):
+┌──────────┬──────────┬──────────┬────────────┬──────────┬──────────┐
+│ type     │ keyLen   │ key      │ valueLen   │ value    │          │
+│ (1 byte) │ (4 byte) │ (N byte) │ (4 byte)   │ (M byte) │          │
+└──────────┴──────────┴──────────┴────────────┴──────────┘──────────┘
+  valueLen >= 0 → Upsert（value 为实际值）
+  valueLen = -1 → Delete（无 value 字段）
+
+SINK_PREPARE (type=0x01):
+┌──────────┬────────────────────┬───────────────────┐
+│ type     │ msgLen             │ commitMessage     │
+│ (1 byte) │ (4 byte)           │ (N byte)          │
+└──────────┴────────────────────┴───────────────────┘
+
+SINK_SUCCESS (type=0x02):
+┌──────────┬────────────────────┐
+│ type     │ snapshotId         │
+│ (1 byte) │ (8 byte)           │
+└──────────┴────────────────────┘
+```
 
 **接口**：
 
 ```java
 interface WALManager {
-    // 写入数据记录
-    void appendDataRecord(byte[] schemaId, byte[] key, byte[] value);
+    // 写入数据记录（Upsert: valueLen >= 0; Delete: value 为 null）
+    void appendDataRecord(byte[] key, byte[] value);
 
-    // 写入状态机记录
-    void appendSinkStart();
+    // 写入控制记录
     void appendSinkPrepare(byte[] commitMessage);
     void appendSinkSuccess(long snapshotId);
 
@@ -223,8 +256,7 @@ interface WALManager {
 }
 
 interface ReplayCallback {
-    void onDataRecord(byte[] schemaId, byte[] key, byte[] value);
-    void onSinkStart();
+    void onDataRecord(byte[] key, byte[] value);
     void onSinkPrepare(byte[] commitMessage);
     void onSinkSuccess(long snapshotId);
 }
@@ -240,8 +272,8 @@ interface ReplayCallback {
 - 截断触发：由 `BackgroundTaskScheduler` 定期执行（默认每 5 分钟），也可在 WAL 配额使用率超过 80% 时立即触发。
 
 **WAL 恢复时校验**：
-- 读取每条记录时校验 CRC32 和 Magic。
-- 尾部记录校验失败 → 可能是崩溃时的 partial write → 截断该记录，之前的记录视为安全。
+- 传输层：由 LevelDB LogReader 逐 chunk 校验 CRC32C。尾部不完整 chunk 自动截断，中间 chunk 校验失败报告损坏。
+- 应用层：解析 PMS Payload 时校验 type 合法性、keyLen/valueLen 范围。
 - 中间记录校验失败 → 磁盘损坏 → 报错，人工介入（V1 单盘无法从备盘恢复）。
 
 ### 3.4 PaimonSinkManager
@@ -434,10 +466,10 @@ RecoveryManager 启动
    ┌───────────────────────────────────────────────────────┐
    │ paimonSnapshotId > walSnapshotId                      │
    │ → 不应发生（PMS 独占写入），报警，以 Paimon 为准      │
-   │ → WAL 中 snapshotId 之后的 DATA_RECORD 重放           │
+   │ → WAL 中 snapshotId 之后的 DATA 记录重放              │
    ├───────────────────────────────────────────────────────┤
    │ paimonSnapshotId == walSnapshotId                     │
-   │ → 正常，重放 snapshotId 之后的 DATA_RECORD            │
+   │ → 正常，重放 snapshotId 之后的 DATA 记录              │
    ├───────────────────────────────────────────────────────┤
    │ paimonSnapshotId < walSnapshotId                      │
    │ → 异常，WAL 记录了 Paimon 没有的 Snapshot             │
@@ -453,13 +485,14 @@ RecoveryManager 启动
    │   └─ 不存在 → 从本地 SST 重新生成 preSink，重试全流程  │
    ├───────────────────────────────────────────────────────┤
    │ 无 SINK_PREPARE                                       │
-   │ → 仅重放 DATA_RECORD 恢复 MemTable                    │
+   │ → 仅重放 DATA 记录恢复 MemTable                       │
    └───────────────────────────────────────────────────────┘
         │
         ▼
-5. 重放 DATA_RECORD，恢复 curMemTable
+5. 重放 DATA 记录，恢复 curMemTable
    - 根据 WAL 截断点，只重放 snapshotId 之后的记录
-   - 重放过程中校验每条记录的 CRC32
+   - 传输层由 LevelDB LogReader 逐 chunk 校验 CRC32C
+   - 应用层解析 PMS Payload 时校验 type 合法性
         │
         ▼
 6. 恢复完毕，启动 RPC 和后台任务

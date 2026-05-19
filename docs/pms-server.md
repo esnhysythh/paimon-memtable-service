@@ -13,7 +13,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 
 | 服务 | 请求 | 响应 | 调用核心接口 |
 |------|------|------|-------------|
-| `write` | `WriteRequest(schemaId, key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
+| `write` | `WriteRequest(key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
 | `get` | `GetRequest(key)` | `GetResponse(status, value?)` | `PMSBucketDirector.get()` |
 
 **写入响应状态**：
@@ -22,7 +22,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 |--------|------|------------|
 | `OK` | 写入成功 | 继续写入 |
 | `SERVICE_OVERLOADED` | 系统过载，写入被拒绝 | 反压重试 |
-| `SCHEMA_MISMATCH` | SchemaId 不一致 | 触发 Schema Reload |
+| `SCHEMA_MISMATCH` | Schema 不一致（V1 中视为 Fatal Error） | 停止写入 |
 | `SHUTTING_DOWN` | 服务正在停机 | 切换到其他节点 |
 
 **流控集成**：RPC 层的写入入口处调用 `WriteAdmissionController.evaluate()`，若返回 OVERLOADED 则响应 `SERVICE_OVERLOADED`。详见 [pms-core.md](pms-core.md) § 4。

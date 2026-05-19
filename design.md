@@ -3,7 +3,7 @@
 ## 1. 项目定位
 PMS 是一个独立于计算引擎的单机存储服务，作为 Apache Paimon 数据湖的加速层。
 - **核心价值**：提供实时（毫秒级）的数据新鲜度点查能力；作为高性能缓冲池，吸收高并发写入，降低对 Paimon 底层存储的 IO 压力与 Snapshot 膨胀。
-- **设计原则**：PMS 是绑定单一 Paimon 表的专用服务；PMS 是该 Paimon 表的**唯一写入者**，独占 Snapshot 生成权；不影响 Paimon 原有的 AP 分析能力。
+- **设计原则**：PMS 是绑定单一 Paimon 表的专用服务；PMS 是该 Paimon 表的**唯一写入者**，独占 Snapshot 生成权；不影响 Paimon 原有的 AP 分析能力；PMS 内部和 Sink 到 Paimon 的数据处理均遵循 Paimon Deduplicate Merge Engine 规则（同一主键只保留最新记录，最新记录为 DELETE 则删除全部同主键记录），不允许其他 Merge Engine，这保证了 PMS 内部数据处理和查询的简单性。
 - **V1 边界**：PMS 绑定的 Paimon 表 Schema 不变，Schema 变更不在 V1 预期范围内。若运行时检测到 Schema 变更，PMS 将报 Fatal Error 并停止运行。后续版本再考虑 Schema 变更的应对策略。
 
 ## 2. 核心架构：双层 LSM 模型
