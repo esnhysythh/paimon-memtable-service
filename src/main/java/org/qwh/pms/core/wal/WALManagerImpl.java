@@ -149,8 +149,7 @@ public class WALManagerImpl implements WALManager {
             try (FileInputStream fis = new FileInputStream(info.file);
                  FileChannel channel = fis.getChannel()) {
 
-                // Skip file header (12 bytes: magic(4) + maxSnapshotId(8))
-                if (channel.size() < 12) {
+                if (channel.size() == 0) {
                     continue;
                 }
 
@@ -158,8 +157,14 @@ public class WALManagerImpl implements WALManager {
                         channel,
                         LogMonitors.logMonitor(),
                         true,  // verify checksums
-                        12     // skip header
+                        0      // start from beginning
                 );
+
+                // First record is the file header — skip it
+                Slice headerRecord = reader.readRecord();
+                if (headerRecord == null || headerRecord.length() < 4) {
+                    continue;
+                }
 
                 Slice record;
                 while ((record = reader.readRecord()) != null) {
@@ -287,21 +292,23 @@ public class WALManagerImpl implements WALManager {
         currentWriter = Logs.createLogWriter(file, fileNum, walConfig);
         currentWriter.addRecord(headerOutput.slice(), true);
 
-        currentFileBytes = 12;
+        currentFileBytes = estimateRecordSize(12);
         walFiles.put(fileNum, new WalFileInfo(fileNum, file));
     }
 
     private long readMaxSnapshotId(File file) {
-        if (!file.exists() || file.length() < 12) {
+        if (!file.exists() || file.length() == 0) {
             return 0;
         }
         try (FileInputStream fis = new FileInputStream(file);
              FileChannel channel = fis.getChannel()) {
-            Slice header = Slices.allocate(12);
-            int bytesRead = header.setBytes(0, channel, 0, 12);
-            if (bytesRead < 12) return 0;
-            // Skip magic(4), read maxSnapshotId(8)
-            return header.getLong(4);
+            LogReader reader = new LogReader(channel, LogMonitors.logMonitor(), true, 0);
+            Slice headerRecord = reader.readRecord();
+            if (headerRecord == null || headerRecord.length() < 12) {
+                return 0;
+            }
+            // Header format: magic(4) + maxSnapshotId(8)
+            return headerRecord.getLong(4);
         } catch (IOException e) {
             LOG.warn("Failed to read WAL file header: {}", file, e);
             return 0;
