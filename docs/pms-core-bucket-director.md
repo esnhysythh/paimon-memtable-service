@@ -105,7 +105,7 @@ PMS 中的数据单元经历以下状态流转：
 interface PMSBucketDirector {
 
     // ── 写入 ──
-    void put(byte[] schemaId, byte[] key, byte[] value);
+    void put(byte[] key, byte[] value);
 
     // ── 查询 ──
     Optional<byte[]> get(byte[] key);
@@ -180,26 +180,23 @@ PMSBucketDirector                        PaimonSinkManager
      │  1. 收集所有 newSST + ImmutableMemTable   │
      │──────────────────────────────────────────►│
      │                                          │
-     │  2. 通知 WALManager 写入 SINK_START       │
-     │◄──────────────────────────────────────────│
-     │                                          │
-     │  3. 合并 newSST + MemTable → preSink      │
+     │  2. 合并 newSST + MemTable → preSink      │
      │     (归并排序，保留最新 Key)               │
      │──────────────────────────────────────────►│
      │                                          │
-     │  4. Paimon prepareCommit → CommitMessage  │
+     │  3. Paimon prepareCommit → CommitMessage  │
      │◄──────────────────────────────────────────│
      │                                          │
-     │  5. WALManager 写入 SINK_PREPARE          │
+     │  4. WALManager 写入 SINK_PREPARE          │
      │──────────────────────────────────────────►│
      │                                          │
-     │  6. Paimon commit → new Snapshot          │
+     │  5. Paimon commit → new Snapshot          │
      │◄──────────────────────────────────────────│
      │                                          │
-     │  7. WALManager 写入 SINK_SUCCESS          │
+     │  6. WALManager 写入 SINK_SUCCESS          │
      │──────────────────────────────────────────►│
      │                                          │
-     │  8. 更新内部状态: new → sinked            │
+     │  7. 更新内部状态: new → sinked            │
      │                                          │
 ```
 
