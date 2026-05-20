@@ -3,6 +3,10 @@ package org.qwh.pms.core.memtable;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.core.memtable.model.Key;
 
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class KeyTest {
@@ -53,5 +57,69 @@ class KeyTest {
 
         assertTrue(a.compareTo(b) < 0, "0x7F < 0x80 in unsigned order");
         assertTrue(b.compareTo(c) < 0, "0x80 < 0xFF in unsigned order");
+    }
+
+    // ── equals / hashCode ──
+
+    @Test
+    void equalsReturnsTrueForSameContent() {
+        Key k1 = new Key("abc".getBytes());
+        Key k2 = new Key("abc".getBytes());
+        assertEquals(k1, k2, "Keys with same byte content should be equal");
+    }
+
+    @Test
+    void equalsReturnsFalseForDifferentContent() {
+        Key k1 = new Key("abc".getBytes());
+        Key k2 = new Key("abd".getBytes());
+        assertNotEquals(k1, k2);
+    }
+
+    @Test
+    void equalsReturnsFalseForDifferentLengths() {
+        Key k1 = new Key("abc".getBytes());
+        Key k2 = new Key("abcd".getBytes());
+        assertNotEquals(k1, k2);
+    }
+
+    @Test
+    void equalsIsReflexiveAndSymmetric() {
+        Key k1 = new Key("test".getBytes());
+        Key k2 = new Key("test".getBytes());
+        assertEquals(k1, k1, "equals should be reflexive");
+        assertEquals(k1.equals(k2), k2.equals(k1), "equals should be symmetric");
+    }
+
+    @Test
+    void hashCodeConsistentWithEquals() {
+        Key k1 = new Key("abc".getBytes());
+        Key k2 = new Key("abc".getBytes());
+        assertEquals(k1.hashCode(), k2.hashCode(), "Equal keys must have same hashCode");
+    }
+
+    @Test
+    void worksInHashSet() {
+        Set<Key> set = new HashSet<>();
+        set.add(new Key("key1".getBytes()));
+        set.add(new Key("key1".getBytes()));
+        set.add(new Key("key2".getBytes()));
+        assertEquals(2, set.size(), "HashSet should deduplicate equal keys");
+    }
+
+    @Test
+    void worksInHashMap() {
+        HashMap<Key, String> map = new HashMap<>();
+        map.put(new Key("k".getBytes()), "v1");
+        map.put(new Key("k".getBytes()), "v2");
+        assertEquals(1, map.size());
+        assertEquals("v2", map.get(new Key("k".getBytes())));
+    }
+
+    @Test
+    void equalsWithBinaryContent() {
+        Key k1 = new Key(new byte[]{0x00, (byte) 0x80, (byte) 0xFF});
+        Key k2 = new Key(new byte[]{0x00, (byte) 0x80, (byte) 0xFF});
+        assertEquals(k1, k2, "Binary keys with same content should be equal");
+        assertEquals(k1.hashCode(), k2.hashCode());
     }
 }

@@ -15,48 +15,63 @@ pms-core 定义所有核心配置的类型和默认值。配置的加载与解�
 
 ### 2.2 配置类
 
+采用分层配置结构：各模块定义自己的配置 Record，顶层 `PMSConfig` 组合各子配置，并提供 `from(Properties)` 工厂方法统一加载。
+
 ```java
+// 各模块配置
+record MemTableConfig(int maxEntries, int maxSizeMb) { ... }   // 默认 1_000_000 / 256
+record WalConfig(String dir, int fileSizeMb, boolean useMmap) { ... }  // 必填 dir / 默认 256 / false
+record StorageConfig(long sinkedMaxSizeMb, int sinkedMaxCount,
+                     int compactThresholdMb, int compactMinFiles) { ... }
+record SinkConfig(int intervalMs, int maxPendingSsts) { ... }  // 默认 30000 / 8
+record FlowControlConfig(int overloadedImmutableCount,
+                         int overloadedPendingSstCount) { ... }  // 默认 4 / 16
+record PaimonConfig(String tablePath, String warehouse) { ... }  // 必填 tablePath
+
+// 顶层组合
 record PMSConfig(
-    // ── MemTable ──
-    int memtableMaxEntries,          // curMemTable 条目上限，默认 1_000_000
-    int memtableMaxSizeMb,           // curMemTable 大小上限，默认 256
-
-    // ── WAL ──
-    String walDir,                   // WAL 目录（V1 单盘）
-    int walFileSizeMb,               // WAL 文件滚动大小，默认 256
-    boolean walUseMmap,              // 是否使用 MMap 写入（默认 false，FileChannel 更安全跨平台）
-
-    // ── 本地存储 ──
-    long storageSinkedMaxSizeMb,     // sinkedSST 总大小上限，默认 10240
-    int storageSinkedMaxCount,       // sinkedSST 文件数上限，默认 100
-    int storageCompactThresholdMb,   // 小 SST 合并阈值，默认 32
-    int storageCompactMinFiles,      // 触发合并的最小文件数，默认 4
-
-    // ── Sink ──
-    int sinkIntervalMs,              // Sink 触发间隔，默认 30000
-    int sinkMaxPendingSsts,          // 触发 Sink 的 SST 数量阈值，默认 8
-
-    // ── 流控 ──
-    int flowcontrolOverloadedImmutableCount,  // Immutable 数量 >= 此值则拒绝写入，默认 4
-    int flowcontrolOverloadedPendingSstCount, // 待 Sink SST 数量 >= 此值则拒绝写入，默认 16
-
-    // ── Paimon ──
-    String paimonTablePath,          // Paimon 表路径
-    String paimonWarehouse           // Paimon Warehouse 路径
-) {}
+    MemTableConfig memtable,
+    WalConfig wal,
+    StorageConfig storage,
+    SinkConfig sink,
+    FlowControlConfig flowcontrol,
+    PaimonConfig paimon
+) {
+    static PMSConfig from(Properties props) { ... }
+}
 ```
+
+**配置键映射**（`from(Properties)` 使用的键名）：
+
+| 键名 | 子配置 | 字段 | 默认值 |
+|------|--------|------|--------|
+| `pms.memtable.max_entries` | MemTableConfig | maxEntries | 1_000_000 |
+| `pms.memtable.max_size_mb` | MemTableConfig | maxSizeMb | 256 |
+| `pms.wal.dir` | WalConfig | dir | 必填 |
+| `pms.wal.file_size_mb` | WalConfig | fileSizeMb | 256 |
+| `pms.wal.use_mmap` | WalConfig | useMmap | false |
+| `pms.storage.sinked_max_size_mb` | StorageConfig | sinkedMaxSizeMb | 10240 |
+| `pms.storage.sinked_max_count` | StorageConfig | sinkedMaxCount | 100 |
+| `pms.storage.compact_threshold_mb` | StorageConfig | compactThresholdMb | 32 |
+| `pms.storage.compact_min_files` | StorageConfig | compactMinFiles | 4 |
+| `pms.sink.interval_ms` | SinkConfig | intervalMs | 30000 |
+| `pms.sink.max_pending_ssts` | SinkConfig | maxPendingSsts | 8 |
+| `pms.flowcontrol.overloaded_immutable_count` | FlowControlConfig | overloadedImmutableCount | 4 |
+| `pms.flowcontrol.overloaded_pending_sst_count` | FlowControlConfig | overloadedPendingSstCount | 16 |
+| `pms.paimon.table_path` | PaimonConfig | tablePath | 必填 |
+| `pms.paimon.warehouse` | PaimonConfig | warehouse | — |
 
 ### 2.3 组件构造方式
 
-core 组件通过构造函数接收 `PMSConfig`：
+core 组件通过构造函数接收各自需要的子配置：
 
 ```java
-class CurMemTable implements IMemTable {
-    CurMemTable(PMSConfig config) { ... }
+class SkipListCurMemTable implements CurMemTable {
+    SkipListCurMemTable(MemTableConfig config) { ... }
 }
 
 class WALManagerImpl implements WALManager {
-    WALManagerImpl(PMSConfig config) { ... }
+    WALManagerImpl(PMSConfig config) { ... }  // 内部使用 config.wal()
 }
 ```
 
@@ -77,7 +92,8 @@ interface CurMemTable {
     Value get(Key key);
     ImmutableMemTable freeze();  // 冻结为 immutable，返回只读实例
     long estimatedSize();
-    int entryCount();
+    int estimatedEntryCount();
+    boolean shouldFreeze();
     Iterator<Entry> iterator();
 }
 ```
@@ -92,7 +108,7 @@ interface ImmutableMemTable {
     Value get(Key key);
     Iterator<Entry> iterator();
     long estimatedSize();
-    int entryCount();
+    int estimatedEntryCount();
     void incrementRef();
     void decrementRef();
     long refCount();
@@ -103,7 +119,8 @@ interface ImmutableMemTable {
 
 - **SkipListCurMemTable**：当前活跃的可写 MemTable。
   - 底层 `ConcurrentSkipListMap<Key, Value>`，线程安全。
-  - 写入前检查容量：`entryCount() < config.memtableMaxEntries()` 且 `estimatedSize() < config.memtableMaxSizeMb() * 1024 * 1024`。
+  - 写入后检查是否达到 Freeze 阈值（`estimatedEntryCount() >= config.maxEntries()` 或 `estimatedSize() >= config.maxSizeBytes()`），达到则触发 Freeze。不拒绝写入，不阻塞写入路径。
+  - `estimatedEntryCount` 和 `estimatedSize` 均为启发式估算值，非精确计数：高并发下 `volatile int ++` 可能丢失增量，误差在可接受范围内。
   - `freeze()` 原子替换内部 Map 引用，返回持有旧 Map 的 `SkipListImmutableMemTable`。
 
 - **SkipListImmutableMemTable**：冻结后的只读 MemTable。
@@ -264,7 +281,8 @@ interface ReplayCallback {
 
 **WAL 文件管理**：
 - 按固定大小滚动（默认 256MB 一个文件）。
-- 每个文件头部记录 `maxSnapshotId`，用于截断时快速判断。
+- 每个文件的第一条记录是文件头部，格式为 `magic(4 bytes, "PMS\0") + maxSnapshotId(8 bytes, 初始为 0)`。头部记录作为普通 WAL 记录写入（经 LevelDB 传输层封装），而非文件级独立 header。
+- `maxSnapshotId` 在内存中随 `SINK_SUCCESS` 写入而更新，但**不回写文件头部**。重启恢复时通过 `readMaxSnapshotId()` 扫描文件中所有 `SINK_SUCCESS` 记录来获取真实值。
 
 **WAL 截断策略**：
 - 安全截断条件：存在 `SINK_SUCCESS(snapshotId=X)` 且 Paimon 侧 Snapshot X 确实存在。

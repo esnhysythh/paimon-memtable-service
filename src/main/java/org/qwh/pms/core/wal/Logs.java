@@ -1,5 +1,6 @@
 package org.qwh.pms.core.wal;
 
+import org.qwh.pms.core.config.WalConfig;
 import org.qwh.pms.core.wal.util.PureJavaCrc32C;
 import org.qwh.pms.core.wal.util.Slice;
 

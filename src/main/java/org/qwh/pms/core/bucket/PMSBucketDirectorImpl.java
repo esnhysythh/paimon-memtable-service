@@ -1,5 +1,6 @@
 package org.qwh.pms.core.bucket;
 
+import org.qwh.pms.core.config.MemTableConfig;
 import org.qwh.pms.core.config.PMSConfig;
 import org.qwh.pms.core.memtable.CurMemTable;
 import org.qwh.pms.core.memtable.ImmutableMemTable;
@@ -21,9 +22,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private static final Logger LOG = LoggerFactory.getLogger(PMSBucketDirectorImpl.class);
 
     private final PMSConfig config;
+    private final MemTableConfig memTableConfig;
     private final WALManagerImpl walManager;
-    private final long maxEntries;
-    private final long maxSizeBytes;
 
     private volatile CurMemTable curMemTable;
     private volatile List<ImmutableMemTable> immutableMemTables = new ArrayList<>();
@@ -32,16 +32,15 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     public PMSBucketDirectorImpl(PMSConfig config) {
         this.config = config;
+        this.memTableConfig = config.memtable();
         this.walManager = new WALManagerImpl(config);
-        this.maxEntries = config.memtableMaxEntries();
-        this.maxSizeBytes = (long) config.memtableMaxSizeMb() * 1024 * 1024;
-        this.curMemTable = new SkipListCurMemTable();
+        this.curMemTable = new SkipListCurMemTable(memTableConfig);
     }
 
     public void init() throws IOException {
         walManager.init();
         recoverFromWAL();
-        LOG.info("PMSBucketDirector initialized, curMemTable entries={}", curMemTable.entryCount());
+        LOG.info("PMSBucketDirector initialized, curMemTable entries={}", curMemTable.estimatedEntryCount());
     }
 
     private void recoverFromWAL() {
@@ -114,7 +113,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
 
         return new BucketStateSnapshot(
-            cur.entryCount(),
+            cur.estimatedEntryCount(),
             cur.estimatedSize(),
             immutables.size(),
             immTotalBytes,
@@ -132,12 +131,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     // ── Internal ──
 
     private void maybeFreeze() {
-        if (curMemTable.entryCount() >= maxEntries || curMemTable.estimatedSize() >= maxSizeBytes) {
+        if (curMemTable.shouldFreeze()) {
             doFreeze();
         }
     }
 
-    private void doFreeze() {
+    private synchronized void doFreeze() {
+        // Secondary check: maybeFreeze() is lock-free, so multiple threads may see
+        // shouldFreeze()==true and race into this method. After the first freeze,
+        // curMemTable is replaced with an empty one — skip to avoid creating a
+        // useless empty ImmutableMemTable.
+        if (curMemTable.estimatedEntryCount() == 0) {
+            return;
+        }
         ImmutableMemTable frozen = curMemTable.freeze();
         List<ImmutableMemTable> newList = new ArrayList<>(immutableMemTables);
         newList.add(frozen);

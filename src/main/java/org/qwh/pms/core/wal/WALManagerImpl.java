@@ -31,8 +31,7 @@ public class WALManagerImpl implements WALManager {
     // valueLen = -1 signals Delete (no value bytes follow)
     static final int VALUE_LEN_DELETE = -1;
 
-    private final PMSConfig config;
-    private final WalConfig walConfig;
+    private final org.qwh.pms.core.config.WalConfig walConfig;
     private final Path walDir;
     private final long maxFileSizeBytes;
 
@@ -44,10 +43,9 @@ public class WALManagerImpl implements WALManager {
     private volatile boolean closed = false;
 
     public WALManagerImpl(PMSConfig config) {
-        this.config = config;
-        this.walConfig = new WalConfig(config);
-        this.walDir = Path.of(config.walDir());
-        this.maxFileSizeBytes = (long) config.walFileSizeMb() * 1024 * 1024;
+        this.walConfig = config.wal();
+        this.walDir = Path.of(config.wal().dir());
+        this.maxFileSizeBytes = config.wal().fileSizeBytes();
     }
 
     /**
@@ -131,6 +129,17 @@ public class WALManagerImpl implements WALManager {
         }
     }
 
+    /**
+     * Replay WAL records to the given callback.
+     *
+     * @param callback receives DATA, SINK_PREPARE, and SINK_SUCCESS records in order
+     * @param highWatermarkSnapshotId controls which DATA records are skipped:
+     *   &lt;= 0 or {@code Long.MAX_VALUE} — replay all DATA records (no filtering);
+     *   positive value — skip DATA records before the first SINK_SUCCESS whose
+     *   snapshotId &gt;= this value (those records are already committed to Paimon).
+     *   Control records (SINK_PREPARE / SINK_SUCCESS) are always replayed regardless
+     *   of the watermark, so the caller can track the full snapshot timeline.
+     */
     @Override
     public void replay(ReplayCallback callback, long highWatermarkSnapshotId) {
         List<WalFileInfo> filesToReplay;
@@ -138,9 +147,20 @@ public class WALManagerImpl implements WALManager {
             filesToReplay = new ArrayList<>(walFiles.values());
         }
 
-        boolean pastHighWatermark = false;
+        // Whether we've encountered a SINK_SUCCESS with snapshotId >= highWatermarkSnapshotId.
+        // Before this point, DATA records are from already-committed snapshots and can be skipped.
+        // Control records (SINK_PREPARE/SINK_SUCCESS) are always replayed so the caller can
+        // track the full snapshot timeline.
+        // highWatermarkSnapshotId = Long.MAX_VALUE means "nothing is committed yet, replay all".
+        boolean pastHighWatermark = highWatermarkSnapshotId <= 0 || highWatermarkSnapshotId == Long.MAX_VALUE;
 
         for (WalFileInfo info : filesToReplay) {
+            // Skip entire files whose maxSnapshotId <= highWatermarkSnapshotId
+            // (all records in such files are before the watermark).
+            if (!pastHighWatermark && info.maxSnapshotId > 0 && info.maxSnapshotId <= highWatermarkSnapshotId) {
+                continue;
+            }
+
             if (!info.file.exists()) {
                 LOG.warn("WAL file missing during replay: {}", info.file);
                 continue;
@@ -171,6 +191,10 @@ public class WALManagerImpl implements WALManager {
                     byte type = record.getByte(0);
                     switch (type) {
                         case TYPE_DATA -> {
+                            if (!pastHighWatermark) {
+                                // Data before highWatermark is already committed to Paimon — skip
+                                continue;
+                            }
                             SliceInput input = record.input();
                             input.readByte(); // skip type
                             int keyLen = input.readInt();
@@ -303,14 +327,31 @@ public class WALManagerImpl implements WALManager {
         try (FileInputStream fis = new FileInputStream(file);
              FileChannel channel = fis.getChannel()) {
             LogReader reader = new LogReader(channel, LogMonitors.logMonitor(), true, 0);
+
+            // Skip file header record
             Slice headerRecord = reader.readRecord();
             if (headerRecord == null || headerRecord.length() < 12) {
                 return 0;
             }
-            // Header format: magic(4) + maxSnapshotId(8)
-            return headerRecord.getLong(4);
+            // Read header's initial maxSnapshotId
+            long maxSnapshotId = headerRecord.getLong(4);
+
+            // Scan all records to find the true maxSnapshotId from SINK_SUCCESS entries.
+            // The header only stores the initial value (0); actual snapshotIds come from
+            // SINK_SUCCESS records written during the file's lifetime, which are not
+            // persisted back to the header.
+            Slice record;
+            while ((record = reader.readRecord()) != null) {
+                if (record.length() < 1) continue;
+                byte type = record.getByte(0);
+                if (type == TYPE_SINK_SUCCESS && record.length() >= 9) {
+                    long snapshotId = record.getLong(1);
+                    maxSnapshotId = Math.max(maxSnapshotId, snapshotId);
+                }
+            }
+            return maxSnapshotId;
         } catch (IOException e) {
-            LOG.warn("Failed to read WAL file header: {}", file, e);
+            LOG.warn("Failed to read WAL file for maxSnapshotId: {}", file, e);
             return 0;
         }
     }

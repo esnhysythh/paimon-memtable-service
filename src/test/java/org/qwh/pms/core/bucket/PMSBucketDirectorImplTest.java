@@ -2,11 +2,15 @@ package org.qwh.pms.core.bucket;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.qwh.pms.core.config.PMSConfig;
+import org.qwh.pms.core.config.*;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -17,12 +21,12 @@ class PMSBucketDirectorImplTest {
 
     private PMSConfig config(int memtableMaxEntries, int memtableMaxSizeMb) {
         return new PMSConfig(
-            memtableMaxEntries, memtableMaxSizeMb,
-            tempDir.toString(), 256, false,
-            10240, 100, 32, 4,
-            30000, 8,
-            4, 16,
-            "", ""
+            new MemTableConfig(memtableMaxEntries, memtableMaxSizeMb),
+            new WalConfig(tempDir.toString(), 256, false),
+            new StorageConfig(0, 0, 0, 0),
+            new SinkConfig(0, 0),
+            new FlowControlConfig(0, 0),
+            new PaimonConfig("dummy", null)
         );
     }
 
@@ -99,7 +103,7 @@ class PMSBucketDirectorImplTest {
             // State snapshot should show 1 immutable
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertEquals(1, snap.immutableMemTableCount());
-            assertEquals(0, snap.curMemTableEntryCount());
+            assertEquals(0, snap.curMemTableEstimatedEntryCount());
         } finally {
             dir.close();
         }
@@ -117,6 +121,25 @@ class PMSBucketDirectorImplTest {
 
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertTrue(snap.immutableMemTableCount() > 0, "Should have frozen at least one MemTable");
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void autoFreezeOnSizeThreshold() throws IOException {
+        // 1 MB size limit
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 1));
+        dir.init();
+        try {
+            byte[] largeValue = new byte[200 * 1024];
+            java.util.Arrays.fill(largeValue, (byte) 'X');
+            for (int i = 0; i < 6; i++) {
+                dir.put(("k" + i).getBytes(), largeValue);
+            }
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertTrue(snap.immutableMemTableCount() > 0, "Should have frozen due to size threshold");
         } finally {
             dir.close();
         }
@@ -203,6 +226,59 @@ class PMSBucketDirectorImplTest {
     }
 
     // ── End-to-end ──
+
+    @Test
+    void concurrentPutTriggersAutoFreeze() throws Exception {
+        // Low threshold to trigger frequent freezes
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(10, 256));
+        dir.init();
+
+        int threadCount = 4;
+        int opsPerThread = 500;
+        CyclicBarrier barrier = new CyclicBarrier(threadCount);
+        List<Throwable> errors = new CopyOnWriteArrayList<>();
+        List<Thread> threads = new ArrayList<>();
+
+        for (int t = 0; t < threadCount; t++) {
+            final int tid = t;
+            threads.add(new Thread(() -> {
+                try { barrier.await(); } catch (Exception e) { return; }
+                for (int i = 0; i < opsPerThread; i++) {
+                    try {
+                        dir.put(("t" + tid + "-" + i).getBytes(), ("v" + tid + "-" + i).getBytes());
+                    } catch (Throwable e) {
+                        errors.add(e);
+                    }
+                }
+            }));
+        }
+
+        for (Thread t : threads) t.start();
+        for (Thread t : threads) t.join();
+
+        try {
+            assertTrue(errors.isEmpty(), "Errors during concurrent put+freeze: " + errors);
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            // With 2000 total writes and threshold 10, there should be multiple freezes
+            assertTrue(snap.immutableMemTableCount() > 0,
+                "Should have frozen at least one MemTable with threshold=10 and 2000 writes");
+
+            // Verify data integrity: all written keys should be readable
+            for (int t = 0; t < threadCount; t++) {
+                final int tid = t;
+                for (int i = 0; i < opsPerThread; i++) {
+                    Optional<byte[]> result = dir.get(("t" + tid + "-" + i).getBytes());
+                    assertTrue(result.isPresent(),
+                        "Key t" + tid + "-" + i + " should be found after concurrent writes");
+                    assertArrayEquals(("v" + tid + "-" + i).getBytes(), result.get(),
+                        "Key t" + tid + "-" + i + " returned wrong value");
+                }
+            }
+        } finally {
+            dir.close();
+        }
+    }
 
     @Test
     void fullLifecycleWriteFreezeOverwriteRecover() throws IOException {

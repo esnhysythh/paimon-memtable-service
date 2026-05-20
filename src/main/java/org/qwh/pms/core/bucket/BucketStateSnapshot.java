@@ -1,9 +1,16 @@
 package org.qwh.pms.core.bucket;
 
 public record BucketStateSnapshot(
-    int curMemTableEntryCount,
+    int curMemTableEstimatedEntryCount,
     long curMemTableSizeBytes,
     int immutableMemTableCount,
     long immutableMemTableTotalBytes,
+    // TODO: 待 SST 模块实现后补充以下字段
+    // int newSSTCount,
+    // long newSSTTotalBytes,
+    // int sinkedSSTCount,
+    // long sinkedSSTTotalBytes,
+    // int withMemCount,
+    // long withMemTotalBytes,
     long lastSinkedSnapshotId
 ) {}
