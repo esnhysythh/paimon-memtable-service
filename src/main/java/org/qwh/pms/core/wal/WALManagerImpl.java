@@ -155,9 +155,10 @@ public class WALManagerImpl implements WALManager {
         boolean pastHighWatermark = highWatermarkSnapshotId <= 0 || highWatermarkSnapshotId == Long.MAX_VALUE;
 
         for (WalFileInfo info : filesToReplay) {
-            // Skip entire files whose maxSnapshotId <= highWatermarkSnapshotId
-            // (all records in such files are before the watermark).
-            if (!pastHighWatermark && info.maxSnapshotId > 0 && info.maxSnapshotId <= highWatermarkSnapshotId) {
+            // Skip entire files whose maxSnapshotId is strictly before the watermark.
+            // A file with maxSnapshotId == highWatermarkSnapshotId can still contain
+            // uncommitted DATA records after that SINK_SUCCESS, so it must be scanned.
+            if (!pastHighWatermark && info.maxSnapshotId > 0 && info.maxSnapshotId < highWatermarkSnapshotId) {
                 continue;
             }
 
@@ -196,8 +197,10 @@ public class WALManagerImpl implements WALManager {
                                 continue;
                             }
                             SliceInput input = record.input();
+                            requireBytes(input, 1 + 4, "DATA header");
                             input.readByte(); // skip type
-                            int keyLen = input.readInt();
+                            int keyLen = readNonNegativeLength(input, "keyLen");
+                            requireBytes(input, keyLen + 4, "DATA key/value header");
                             byte[] key = new byte[keyLen];
                             input.readBytes(key);
                             int valueLen = input.readInt();
@@ -205,23 +208,33 @@ public class WALManagerImpl implements WALManager {
                             if (valueLen == VALUE_LEN_DELETE) {
                                 value = null;
                             } else {
+                                if (valueLen < 0) {
+                                    throw corruptRecord("Invalid valueLen: " + valueLen);
+                                }
+                                requireBytes(input, valueLen, "DATA value");
                                 value = new byte[valueLen];
                                 input.readBytes(value);
                             }
+                            requireFullyConsumed(input, "DATA");
                             callback.onDataRecord(key, value);
                         }
                         case TYPE_SINK_PREPARE -> {
                             SliceInput input = record.input();
+                            requireBytes(input, 1 + 4, "SINK_PREPARE header");
                             input.readByte(); // skip type
-                            int msgLen = input.readInt();
+                            int msgLen = readNonNegativeLength(input, "commitMessageLen");
+                            requireBytes(input, msgLen, "SINK_PREPARE message");
                             byte[] commitMessage = new byte[msgLen];
                             input.readBytes(commitMessage);
+                            requireFullyConsumed(input, "SINK_PREPARE");
                             callback.onSinkPrepare(commitMessage);
                         }
                         case TYPE_SINK_SUCCESS -> {
                             SliceInput input = record.input();
+                            requireBytes(input, 1 + 8, "SINK_SUCCESS payload");
                             input.readByte(); // skip type
                             long snapshotId = input.readLong();
+                            requireFullyConsumed(input, "SINK_SUCCESS");
                             callback.onSinkSuccess(snapshotId);
                             if (snapshotId >= highWatermarkSnapshotId) {
                                 pastHighWatermark = true;
@@ -233,6 +246,9 @@ public class WALManagerImpl implements WALManager {
             } catch (IOException e) {
                 LOG.error("Error reading WAL file during replay: {}", info.file, e);
                 throw new RuntimeException("WAL replay failed for file: " + info.file, e);
+            } catch (IllegalArgumentException | IndexOutOfBoundsException e) {
+                LOG.error("Corrupt WAL record during replay: {}", info.file, e);
+                throw new RuntimeException("Corrupt WAL record in file: " + info.file, e);
             }
         }
     }
@@ -375,6 +391,30 @@ public class WALManagerImpl implements WALManager {
 
     private static void writeBytes(DynamicSliceOutput output, byte[] data) {
         output.writeBytes(data, 0, data.length);
+    }
+
+    private static int readNonNegativeLength(SliceInput input, String fieldName) {
+        int length = input.readInt();
+        if (length < 0) {
+            throw corruptRecord("Invalid " + fieldName + ": " + length);
+        }
+        return length;
+    }
+
+    private static void requireBytes(SliceInput input, int length, String fieldName) {
+        if (length < 0 || input.available() < length) {
+            throw corruptRecord("Truncated " + fieldName + ", required=" + length + ", available=" + input.available());
+        }
+    }
+
+    private static void requireFullyConsumed(SliceInput input, String recordType) {
+        if (input.available() != 0) {
+            throw corruptRecord(recordType + " record has trailing bytes: " + input.available());
+        }
+    }
+
+    private static IllegalArgumentException corruptRecord(String message) {
+        return new IllegalArgumentException(message);
     }
 
     private static int estimateRecordSize(int payloadSize) {

@@ -3,7 +3,10 @@ package org.qwh.pms.core.wal;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.qwh.pms.core.config.*;
+import org.qwh.pms.core.wal.util.DynamicSliceOutput;
+import org.qwh.pms.core.wal.util.Slice;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -18,9 +21,13 @@ class WALManagerImplTest {
     Path tempDir;
 
     private PMSConfig config(int walFileSizeMb) {
+        return config(walFileSizeMb, false);
+    }
+
+    private PMSConfig config(int walFileSizeMb, boolean useMmap) {
         return new PMSConfig(
             new MemTableConfig(0, 0),
-            new WalConfig(tempDir.toString(), walFileSizeMb, false),
+            new WalConfig(tempDir.toString(), walFileSizeMb, useMmap),
             new StorageConfig(0, 0, 0, 0),
             new SinkConfig(0, 0),
             new FlowControlConfig(0, 0),
@@ -82,6 +89,23 @@ class WALManagerImplTest {
         wal.appendDataRecord("key1".getBytes(), "value1".getBytes());
 
         CollectingCallback cb = writeCloseAndReplay(wal, 256);
+
+        assertEquals(1, cb.dataRecords.size());
+        assertDataEquals(new DataRecord("key1".getBytes(), "value1".getBytes()), cb.dataRecords.get(0));
+    }
+
+    @Test
+    void mmapWriterAppendAndReplayDataRecord() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(256, true));
+        wal.init();
+        wal.appendDataRecord("key1".getBytes(), "value1".getBytes());
+        wal.close();
+
+        WALManagerImpl reader = new WALManagerImpl(config(256, true));
+        reader.init();
+        CollectingCallback cb = new CollectingCallback();
+        reader.replay(cb, Long.MAX_VALUE);
+        reader.close();
 
         assertEquals(1, cb.dataRecords.size());
         assertDataEquals(new DataRecord("key1".getBytes(), "value1".getBytes()), cb.dataRecords.get(0));
@@ -323,5 +347,60 @@ class WALManagerImplTest {
         assertEquals(2, cb.dataRecords.size());
         assertArrayEquals("k2".getBytes(), cb.dataRecords.get(0).key);
         assertArrayEquals("k3".getBytes(), cb.dataRecords.get(1).key);
+    }
+
+    @Test
+    void replayWithHighWatermarkScansFileWhenMaxSnapshotEqualsWatermark() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(256));
+        wal.init();
+        wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
+        wal.appendSinkSuccess(5L);
+        wal.appendDataRecord("k2".getBytes(), "v2".getBytes());
+        wal.close();
+
+        WALManagerImpl reader = new WALManagerImpl(config(256));
+        reader.init();
+        CollectingCallback cb = new CollectingCallback();
+        reader.replay(cb, 5L);
+        reader.close();
+
+        assertEquals(1, cb.dataRecords.size());
+        assertArrayEquals("k2".getBytes(), cb.dataRecords.get(0).key);
+    }
+
+    @Test
+    void replayRejectsCorruptDataRecordLength() throws IOException {
+        File file = tempDir.resolve("wal-000001.log").toFile();
+        LogWriter writer = new FileChannelLogWriter(file, 1);
+        try {
+            writer.addRecord(fileHeader(), true);
+
+            DynamicSliceOutput corrupt = new DynamicSliceOutput(5);
+            corrupt.writeByte(WALManagerImpl.TYPE_DATA);
+            corrupt.writeInt(-1);
+            writer.addRecord(corrupt.slice(), true);
+        } finally {
+            writer.close();
+        }
+
+        WALManagerImpl reader = new WALManagerImpl(config(256));
+        reader.init();
+        try {
+            RuntimeException error = assertThrows(RuntimeException.class,
+                () -> reader.replay(new CollectingCallback(), Long.MAX_VALUE));
+            assertTrue(error.getMessage().contains("Corrupt WAL record"));
+        } finally {
+            reader.close();
+        }
+    }
+
+    private static Slice fileHeader() {
+        DynamicSliceOutput header = new DynamicSliceOutput(12);
+        header.writeByte('P');
+        header.writeByte('M');
+        header.writeByte('S');
+        header.writeByte(0);
+        header.writeLong(0);
+        return header.slice();
     }
 }
