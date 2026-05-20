@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
@@ -28,6 +29,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private volatile CurMemTable curMemTable;
     private volatile List<ImmutableMemTable> immutableMemTables = new ArrayList<>();
 
+    private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
     private volatile boolean closed = false;
 
     public PMSBucketDirectorImpl(PMSConfig config) {
@@ -58,74 +60,106 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public void put(byte[] key, byte[] value) {
-        ensureNotClosed();
-        walManager.appendDataRecord(key, value);
-        curMemTable.put(new Key(key), new Value(value));
-        maybeFreeze();
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            walManager.appendDataRecord(key, value);
+            curMemTable.put(new Key(key), new Value(value));
+            maybeFreeze();
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
     }
 
     @Override
     public void delete(byte[] key) {
-        ensureNotClosed();
-        walManager.appendDataRecord(key, null);
-        curMemTable.delete(new Key(key));
-        maybeFreeze();
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            walManager.appendDataRecord(key, null);
+            curMemTable.delete(new Key(key));
+            maybeFreeze();
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
     }
 
     @Override
     public Optional<byte[]> get(byte[] key) {
-        Key k = new Key(key);
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            Key k = new Key(key);
 
-        // Layer 1: curMemTable
-        Value v = curMemTable.get(k);
-        if (v != null) {
-            if (v.isTombstone()) return Optional.empty();
-            return Optional.of(v.bytes());
-        }
-
-        // Layer 2: immutableMemTables (reverse order, newest first)
-        List<ImmutableMemTable> immutables = immutableMemTables;
-        for (int i = immutables.size() - 1; i >= 0; i--) {
-            v = immutables.get(i).get(k);
+            // Layer 1: curMemTable
+            Value v = curMemTable.get(k);
             if (v != null) {
                 if (v.isTombstone()) return Optional.empty();
                 return Optional.of(v.bytes());
             }
-        }
 
-        return Optional.empty();
+            // Layer 2: immutableMemTables (reverse order, newest first)
+            List<ImmutableMemTable> immutables = immutableMemTables;
+            for (int i = immutables.size() - 1; i >= 0; i--) {
+                v = immutables.get(i).get(k);
+                if (v != null) {
+                    if (v.isTombstone()) return Optional.empty();
+                    return Optional.of(v.bytes());
+                }
+            }
+
+            return Optional.empty();
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
     }
 
     @Override
     public void freezeCurMemTable() {
-        ensureNotClosed();
-        doFreeze();
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            doFreeze();
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
     }
 
     @Override
     public BucketStateSnapshot stateSnapshot() {
-        CurMemTable cur = curMemTable;
-        List<ImmutableMemTable> immutables = immutableMemTables;
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            CurMemTable cur = curMemTable;
+            List<ImmutableMemTable> immutables = immutableMemTables;
 
-        long immTotalBytes = 0;
-        for (ImmutableMemTable im : immutables) {
-            immTotalBytes += im.estimatedSize();
+            long immTotalBytes = 0;
+            for (ImmutableMemTable im : immutables) {
+                immTotalBytes += im.estimatedSize();
+            }
+
+            return new BucketStateSnapshot(
+                cur.estimatedEntryCount(),
+                cur.estimatedSize(),
+                immutables.size(),
+                immTotalBytes,
+                0L
+            );
+        } finally {
+            lifecycleLock.readLock().unlock();
         }
-
-        return new BucketStateSnapshot(
-            cur.estimatedEntryCount(),
-            cur.estimatedSize(),
-            immutables.size(),
-            immTotalBytes,
-            0L
-        );
     }
 
     @Override
     public void close() {
-        if (closed) return;
-        closed = true;
-        walManager.close();
+        lifecycleLock.writeLock().lock();
+        try {
+            if (closed) return;
+            closed = true;
+            walManager.close();
+        } finally {
+            lifecycleLock.writeLock().unlock();
+        }
     }
 
     // ── Internal ──

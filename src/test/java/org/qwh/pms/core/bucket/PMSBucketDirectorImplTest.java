@@ -163,6 +163,20 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void operationsAfterCloseThrow() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        dir.close();
+
+        assertThrows(IllegalStateException.class, () -> dir.put("k".getBytes(), "v".getBytes()));
+        assertThrows(IllegalStateException.class, () -> dir.delete("k".getBytes()));
+        assertThrows(IllegalStateException.class, () -> dir.get("k".getBytes()));
+        assertThrows(IllegalStateException.class, dir::freezeCurMemTable);
+        assertThrows(IllegalStateException.class, dir::stateSnapshot);
+        dir.close();
+    }
+
+    @Test
     void immutableLayerOverriddenByCurMemTable() throws IOException {
         PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
         dir.init();
