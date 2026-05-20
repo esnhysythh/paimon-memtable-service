@@ -18,7 +18,7 @@ public interface ImmutableMemTable {
 
     long estimatedSize();
 
-    int entryCount();
+    int estimatedEntryCount();
 
     void incrementRef();
 

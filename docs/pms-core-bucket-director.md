@@ -106,24 +106,28 @@ interface PMSBucketDirector {
 
     // ── 写入 ──
     void put(byte[] key, byte[] value);
+    void delete(byte[] key);  // 删除记录（写入墓碑标记）
 
     // ── 查询 ──
     Optional<byte[]> get(byte[] key);
 
     // ── 状态流转触发 ──
     void freezeCurMemTable();
-    void flushImmutableMemTable();
-    void sinkToPaimon();
-    void evictOldestSinkedSST();
+    void flushImmutableMemTable();    // TODO: 待 SST 模块实现
+    void sinkToPaimon();             // TODO: 待 Paimon 集成实现
+    void evictOldestSinkedSST();     // TODO: 待 SST 模块实现
 
     // ── 本地 SST 合并 ──
-    void compactLocalSSTs();
+    void compactLocalSSTs();         // TODO: 待 SST 模块实现
 
     // ── Mem 缓存退化 ──
-    void degradeMemCache();  // 将最早的双持状态退化为不带 Mem
+    void degradeMemCache();          // TODO: 待 SST 模块实现
 
     // ── 状态快照（供管理接口使用）──
     BucketStateSnapshot stateSnapshot();
+
+    // ── 生命周期 ──
+    void close();
 }
 ```
 
@@ -131,19 +135,21 @@ interface PMSBucketDirector {
 
 ```java
 record BucketStateSnapshot(
-    int curMemTableEntryCount,
+    int curMemTableEstimatedEntryCount,
     long curMemTableSizeBytes,
     int immutableMemTableCount,
     long immutableMemTableTotalBytes,
-    int newSSTCount,
-    long newSSTTotalBytes,
-    int sinkedSSTCount,
-    long sinkedSSTTotalBytes,
-    int withMemCount,               // 当前双持状态的条目数
-    long withMemTotalBytes,         // 双持 Mem 缓存的总内存占用
+    int newSSTCount,                    // TODO: 待 SST 模块实现后补充
+    long newSSTTotalBytes,              // TODO: 待 SST 模块实现后补充
+    int sinkedSSTCount,                 // TODO: 待 SST 模块实现后补充
+    long sinkedSSTTotalBytes,           // TODO: 待 SST 模块实现后补充
+    int withMemCount,                   // TODO: 待 SST 模块实现后补充
+    long withMemTotalBytes,             // TODO: 待 SST 模块实现后补充
     long lastSinkedSnapshotId
 ) {}
 ```
+
+> 当前实现仅包含前 5 个字段 + lastSinkedSnapshotId，SST 相关字段待 SST 模块实现后补充。
 
 ## 6. 冻结与刷盘策略
 

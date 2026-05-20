@@ -1,5 +1,14 @@
 package org.qwh.pms.core.memtable.model;
 
+import java.util.Arrays;
+
+/**
+ * Byte array key with unsigned lexicographical comparison (aligned with Paimon primary key sort order).
+ * <p>
+ * <b>Immutability contract:</b> The internal byte[] is NOT defensively copied for performance.
+ * Callers MUST NOT modify the array after passing it to this class — doing so will corrupt
+ * the SkipList ordering invariant and cause data loss or infinite loops.
+ */
 public record Key(byte[] bytes) implements Comparable<Key> {
 
     public Key {
@@ -20,6 +29,18 @@ public record Key(byte[] bytes) implements Comparable<Key> {
             }
         }
         return Integer.compare(this.bytes.length, other.bytes.length);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Key other)) return false;
+        return Arrays.equals(this.bytes, other.bytes);
+    }
+
+    @Override
+    public int hashCode() {
+        return Arrays.hashCode(bytes);
     }
 
     public int size() {

@@ -2,6 +2,7 @@ package org.qwh.pms.core.memtable;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.qwh.pms.core.config.MemTableConfig;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
@@ -15,9 +16,11 @@ class SkipListImmutableMemTableTest {
 
     private ImmutableMemTable immutable;
 
+    private static final MemTableConfig TEST_CONFIG = new MemTableConfig(1_000_000, 256);
+
     @BeforeEach
     void setUp() {
-        SkipListCurMemTable cur = new SkipListCurMemTable();
+        SkipListCurMemTable cur = new SkipListCurMemTable(TEST_CONFIG);
         cur.put(new Key("k1".getBytes()), new Value("v1".getBytes()));
         cur.put(new Key("k2".getBytes()), new Value("v2".getBytes()));
         cur.delete(new Key("k3".getBytes()));
@@ -48,8 +51,8 @@ class SkipListImmutableMemTableTest {
     }
 
     @Test
-    void entryCount() {
-        assertEquals(3, immutable.entryCount());
+    void estimatedEntryCount() {
+        assertEquals(3, immutable.estimatedEntryCount());
     }
 
     @Test
@@ -78,5 +81,40 @@ class SkipListImmutableMemTableTest {
         assertEquals(2, immutable.refCount());
         immutable.decrementRef();
         assertEquals(1, immutable.refCount());
+    }
+
+    @Test
+    void refCountDecrementBelowZeroGoesNegative() {
+        // AtomicLong allows decrement below zero — this is by design.
+        // The caller (BucketDirector) is responsible for checking refCount before evict.
+        assertEquals(0, immutable.refCount());
+        immutable.decrementRef();
+        assertEquals(-1, immutable.refCount());
+    }
+
+    @Test
+    void refCountConcurrentIncrementDecrement() throws Exception {
+        int threadCount = 8;
+        int opsPerThread = 10_000;
+        List<Thread> threads = new ArrayList<>();
+
+        for (int t = 0; t < threadCount; t++) {
+            final int tid = t;
+            threads.add(new Thread(() -> {
+                for (int i = 0; i < opsPerThread; i++) {
+                    if (tid % 2 == 0) {
+                        immutable.incrementRef();
+                    } else {
+                        immutable.decrementRef();
+                    }
+                }
+            }));
+        }
+
+        for (Thread t : threads) t.start();
+        for (Thread t : threads) t.join();
+
+        // 4 threads increment, 4 threads decrement — net should be 0
+        assertEquals(0, immutable.refCount());
     }
 }

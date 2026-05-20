@@ -2,7 +2,7 @@ package org.qwh.pms.core.wal;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.qwh.pms.core.config.PMSConfig;
+import org.qwh.pms.core.config.*;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -19,12 +19,12 @@ class WALManagerImplTest {
 
     private PMSConfig config(int walFileSizeMb) {
         return new PMSConfig(
-            1_000_000, 256,
-            tempDir.toString(), walFileSizeMb, false,
-            10240, 100, 32, 4,
-            30000, 8,
-            4, 16,
-            "", ""
+            new MemTableConfig(0, 0),
+            new WalConfig(tempDir.toString(), walFileSizeMb, false),
+            new StorageConfig(0, 0, 0, 0),
+            new SinkConfig(0, 0),
+            new FlowControlConfig(0, 0),
+            new PaimonConfig("dummy", null)
         );
     }
 
@@ -270,5 +270,58 @@ class WALManagerImplTest {
         assertTrue(cb.dataRecords.isEmpty());
         assertTrue(cb.sinkPrepares.isEmpty());
         assertTrue(cb.sinkSuccesses.isEmpty());
+    }
+
+    @Test
+    void maxSnapshotIdSurvivesRestart() throws IOException {
+        PMSConfig cfg = config(1);
+
+        // Write data + SINK_SUCCESS(10) to file 1, then roll to file 2
+        WALManagerImpl wal = new WALManagerImpl(cfg);
+        wal.init();
+        wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
+        wal.appendSinkSuccess(10L);
+        byte[] padding = new byte[1100 * 1024];
+        Arrays.fill(padding, (byte) 'P');
+        wal.appendDataRecord("pad".getBytes(), padding);
+        wal.appendDataRecord("k2".getBytes(), "v2".getBytes());
+        wal.appendSinkSuccess(20L);
+        wal.close();
+
+        // Re-open and truncate with safeSnapshotId=10 — file 1 should be deleted
+        WALManagerImpl recovered = new WALManagerImpl(cfg);
+        recovered.init();
+        recovered.truncate(10L);
+        CollectingCallback cb = new CollectingCallback();
+        recovered.replay(cb, Long.MAX_VALUE);
+        recovered.close();
+
+        boolean hasK1 = cb.dataRecords.stream()
+            .anyMatch(r -> Arrays.equals(r.key, "k1".getBytes()));
+        assertFalse(hasK1, "k1 should have been truncated after restart");
+    }
+
+    @Test
+    void replayWithHighWatermarkSkipsOldData() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(256));
+        wal.init();
+        wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
+        wal.appendSinkSuccess(5L);
+        wal.appendDataRecord("k2".getBytes(), "v2".getBytes());
+        wal.appendSinkSuccess(10L);
+        wal.appendDataRecord("k3".getBytes(), "v3".getBytes());
+        wal.close();
+
+        WALManagerImpl reader = new WALManagerImpl(config(256));
+        reader.init();
+        CollectingCallback cb = new CollectingCallback();
+        reader.replay(cb, 5L);
+        reader.close();
+
+        // Only DATA after SINK_SUCCESS(5) should be replayed: k2 and k3
+        // k1 is before the highWatermark and should be skipped
+        assertEquals(2, cb.dataRecords.size());
+        assertArrayEquals("k2".getBytes(), cb.dataRecords.get(0).key);
+        assertArrayEquals("k3".getBytes(), cb.dataRecords.get(1).key);
     }
 }

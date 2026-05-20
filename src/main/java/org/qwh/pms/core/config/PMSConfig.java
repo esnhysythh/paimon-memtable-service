@@ -1,57 +1,84 @@
 package org.qwh.pms.core.config;
 
+import java.util.Properties;
+
 public record PMSConfig(
-    // ── MemTable ──
-    int memtableMaxEntries,
-    int memtableMaxSizeMb,
-
-    // ── WAL ──
-    String walDir,
-    int walFileSizeMb,
-    boolean walUseMmap,
-
-    // ── 本地存储 ──
-    long storageSinkedMaxSizeMb,
-    int storageSinkedMaxCount,
-    int storageCompactThresholdMb,
-    int storageCompactMinFiles,
-
-    // ── Sink ──
-    int sinkIntervalMs,
-    int sinkMaxPendingSsts,
-
-    // ── 流控 ──
-    int flowcontrolOverloadedImmutableCount,
-    int flowcontrolOverloadedPendingSstCount,
-
-    // ── Paimon ──
-    String paimonTablePath,
-    String paimonWarehouse
+    MemTableConfig memtable,
+    WalConfig wal,
+    StorageConfig storage,
+    SinkConfig sink,
+    FlowControlConfig flowcontrol,
+    PaimonConfig paimon
 ) {
-    public static final int DEFAULT_MEMTABLE_MAX_ENTRIES = 1_000_000;
-    public static final int DEFAULT_MEMTABLE_MAX_SIZE_MB = 256;
-    public static final int DEFAULT_WAL_FILE_SIZE_MB = 256;
-    public static final boolean DEFAULT_WAL_USE_MMAP = false;
-    public static final long DEFAULT_STORAGE_SINKED_MAX_SIZE_MB = 10240;
-    public static final int DEFAULT_STORAGE_SINKED_MAX_COUNT = 100;
-    public static final int DEFAULT_STORAGE_COMPACT_THRESHOLD_MB = 32;
-    public static final int DEFAULT_STORAGE_COMPACT_MIN_FILES = 4;
-    public static final int DEFAULT_SINK_INTERVAL_MS = 30000;
-    public static final int DEFAULT_SINK_MAX_PENDING_SSTS = 8;
-    public static final int DEFAULT_FLOWCONTROL_OVERLOADED_IMMUTABLE_COUNT = 4;
-    public static final int DEFAULT_FLOWCONTROL_OVERLOADED_PENDING_SST_COUNT = 16;
-
     public PMSConfig {
-        if (memtableMaxEntries <= 0) memtableMaxEntries = DEFAULT_MEMTABLE_MAX_ENTRIES;
-        if (memtableMaxSizeMb <= 0) memtableMaxSizeMb = DEFAULT_MEMTABLE_MAX_SIZE_MB;
-        if (walFileSizeMb <= 0) walFileSizeMb = DEFAULT_WAL_FILE_SIZE_MB;
-        if (storageSinkedMaxSizeMb <= 0) storageSinkedMaxSizeMb = DEFAULT_STORAGE_SINKED_MAX_SIZE_MB;
-        if (storageSinkedMaxCount <= 0) storageSinkedMaxCount = DEFAULT_STORAGE_SINKED_MAX_COUNT;
-        if (storageCompactThresholdMb <= 0) storageCompactThresholdMb = DEFAULT_STORAGE_COMPACT_THRESHOLD_MB;
-        if (storageCompactMinFiles <= 0) storageCompactMinFiles = DEFAULT_STORAGE_COMPACT_MIN_FILES;
-        if (sinkIntervalMs <= 0) sinkIntervalMs = DEFAULT_SINK_INTERVAL_MS;
-        if (sinkMaxPendingSsts <= 0) sinkMaxPendingSsts = DEFAULT_SINK_MAX_PENDING_SSTS;
-        if (flowcontrolOverloadedImmutableCount <= 0) flowcontrolOverloadedImmutableCount = DEFAULT_FLOWCONTROL_OVERLOADED_IMMUTABLE_COUNT;
-        if (flowcontrolOverloadedPendingSstCount <= 0) flowcontrolOverloadedPendingSstCount = DEFAULT_FLOWCONTROL_OVERLOADED_PENDING_SST_COUNT;
+        if (memtable == null) memtable = new MemTableConfig(0, 0);
+        if (wal == null) throw new IllegalArgumentException("WAL config must not be null");
+        if (storage == null) storage = new StorageConfig(0, 0, 0, 0);
+        if (sink == null) sink = new SinkConfig(0, 0);
+        if (flowcontrol == null) flowcontrol = new FlowControlConfig(0, 0);
+        if (paimon == null) throw new IllegalArgumentException("Paimon config must not be null");
+    }
+
+    public static PMSConfig from(Properties props) {
+        return new PMSConfig(
+            new MemTableConfig(
+                getInt(props, "pms.memtable.max_entries", MemTableConfig.DEFAULT_MAX_ENTRIES),
+                getInt(props, "pms.memtable.max_size_mb", MemTableConfig.DEFAULT_MAX_SIZE_MB)
+            ),
+            new WalConfig(
+                getString(props, "pms.wal.dir", null),
+                getInt(props, "pms.wal.file_size_mb", WalConfig.DEFAULT_FILE_SIZE_MB),
+                getBoolean(props, "pms.wal.use_mmap", WalConfig.DEFAULT_USE_MMAP)
+            ),
+            new StorageConfig(
+                getLong(props, "pms.storage.sinked_max_size_mb", StorageConfig.DEFAULT_SINKED_MAX_SIZE_MB),
+                getInt(props, "pms.storage.sinked_max_count", StorageConfig.DEFAULT_SINKED_MAX_COUNT),
+                getInt(props, "pms.storage.compact_threshold_mb", StorageConfig.DEFAULT_COMPACT_THRESHOLD_MB),
+                getInt(props, "pms.storage.compact_min_files", StorageConfig.DEFAULT_COMPACT_MIN_FILES)
+            ),
+            new SinkConfig(
+                getInt(props, "pms.sink.interval_ms", SinkConfig.DEFAULT_INTERVAL_MS),
+                getInt(props, "pms.sink.max_pending_ssts", SinkConfig.DEFAULT_MAX_PENDING_SSTS)
+            ),
+            new FlowControlConfig(
+                getInt(props, "pms.flowcontrol.overloaded_immutable_count", FlowControlConfig.DEFAULT_OVERLOADED_IMMUTABLE_COUNT),
+                getInt(props, "pms.flowcontrol.overloaded_pending_sst_count", FlowControlConfig.DEFAULT_OVERLOADED_PENDING_SST_COUNT)
+            ),
+            new PaimonConfig(
+                getString(props, "pms.paimon.table_path", null),
+                getString(props, "pms.paimon.warehouse", null)
+            )
+        );
+    }
+
+    private static int getInt(Properties props, String key, int defaultValue) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) return defaultValue;
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid integer value for config key '" + key + "': " + value, e);
+        }
+    }
+
+    private static long getLong(Properties props, String key, long defaultValue) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) return defaultValue;
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid long value for config key '" + key + "': " + value, e);
+        }
+    }
+
+    private static boolean getBoolean(Properties props, String key, boolean defaultValue) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) return defaultValue;
+        return Boolean.parseBoolean(value.trim());
+    }
+
+    private static String getString(Properties props, String key, String defaultValue) {
+        String value = props.getProperty(key);
+        return (value == null || value.isBlank()) ? defaultValue : value.trim();
     }
 }

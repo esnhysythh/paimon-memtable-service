@@ -27,7 +27,13 @@ public interface CurMemTable {
 
     long estimatedSize();
 
-    int entryCount();
+    int estimatedEntryCount();
+
+    /**
+     * Check whether this MemTable has reached its capacity threshold
+     * and should be frozen.
+     */
+    boolean shouldFreeze();
 
     Iterator<Entry> iterator();
 }
