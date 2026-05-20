@@ -2,7 +2,9 @@ package org.qwh.pms.core.wal;
 
 public interface WALManager {
 
-    void appendDataRecord(byte[] key, byte[] value);
+    long appendDataRecord(byte[] key, byte[] value);
+
+    long lastSequenceId();
 
     void appendSinkPrepare(byte[] commitMessage);
 

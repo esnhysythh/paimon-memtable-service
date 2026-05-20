@@ -30,6 +30,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private volatile List<ImmutableMemTable> immutableMemTables = new ArrayList<>();
 
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+    private final Object writeMutex = new Object();
     private volatile boolean closed = false;
 
     public PMSBucketDirectorImpl(PMSConfig config) {
@@ -52,7 +53,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
         for (var record : cb.dataRecords) {
             Key key = new Key(record.key);
-            Value value = record.value != null ? new Value(record.value) : Value.TOMBSTONE;
+            Value value = record.value != null ? new Value(record.value, record.sequenceId) : Value.tombstone(record.sequenceId);
             curMemTable.put(key, value);
         }
         LOG.info("Recovered {} data records from WAL", cb.dataRecords.size());
@@ -63,9 +64,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
-            walManager.appendDataRecord(key, value);
-            curMemTable.put(new Key(key), new Value(value));
-            maybeFreeze();
+            synchronized (writeMutex) {
+                long sequenceId = walManager.appendDataRecord(key, value);
+                curMemTable.put(new Key(key), new Value(value, sequenceId));
+                maybeFreezeLocked();
+            }
         } finally {
             lifecycleLock.readLock().unlock();
         }
@@ -76,9 +79,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
-            walManager.appendDataRecord(key, null);
-            curMemTable.delete(new Key(key));
-            maybeFreeze();
+            synchronized (writeMutex) {
+                long sequenceId = walManager.appendDataRecord(key, null);
+                curMemTable.put(new Key(key), Value.tombstone(sequenceId));
+                maybeFreezeLocked();
+            }
         } finally {
             lifecycleLock.readLock().unlock();
         }
@@ -119,7 +124,9 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
-            doFreeze();
+            synchronized (writeMutex) {
+                doFreezeLocked();
+            }
         } finally {
             lifecycleLock.readLock().unlock();
         }
@@ -134,8 +141,14 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             List<ImmutableMemTable> immutables = immutableMemTables;
 
             long immTotalBytes = 0;
+            long immMinSequenceId = 0;
+            long immMaxSequenceId = 0;
             for (ImmutableMemTable im : immutables) {
                 immTotalBytes += im.estimatedSize();
+                if (im.minSequenceId() > 0 && (immMinSequenceId == 0 || im.minSequenceId() < immMinSequenceId)) {
+                    immMinSequenceId = im.minSequenceId();
+                }
+                immMaxSequenceId = Math.max(immMaxSequenceId, im.maxSequenceId());
             }
 
             return new BucketStateSnapshot(
@@ -143,6 +156,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 cur.estimatedSize(),
                 immutables.size(),
                 immTotalBytes,
+                walManager.lastSequenceId(),
+                cur.minSequenceId(),
+                cur.maxSequenceId(),
+                immMinSequenceId,
+                immMaxSequenceId,
                 0L
             );
         } finally {
@@ -164,17 +182,13 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     // ── Internal ──
 
-    private void maybeFreeze() {
+    private void maybeFreezeLocked() {
         if (curMemTable.shouldFreeze()) {
-            doFreeze();
+            doFreezeLocked();
         }
     }
 
-    private synchronized void doFreeze() {
-        // Secondary check: maybeFreeze() is lock-free, so multiple threads may see
-        // shouldFreeze()==true and race into this method. After the first freeze,
-        // curMemTable is replaced with an empty one — skip to avoid creating a
-        // useless empty ImmutableMemTable.
+    private void doFreezeLocked() {
         if (curMemTable.estimatedEntryCount() == 0) {
             return;
         }
@@ -196,7 +210,12 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
         @Override
         public void onDataRecord(byte[] key, byte[] value) {
-            dataRecords.add(new DataRecord(key, value));
+            dataRecords.add(new DataRecord(0, key, value));
+        }
+
+        @Override
+        public void onDataRecord(long sequenceId, byte[] key, byte[] value) {
+            dataRecords.add(new DataRecord(sequenceId, key, value));
         }
 
         @Override
@@ -210,5 +229,5 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
-    private record DataRecord(byte[] key, byte[] value) {}
+    private record DataRecord(long sequenceId, byte[] key, byte[] value) {}
 }

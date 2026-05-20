@@ -104,6 +104,9 @@ class PMSBucketDirectorImplTest {
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertEquals(1, snap.immutableMemTableCount());
             assertEquals(0, snap.curMemTableEstimatedEntryCount());
+            assertEquals(1L, snap.lastAssignedSequenceId());
+            assertEquals(1L, snap.immutableMemTableMinSequenceId());
+            assertEquals(1L, snap.immutableMemTableMaxSequenceId());
         } finally {
             dir.close();
         }
@@ -121,6 +124,25 @@ class PMSBucketDirectorImplTest {
 
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertTrue(snap.immutableMemTableCount() > 0, "Should have frozen at least one MemTable");
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void autoFreezePreservesSequenceBoundary() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(3, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.delete("k3".getBytes());
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(1, snap.immutableMemTableCount());
+            assertEquals(3L, snap.lastAssignedSequenceId());
+            assertEquals(1L, snap.immutableMemTableMinSequenceId());
+            assertEquals(3L, snap.immutableMemTableMaxSequenceId());
         } finally {
             dir.close();
         }
@@ -213,6 +235,7 @@ class PMSBucketDirectorImplTest {
             assertFalse(dir2.get("k1".getBytes()).isPresent(), "k1 was deleted");
             assertTrue(dir2.get("k2".getBytes()).isPresent(), "k2 should be recovered");
             assertArrayEquals("v2".getBytes(), dir2.get("k2".getBytes()).orElse(null));
+            assertEquals(3L, dir2.stateSnapshot().lastAssignedSequenceId());
         } finally {
             dir2.close();
         }

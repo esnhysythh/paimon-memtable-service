@@ -12,8 +12,9 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 ### 2.1 写入路径
 
 1. 数据通过 RPC 写入 `curMemTable`（基于 SkipList）。
-2. `curMemTable` 满后或达到时间阈值，冻结为 `ImmutableMemTable`，异步刷盘生成 SST。
-3. 触发 Sink 流程时，归并本地数据生成 Parquet 格式的 `preSink` 文件，调用 Paimon 2PC 接口提交新 Snapshot。
+2. Bucket 内部分配单调递增的 `sequenceId`，WAL 与 MemTable 同时记录该值。V1 使用轻量级 sequence：只确定写入边界，不提供 MVCC 快照读。
+3. `curMemTable` 满后或达到时间阈值，冻结为 `ImmutableMemTable`，冻结结果携带 `minSequenceId/maxSequenceId`，异步刷盘生成 SST。
+4. 触发 Sink 流程时，归并本地数据生成 Parquet 格式的 `preSink` 文件，调用 Paimon 2PC 接口提交新 Snapshot。Sink/WAL 截断必须以 sequence 边界为核心安全依据，Paimon snapshotId 只表示外部提交结果。
 
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
@@ -32,10 +33,11 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | 机制 | 说明 | 详细文档 |
 |------|------|---------|
 | WAL 与崩溃恢复 | V1 采用单盘 WAL，每条记录带 CRC32 校验和 Magic Number。WAL 包含数据写入记录及 Sink 状态机记录，支持崩溃后恢复。 | [pms-core.md](docs/pms-core.md) § 5 |
+| 轻量级 Sequence | 每条写入分配单调递增 sequenceId，作为 freeze/flush/sink/WAL 截断的内部边界坐标。V1 不做 MVCC 多版本。 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) |
 | Paimon 独占与 Compaction | PMS 独占 Paimon 表写入，内部直接调用 Paimon 原生 API 触发 Compaction | [pms-core.md](docs/pms-core.md) § 3.4 |
 | 序列化与 Schema 兼容 | PMS Client 传输格式：`SchemaId (Hash) + 各列偏移量 + 二进制串` | [pms-client.md](docs/pms-client.md) |
 | 流控 | 两层水位线：NORMAL（正常）/ OVERLOADED（拒绝写入） | [pms-core.md](docs/pms-core.md) § 4 |
-| 并发模型 | 无全局锁，volatile 引用原子切换 + 引用计数，初期不做快照读 | [pms-core.md](docs/pms-core.md) § 5 |
+| 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；flush/sink 等慢路径异步执行，初期不做快照读 | [pms-core.md](docs/pms-core.md) § 5 |
 | 优雅停机 | Drain → Quiesce → Shutdown 三阶段 | [pms-server.md](docs/pms-server.md) § 2.5 |
 
 > **后续演进**：双盘 WAL（主盘 + 备盘同步写、互恢复）作为后续演进方向，V1 不实现。
@@ -77,6 +79,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 | [design.md](design.md) | 顶层架构设计（本文档） |
 | [pms-core.md](docs/pms-core.md) | 核心引擎组件、接口定义、流控、并发模型、数据完整性 |
 | [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) | 状态机协调器 |
+| [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) | Sequence、写入边界、锁粒度与 WAL 优化设计说明 |
 | [pms-core-statistic.md](docs/pms-core-statistic.md) | 可观测性基础设施（待详细设计） |
 | [pms-server.md](docs/pms-server.md) | 服务端外壳 |
 | [pms-client.md](docs/pms-client.md) | 客户端 SDK |

@@ -25,27 +25,23 @@ public class SkipListCurMemTable implements CurMemTable {
     // may be momentarily inconsistent. Acceptable for heuristics, but document if needed later.
     private volatile long estimatedSize;
     private volatile int estimatedEntryCount;
+    private volatile long minSequenceId;
+    private volatile long maxSequenceId;
 
     public SkipListCurMemTable(MemTableConfig config) {
         this.config = config;
         this.map = new ConcurrentSkipListMap<>();
         this.estimatedSize = 0;
         this.estimatedEntryCount = 0;
+        this.minSequenceId = 0;
+        this.maxSequenceId = 0;
     }
 
     @Override
     public void put(Key key, Value value) {
         Value old = map.put(key, value);
         updateEstimatedSize(key, value, old);
-        if (old == null) {
-            estimatedEntryCount++;
-        }
-    }
-
-    @Override
-    public void delete(Key key) {
-        Value old = map.put(key, Value.TOMBSTONE);
-        updateEstimatedSize(key, Value.TOMBSTONE, old);
+        updateSequenceBounds(value.sequenceId());
         if (old == null) {
             estimatedEntryCount++;
         }
@@ -67,12 +63,16 @@ public class SkipListCurMemTable implements CurMemTable {
         ConcurrentSkipListMap<Key, Value> oldMap = this.map;
         long oldSize = this.estimatedSize;
         int oldCount = this.estimatedEntryCount;
+        long oldMinSequenceId = this.minSequenceId;
+        long oldMaxSequenceId = this.maxSequenceId;
 
         this.map = new ConcurrentSkipListMap<>();
         this.estimatedSize = 0;
         this.estimatedEntryCount = 0;
+        this.minSequenceId = 0;
+        this.maxSequenceId = 0;
 
-        return new SkipListImmutableMemTable(oldMap, oldSize, oldCount);
+        return new SkipListImmutableMemTable(oldMap, oldSize, oldCount, oldMinSequenceId, oldMaxSequenceId);
     }
 
     /**
@@ -94,6 +94,16 @@ public class SkipListCurMemTable implements CurMemTable {
     }
 
     @Override
+    public long minSequenceId() {
+        return minSequenceId;
+    }
+
+    @Override
+    public long maxSequenceId() {
+        return maxSequenceId;
+    }
+
+    @Override
     public Iterator<Entry> iterator() {
         // Direct iterator over entrySet, no Stream — avoids boxing overhead and
         // is compatible with future off-heap implementations (e.g. OakMap zero-copy).
@@ -101,9 +111,9 @@ public class SkipListCurMemTable implements CurMemTable {
     }
 
     private void updateEstimatedSize(Key key, Value value, Value old) {
-        int delta = 4 + key.size() + 4 + value.size();
+        int delta = 8 + 4 + key.size() + 4 + value.size();
         if (old != null) {
-            delta -= 4 + key.size() + 4 + old.size();
+            delta -= 8 + 4 + key.size() + 4 + old.size();
         }
         // Rough estimate of ConcurrentSkipListMap node overhead: object header (16B) +
         // key/value refs (16B) + forward pointers (24B) + alignment ≈ 64B.
@@ -114,6 +124,20 @@ public class SkipListCurMemTable implements CurMemTable {
             delta += 64;
         }
         estimatedSize += delta;
+    }
+
+    private void updateSequenceBounds(long sequenceId) {
+        if (sequenceId <= 0) {
+            return;
+        }
+        // 0 is the uninitialized sentinel; real sequenceIds start from 1.
+        // Callers must serialize write-boundary updates with freeze.
+        if (minSequenceId == 0 || sequenceId < minSequenceId) {
+            minSequenceId = sequenceId;
+        }
+        if (sequenceId > maxSequenceId) {
+            maxSequenceId = sequenceId;
+        }
     }
 
     private static class EntryIterator implements Iterator<Entry> {

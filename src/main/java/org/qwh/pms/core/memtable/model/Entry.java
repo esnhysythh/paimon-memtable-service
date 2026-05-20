@@ -7,6 +7,6 @@ public record Entry(Key key, Value value) {
     }
 
     public int estimatedSize() {
-        return 4 + key.size() + 4 + value.size();
+        return 8 + 4 + key.size() + 4 + value.size();
     }
 }

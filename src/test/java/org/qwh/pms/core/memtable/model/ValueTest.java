@@ -40,6 +40,16 @@ class ValueTest {
     }
 
     @Test
+    void sequenceIdIsMetadataNotValueIdentity() {
+        Value v1 = new Value("abc".getBytes(), 1);
+        Value v2 = new Value("abc".getBytes(), 2);
+        assertEquals(v1, v2);
+        assertEquals(v1.hashCode(), v2.hashCode());
+        assertEquals(1L, v1.sequenceId());
+        assertEquals(2L, v2.sequenceId());
+    }
+
+    @Test
     void equalsReturnsFalseForDifferentContent() {
         Value v1 = new Value("abc".getBytes());
         Value v2 = new Value("abd".getBytes());

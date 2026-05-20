@@ -14,12 +14,17 @@ public class SkipListImmutableMemTable implements ImmutableMemTable {
     private final ConcurrentSkipListMap<Key, Value> map;
     private final long estimatedSize;
     private final int estimatedEntryCount;
+    private final long minSequenceId;
+    private final long maxSequenceId;
     private final AtomicLong refCount = new AtomicLong(0);
 
-    SkipListImmutableMemTable(ConcurrentSkipListMap<Key, Value> map, long estimatedSize, int estimatedEntryCount) {
+    SkipListImmutableMemTable(ConcurrentSkipListMap<Key, Value> map, long estimatedSize, int estimatedEntryCount,
+                              long minSequenceId, long maxSequenceId) {
         this.map = map;
         this.estimatedSize = estimatedSize;
         this.estimatedEntryCount = estimatedEntryCount;
+        this.minSequenceId = minSequenceId;
+        this.maxSequenceId = maxSequenceId;
     }
 
     @Override
@@ -40,6 +45,16 @@ public class SkipListImmutableMemTable implements ImmutableMemTable {
     @Override
     public int estimatedEntryCount() {
         return estimatedEntryCount;
+    }
+
+    @Override
+    public long minSequenceId() {
+        return minSequenceId;
+    }
+
+    @Override
+    public long maxSequenceId() {
+        return maxSequenceId;
     }
 
     @Override
