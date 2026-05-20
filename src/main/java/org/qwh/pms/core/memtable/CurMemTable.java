@@ -14,8 +14,6 @@ public interface CurMemTable {
 
     void put(Key key, Value value);
 
-    void delete(Key key);
-
     Value get(Key key);
 
     /**
@@ -28,6 +26,10 @@ public interface CurMemTable {
     long estimatedSize();
 
     int estimatedEntryCount();
+
+    long minSequenceId();
+
+    long maxSequenceId();
 
     /**
      * Check whether this MemTable has reached its capacity threshold

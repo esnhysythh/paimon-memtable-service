@@ -20,6 +20,10 @@ public interface ImmutableMemTable {
 
     int estimatedEntryCount();
 
+    long minSequenceId();
+
+    long maxSequenceId();
+
     void incrementRef();
 
     void decrementRef();

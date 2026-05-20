@@ -8,12 +8,20 @@ import java.util.Arrays;
  * <b>Immutability contract:</b> The internal byte[] is NOT defensively copied for performance.
  * Callers MUST NOT modify the array after passing it to this class.
  */
-public record Value(byte[] bytes) {
+public record Value(byte[] bytes, long sequenceId) {
 
-    public static final Value TOMBSTONE = new Value(null);
+    public static final Value TOMBSTONE = new Value(null, 0);
+
+    public Value(byte[] bytes) {
+        this(bytes, 0);
+    }
 
     public Value {
         // null bytes is allowed only for TOMBSTONE
+    }
+
+    public static Value tombstone(long sequenceId) {
+        return new Value(null, sequenceId);
     }
 
     public boolean isTombstone() {

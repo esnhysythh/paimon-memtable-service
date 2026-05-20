@@ -21,9 +21,9 @@ class SkipListImmutableMemTableTest {
     @BeforeEach
     void setUp() {
         SkipListCurMemTable cur = new SkipListCurMemTable(TEST_CONFIG);
-        cur.put(new Key("k1".getBytes()), new Value("v1".getBytes()));
-        cur.put(new Key("k2".getBytes()), new Value("v2".getBytes()));
-        cur.delete(new Key("k3".getBytes()));
+        cur.put(new Key("k1".getBytes()), new Value("v1".getBytes(), 1));
+        cur.put(new Key("k2".getBytes()), new Value("v2".getBytes(), 2));
+        cur.put(new Key("k3".getBytes()), Value.tombstone(3));
         immutable = cur.freeze();
     }
 
@@ -58,6 +58,12 @@ class SkipListImmutableMemTableTest {
     @Test
     void estimatedSize() {
         assertTrue(immutable.estimatedSize() > 0);
+    }
+
+    @Test
+    void exposesSequenceBounds() {
+        assertEquals(1L, immutable.minSequenceId());
+        assertEquals(3L, immutable.maxSequenceId());
     }
 
     @Test

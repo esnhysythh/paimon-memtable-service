@@ -44,7 +44,12 @@ class WALManagerImplTest {
 
         @Override
         public void onDataRecord(byte[] key, byte[] value) {
-            dataRecords.add(new DataRecord(key, value));
+            dataRecords.add(new DataRecord(0, key, value));
+        }
+
+        @Override
+        public void onDataRecord(long sequenceId, byte[] key, byte[] value) {
+            dataRecords.add(new DataRecord(sequenceId, key, value));
         }
 
         @Override
@@ -58,7 +63,11 @@ class WALManagerImplTest {
         }
     }
 
-    record DataRecord(byte[] key, byte[] value) {}
+    record DataRecord(long sequenceId, byte[] key, byte[] value) {
+        DataRecord(byte[] key, byte[] value) {
+            this(0, key, value);
+        }
+    }
 
     private static void assertDataEquals(DataRecord expected, DataRecord actual) {
         assertArrayEquals(expected.key, actual.key);
@@ -86,12 +95,27 @@ class WALManagerImplTest {
     void appendAndReplayDataRecord() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
         wal.init();
-        wal.appendDataRecord("key1".getBytes(), "value1".getBytes());
+        long sequenceId = wal.appendDataRecord("key1".getBytes(), "value1".getBytes());
 
         CollectingCallback cb = writeCloseAndReplay(wal, 256);
 
+        assertEquals(1L, sequenceId);
         assertEquals(1, cb.dataRecords.size());
         assertDataEquals(new DataRecord("key1".getBytes(), "value1".getBytes()), cb.dataRecords.get(0));
+        assertEquals(1L, cb.dataRecords.get(0).sequenceId);
+    }
+
+    @Test
+    void appendDataRecordReturnsIncreasingSequenceIds() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(256));
+        wal.init();
+        try {
+            assertEquals(1L, wal.appendDataRecord("k1".getBytes(), "v1".getBytes()));
+            assertEquals(2L, wal.appendDataRecord("k2".getBytes(), "v2".getBytes()));
+            assertEquals(2L, wal.lastSequenceId());
+        } finally {
+            wal.close();
+        }
     }
 
     @Test
@@ -275,6 +299,48 @@ class WALManagerImplTest {
     }
 
     @Test
+    void sequenceIdContinuesAfterRestart() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(256));
+        wal.init();
+        assertEquals(1L, wal.appendDataRecord("k1".getBytes(), "v1".getBytes()));
+        assertEquals(2L, wal.appendDataRecord("k2".getBytes(), "v2".getBytes()));
+        wal.close();
+
+        WALManagerImpl recovered = new WALManagerImpl(config(256));
+        recovered.init();
+        try {
+            assertEquals(2L, recovered.lastSequenceId());
+            assertEquals(3L, recovered.appendDataRecord("k3".getBytes(), "v3".getBytes()));
+        } finally {
+            recovered.close();
+        }
+    }
+
+    @Test
+    void sequenceIdContinuesAfterTruncatingPreviousDataFiles() throws IOException {
+        PMSConfig cfg = config(1);
+        WALManagerImpl wal = new WALManagerImpl(cfg);
+        wal.init();
+        assertEquals(1L, wal.appendDataRecord("k1".getBytes(), "v1".getBytes()));
+        wal.appendSinkSuccess(10L);
+
+        byte[] largeCommitMessage = new byte[1100 * 1024];
+        Arrays.fill(largeCommitMessage, (byte) 'C');
+        wal.appendSinkPrepare(largeCommitMessage);
+        wal.truncate(10L);
+        wal.close();
+
+        WALManagerImpl recovered = new WALManagerImpl(cfg);
+        recovered.init();
+        try {
+            assertEquals(1L, recovered.lastSequenceId());
+            assertEquals(2L, recovered.appendDataRecord("k2".getBytes(), "v2".getBytes()));
+        } finally {
+            recovered.close();
+        }
+    }
+
+    @Test
     void appendAfterCloseThrows() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
         wal.init();
@@ -377,6 +443,7 @@ class WALManagerImplTest {
 
             DynamicSliceOutput corrupt = new DynamicSliceOutput(5);
             corrupt.writeByte(WALManagerImpl.TYPE_DATA);
+            corrupt.writeLong(1L);
             corrupt.writeInt(-1);
             writer.addRecord(corrupt.slice(), true);
         } finally {

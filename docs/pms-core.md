@@ -79,6 +79,15 @@ class WALManagerImpl implements WALManager {
 
 **数据语义约束**：PMS 内部和 Sink 到 Paimon 的数据处理均遵循 Paimon Deduplicate Merge Engine 规则——同一主键只保留最新记录，最新记录为 DELETE 则删除全部同主键记录。不允许其他 Merge Engine。这保证了 PMS 内部数据处理和查询的简单性：同一 Key 取最新值即可，归并时最新 Key 胜出，无需特殊合并函数。
 
+**轻量级 sequence 边界**：PMS 为每条成功进入 WAL 的数据写入分配单调递增的 `sequenceId`。V1 中 sequence 只用于确定内部处理边界，不提供 MVCC 快照读；同一 Key 在 MemTable 中仍只保留 latest value。sequence 必须随 WAL 持久化，恢复时从 WAL 中的最大 sequence 继续递增。
+
+sequence 的边界语义：
+- `Value/Entry` 携带 latest `sequenceId`，作为该 Key 最新写入的内部顺序。
+- `CurMemTable.freeze()` 产生的 `ImmutableMemTable` 记录 `minSequenceId/maxSequenceId`。
+- 后续 Flush/SST/Sink 元数据也必须记录覆盖的 sequence 范围。
+- Paimon `snapshotId` 表示外部提交结果；WAL 安全截断应最终以 PMS 内部 `persistedSequenceId` 为主边界，不能只依赖文件内 `maxSnapshotId`。
+- V1 不保存同 Key 多版本；未来如果要支持 MVCC，可将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。
+
 ### 3.1 MemTableEngine
 
 管理内存中的数据缓冲，基于 SkipList 实现。接口拆分为 `CurMemTable`（可写）和 `ImmutableMemTable`（只读 + 引用计数），由 `CurMemTable.freeze()` 产生 `ImmutableMemTable`。
@@ -93,6 +102,8 @@ interface CurMemTable {
     ImmutableMemTable freeze();  // 冻结为 immutable，返回只读实例
     long estimatedSize();
     int estimatedEntryCount();
+    long minSequenceId();
+    long maxSequenceId();
     boolean shouldFreeze();
     Iterator<Entry> iterator();
 }
@@ -109,6 +120,8 @@ interface ImmutableMemTable {
     Iterator<Entry> iterator();
     long estimatedSize();
     int estimatedEntryCount();
+    long minSequenceId();
+    long maxSequenceId();
     void incrementRef();
     void decrementRef();
     long refCount();
@@ -121,10 +134,12 @@ interface ImmutableMemTable {
   - 底层 `ConcurrentSkipListMap<Key, Value>`，线程安全。
   - 写入后检查是否达到 Freeze 阈值（`estimatedEntryCount() >= config.maxEntries()` 或 `estimatedSize() >= config.maxSizeBytes()`），达到则触发 Freeze。不拒绝写入，不阻塞写入路径。
   - `estimatedEntryCount` 和 `estimatedSize` 均为启发式估算值，非精确计数：高并发下 `volatile int ++` 可能丢失增量，误差在可接受范围内。
-  - `freeze()` 原子替换内部 Map 引用，返回持有旧 Map 的 `SkipListImmutableMemTable`。
+  - 跟踪当前 MemTable 的 `minSequenceId/maxSequenceId`，作为 freeze 后的边界元数据。
+  - `freeze()` 原子替换内部 Map 引用，返回持有旧 Map 与 sequence 边界的 `SkipListImmutableMemTable`。
 
 - **SkipListImmutableMemTable**：冻结后的只读 MemTable。
   - 构造时接收 `SkipListCurMemTable` 的内部 SkipList 引用（浅拷贝，零开销）。
+  - 暴露 `minSequenceId/maxSequenceId`，供后续 Flush/Sink/WAL 截断推进安全边界。
   - 维护 `AtomicLong refCount`，查询进入时 `incrementRef()`，离开时 `decrementRef()`。
   - `refCount` 归零后可安全退役（释放内存）。
 
@@ -198,14 +213,14 @@ V1 采用单盘 WAL，保证数据持久性和崩溃恢复能力。底层 I/O �
 
 WAL 中存在两类性质不同的记录——数据记录（DATA）和控制记录（SINK_PREPARE / SINK_SUCCESS）。它们必须在同一个有序流中，原因：
 1. **时序依赖**：SINK_PREPARE 必须在被 sink 的数据之后、新写入数据之前，恢复时才能判断哪些数据已进入 Sink 流程。
-2. **截断判定**：SINK_SUCCESS(snapshotId=N) 意味着"此之前的所有 DATA 都已安全提交到 Paimon"，截断旧 WAL 以此为界。这要求 data 和 control 在同一时序流中才能成立。
+2. **截断判定**：SINK_SUCCESS(snapshotId=N) 表示一次外部 Paimon 提交成功；真正的安全截断还需要知道本次提交覆盖到的 PMS 内部 sequence 边界。这要求 data 和 control 在同一时序流中才能还原提交关系。
 3. 若分为两个文件，崩溃后可能数据文件已写但控制文件未写，时序信息丢失，无法正确恢复。
 
 **应用层记录类型**：
 
 | 类型 | 值 | 说明 |
 |------|---|------|
-| DATA | 0x00 | 数据记录（Upsert 或 Delete），由 valueLen 区分 |
+| DATA | 0x00 | 数据记录，包含 sequenceId；Upsert 或 Delete 由 valueLen 区分 |
 | SINK_PREPARE | 0x01 | Paimon 返回的 CommitMessage 字节流 |
 | SINK_SUCCESS | 0x02 | 成功提交的 Snapshot ID |
 
@@ -231,10 +246,10 @@ CRC32C = masked CRC32C(ChunkType + Payload)
 PMS 应用层 Payload（由 WALManager 序列化/反序列化）：
 
 DATA (type=0x00):
-┌──────────┬──────────┬──────────┬────────────┬──────────┬──────────┐
-│ type     │ keyLen   │ key      │ valueLen   │ value    │          │
-│ (1 byte) │ (4 byte) │ (N byte) │ (4 byte)   │ (M byte) │          │
-└──────────┴──────────┴──────────┴────────────┴──────────┘──────────┘
+┌──────────┬────────────┬──────────┬──────────┬────────────┬──────────┐
+│ type     │ sequenceId │ keyLen   │ key      │ valueLen   │ value    │
+│ (1 byte) │ (8 byte)   │ (4 byte) │ (N byte) │ (4 byte)   │ (M byte) │
+└──────────┴────────────┴──────────┴──────────┴────────────┴──────────┘
   valueLen >= 0 → Upsert（value 为实际值）
   valueLen = -1 → Delete（无 value 字段）
 
@@ -256,7 +271,9 @@ SINK_SUCCESS (type=0x02):
 ```java
 interface WALManager {
     // 写入数据记录（Upsert: valueLen >= 0; Delete: value 为 null）
-    void appendDataRecord(byte[] key, byte[] value);
+    long appendDataRecord(byte[] key, byte[] value);
+
+    long lastSequenceId();
 
     // 写入控制记录
     void appendSinkPrepare(byte[] commitMessage);
@@ -274,6 +291,7 @@ interface WALManager {
 
 interface ReplayCallback {
     void onDataRecord(byte[] key, byte[] value);
+    default void onDataRecord(long sequenceId, byte[] key, byte[] value) { ... }
     void onSinkPrepare(byte[] commitMessage);
     void onSinkSuccess(long snapshotId);
 }
@@ -281,13 +299,15 @@ interface ReplayCallback {
 
 **WAL 文件管理**：
 - 按固定大小滚动（默认 256MB 一个文件）。
-- 每个文件的第一条记录是文件头部，格式为 `magic(4 bytes, "PMS\0") + maxSnapshotId(8 bytes, 初始为 0)`。头部记录作为普通 WAL 记录写入（经 LevelDB 传输层封装），而非文件级独立 header。
+- 每个文件的第一条记录是文件头部，格式为 `magic(4 bytes, "PMS\0") + maxSnapshotId(8 bytes, 初始为 0) + lastSequenceId(8 bytes, 文件创建时的全局 sequence 水位)`。头部记录作为普通 WAL 记录写入（经 LevelDB 传输层封装），而非文件级独立 header。
 - `maxSnapshotId` 在内存中随 `SINK_SUCCESS` 写入而更新，但**不回写文件头部**。重启恢复时通过 `readMaxSnapshotId()` 扫描文件中所有 `SINK_SUCCESS` 记录来获取真实值。
+- WALManager 扫描文件头和 DATA 记录恢复 `lastSequenceId`，新写入从 `max(sequenceId) + 1` 继续分配；即使旧 WAL 文件被截断，当前空 WAL 文件的头部也能保留 sequence 水位。
 
 **WAL 截断策略**：
 - 安全截断条件：存在 `SINK_SUCCESS(snapshotId=X)` 且 Paimon 侧 Snapshot X 确实存在。
 - 截断时删除所有 `maxSnapshotId <= 安全 Snapshot ID` 的 WAL 文件，正在写入的文件永不删除。
 - 截断触发：由 `BackgroundTaskScheduler` 定期执行（默认每 5 分钟），也可在 WAL 配额使用率超过 80% 时立即触发。
+- V1.3 后续实现应改为以 `persistedSequenceId` 为主要截断条件：只有当 WAL 文件 `maxSequenceId <= persistedSequenceId` 时才可删除。当前 snapshotId 条件只能作为临时策略。
 
 **WAL 恢复时校验**：
 - 传输层：由 LevelDB LogReader 逐 chunk 校验 CRC32C。尾部不完整 chunk 自动截断，中间 chunk 校验失败报告损坏。
@@ -428,14 +448,14 @@ class WriteAdmissionController {
 
 ### 5.1 核心原则
 
-- **无全局锁**：整个系统不使用任何粗粒度全局互斥锁。
+- **短写入临界区**：WAL 写入、sequence 分配和 MemTable 可见顺序必须保持一致；flush/sink/compaction 等慢路径不得持有写入临界区。
 - **Volatile 引用切换**：状态变更通过 volatile 引用的原子替换实现，而非就地修改。
 - **文件延迟删除**：被淘汰的 SST 文件不立即删除，确认无查询引用后才删除。
 - **初期简化**：查询时直接读 volatile 引用遍历，不做快照拷贝。引用计数仅在 Evict 删除文件时检查。
 
 ### 5.2 关键场景的并发控制
 
-**并发写入 curMemTable**：底层 `ConcurrentSkipListMap` 本身线程安全，无需额外同步。
+**并发写入 curMemTable**：底层 `ConcurrentSkipListMap` 本身线程安全；但写入提交顺序由 WALManager 分配的 `sequenceId` 确定，调用方必须保证 WAL record 与 MemTable value 使用同一个 sequence。
 
 **Freeze（curMemTable → ImmutableMemTable）**：
 - `curMemTable` 字段用 `volatile` 修饰。
@@ -508,7 +528,8 @@ RecoveryManager 启动
         │
         ▼
 5. 重放 DATA 记录，恢复 curMemTable
-   - 根据 WAL 截断点，只重放 snapshotId 之后的记录
+   - 根据 WAL 截断点，只重放安全边界之后的记录；当前实现支持 snapshotId highWatermark，后续应切换为 persistedSequenceId
+   - 扫描 DATA 记录中的 sequenceId，恢复 lastSequenceId，保证后续写入继续递增
    - 传输层由 LevelDB LogReader 逐 chunk 校验 CRC32C
    - 应用层解析 PMS Payload 时校验 type 合法性
         │

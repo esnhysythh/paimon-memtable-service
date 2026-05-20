@@ -78,7 +78,7 @@ PMS 中的数据单元经历以下状态流转：
 
 每个状态流转操作必须是原子的，确保查询路径不会看到中间状态：
 
-- **freeze**：`curMemTable` 引用用 volatile 修饰，原子切换为新的空 MemTable，原 MemTable 标记为 immutable 并加入 `newImmutableList`。
+- **freeze**：`curMemTable` 引用用 volatile 修饰，原子切换为新的空 MemTable，原 MemTable 标记为 immutable 并加入 `newImmutableList`。冻结结果必须携带 `minSequenceId/maxSequenceId`，后续 Flush/Sink/WAL 截断以该边界推进。
 - **flush**：Flush 完成后，将对应 ImmutableMemTable 从 `newImmutableList` 移至 `newSSTWithMemList`，同时注册 newSST 的 BloomFilter。
 - **sink**：Sink 完成后，将 newSSTWithMem 条目批量移至 `sinkedSSTWithMemList`。
 - **mem退役**：ImmutableMemTable 的引用计数归零后，从对应列表中移除，只保留 SST 引用。
@@ -139,6 +139,11 @@ record BucketStateSnapshot(
     long curMemTableSizeBytes,
     int immutableMemTableCount,
     long immutableMemTableTotalBytes,
+    long lastAssignedSequenceId,
+    long curMemTableMinSequenceId,
+    long curMemTableMaxSequenceId,
+    long immutableMemTableMinSequenceId,
+    long immutableMemTableMaxSequenceId,
     int newSSTCount,                    // TODO: 待 SST 模块实现后补充
     long newSSTTotalBytes,              // TODO: 待 SST 模块实现后补充
     int sinkedSSTCount,                 // TODO: 待 SST 模块实现后补充
@@ -149,7 +154,7 @@ record BucketStateSnapshot(
 ) {}
 ```
 
-> 当前实现仅包含前 5 个字段 + lastSinkedSnapshotId，SST 相关字段待 SST 模块实现后补充。
+> 当前实现包含 MemTable 统计、轻量 sequence 边界和 lastSinkedSnapshotId，SST 相关字段待 SST 模块实现后补充。
 
 ## 6. 冻结与刷盘策略
 
@@ -163,6 +168,7 @@ record BucketStateSnapshot(
 
 - Freeze 后立即异步提交 Flush 任务。
 - Flush 任务将 ImmutableMemTable 序列化为 SST 文件（自定义行存格式，参见 [pms-core.md](pms-core.md) § 3.2）。
+- Flush 输出的 SST 元数据必须记录源 ImmutableMemTable 的 `minSequenceId/maxSequenceId`。
 - Flush 期间，新的写入继续进入新的 curMemTable，不阻塞。
 
 ### 6.3 并发限制

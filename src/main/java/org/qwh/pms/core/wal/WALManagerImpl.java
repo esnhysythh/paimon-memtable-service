@@ -39,6 +39,8 @@ public class WALManagerImpl implements WALManager {
     private LogWriter currentWriter;
     private long nextFileNumber;
     private long currentFileBytes;
+    private long nextSequenceId = 1;
+    private long lastSequenceId = 0;
 
     private volatile boolean closed = false;
 
@@ -68,10 +70,15 @@ public class WALManagerImpl implements WALManager {
             }
         }
 
-        // Read maxSnapshotId from each existing file's header
+        // Read maxSnapshotId and maxSequenceId from each existing file.
         for (WalFileInfo info : walFiles.values()) {
-            info.maxSnapshotId = readMaxSnapshotId(info.file);
+            WalFileScan scan = scanWalFile(info.file);
+            info.maxSnapshotId = scan.maxSnapshotId;
+            info.minSequenceId = scan.minSequenceId;
+            info.maxSequenceId = scan.maxSequenceId;
+            lastSequenceId = Math.max(lastSequenceId, scan.maxSequenceId);
         }
+        nextSequenceId = lastSequenceId + 1;
 
         // Open current writer (new file if none exist)
         rollToNewFile();
@@ -79,13 +86,16 @@ public class WALManagerImpl implements WALManager {
     }
 
     @Override
-    public synchronized void appendDataRecord(byte[] key, byte[] value) {
+    public synchronized long appendDataRecord(byte[] key, byte[] value) {
         ensureNotClosed();
 
-        // Serialize: type(1) + keyLen(4) + key + valueLen(4) + [value]
-        int payloadSize = 1 + 4 + key.length + 4 + (value != null ? value.length : 0);
+        long sequenceId = nextSequenceId++;
+
+        // Serialize: type(1) + sequenceId(8) + keyLen(4) + key + valueLen(4) + [value]
+        int payloadSize = 1 + 8 + 4 + key.length + 4 + (value != null ? value.length : 0);
         DynamicSliceOutput output = new DynamicSliceOutput(payloadSize);
         output.writeByte(TYPE_DATA);
+        output.writeLong(sequenceId);
         output.writeInt(key.length);
         writeBytes(output, key);
         if (value != null) {
@@ -95,7 +105,20 @@ public class WALManagerImpl implements WALManager {
             output.writeInt(VALUE_LEN_DELETE);
         }
 
+        long fileNumber = currentWriter.getFileNumber();
         addRecord(output.slice(), false);
+        lastSequenceId = sequenceId;
+
+        WalFileInfo currentInfo = walFiles.get(fileNumber);
+        if (currentInfo != null) {
+            currentInfo.observeSequence(sequenceId);
+        }
+        return sequenceId;
+    }
+
+    @Override
+    public synchronized long lastSequenceId() {
+        return lastSequenceId;
     }
 
     @Override
@@ -120,10 +143,11 @@ public class WALManagerImpl implements WALManager {
         output.writeByte(TYPE_SINK_SUCCESS);
         output.writeLong(snapshotId);
 
+        long fileNumber = currentWriter.getFileNumber();
         addRecord(output.slice(), true);
 
         // Update maxSnapshotId for current file
-        WalFileInfo currentInfo = walFiles.get(currentWriter.getFileNumber());
+        WalFileInfo currentInfo = walFiles.get(fileNumber);
         if (currentInfo != null) {
             currentInfo.maxSnapshotId = Math.max(currentInfo.maxSnapshotId, snapshotId);
         }
@@ -197,8 +221,12 @@ public class WALManagerImpl implements WALManager {
                                 continue;
                             }
                             SliceInput input = record.input();
-                            requireBytes(input, 1 + 4, "DATA header");
+                            requireBytes(input, 1 + 8 + 4, "DATA header");
                             input.readByte(); // skip type
+                            long sequenceId = input.readLong();
+                            if (sequenceId <= 0) {
+                                throw corruptRecord("Invalid sequenceId: " + sequenceId);
+                            }
                             int keyLen = readNonNegativeLength(input, "keyLen");
                             requireBytes(input, keyLen + 4, "DATA key/value header");
                             byte[] key = new byte[keyLen];
@@ -216,7 +244,7 @@ public class WALManagerImpl implements WALManager {
                                 input.readBytes(value);
                             }
                             requireFullyConsumed(input, "DATA");
-                            callback.onDataRecord(key, value);
+                            callback.onDataRecord(sequenceId, key, value);
                         }
                         case TYPE_SINK_PREPARE -> {
                             SliceInput input = record.input();
@@ -320,25 +348,26 @@ public class WALManagerImpl implements WALManager {
         long fileNum = nextFileNumber++;
         File file = walDir.resolve(String.format("wal-%06d.log", fileNum)).toFile();
 
-        // Write file header: magic(4) + maxSnapshotId(8) = 12 bytes
+        // Write file header: magic(4) + maxSnapshotId(8) + lastSequenceId(8) = 20 bytes
         // Magic: "PMS\0"
-        DynamicSliceOutput headerOutput = new DynamicSliceOutput(12);
+        DynamicSliceOutput headerOutput = new DynamicSliceOutput(20);
         headerOutput.writeByte('P');
         headerOutput.writeByte('M');
         headerOutput.writeByte('S');
         headerOutput.writeByte(0);
         headerOutput.writeLong(0); // maxSnapshotId = 0 initially
+        headerOutput.writeLong(lastSequenceId);
 
         currentWriter = Logs.createLogWriter(file, fileNum, walConfig);
         currentWriter.addRecord(headerOutput.slice(), true);
 
-        currentFileBytes = estimateRecordSize(12);
+        currentFileBytes = estimateRecordSize(20);
         walFiles.put(fileNum, new WalFileInfo(fileNum, file));
     }
 
-    private long readMaxSnapshotId(File file) {
+    private WalFileScan scanWalFile(File file) {
         if (!file.exists() || file.length() == 0) {
-            return 0;
+            return WalFileScan.EMPTY;
         }
         try (FileInputStream fis = new FileInputStream(file);
              FileChannel channel = fis.getChannel()) {
@@ -347,10 +376,13 @@ public class WALManagerImpl implements WALManager {
             // Skip file header record
             Slice headerRecord = reader.readRecord();
             if (headerRecord == null || headerRecord.length() < 12) {
-                return 0;
+                return WalFileScan.EMPTY;
             }
             // Read header's initial maxSnapshotId
             long maxSnapshotId = headerRecord.getLong(4);
+            long headerLastSequenceId = headerRecord.length() >= 20 ? headerRecord.getLong(12) : 0;
+            long minSequenceId = Long.MAX_VALUE;
+            long maxSequenceId = headerLastSequenceId;
 
             // Scan all records to find the true maxSnapshotId from SINK_SUCCESS entries.
             // The header only stores the initial value (0); actual snapshotIds come from
@@ -363,12 +395,18 @@ public class WALManagerImpl implements WALManager {
                 if (type == TYPE_SINK_SUCCESS && record.length() >= 9) {
                     long snapshotId = record.getLong(1);
                     maxSnapshotId = Math.max(maxSnapshotId, snapshotId);
+                } else if (type == TYPE_DATA && record.length() >= 9) {
+                    long sequenceId = record.getLong(1);
+                    if (sequenceId > 0) {
+                        minSequenceId = Math.min(minSequenceId, sequenceId);
+                        maxSequenceId = Math.max(maxSequenceId, sequenceId);
+                    }
                 }
             }
-            return maxSnapshotId;
+            return new WalFileScan(maxSnapshotId, minSequenceId == Long.MAX_VALUE ? 0 : minSequenceId, maxSequenceId);
         } catch (IOException e) {
-            LOG.warn("Failed to read WAL file for maxSnapshotId: {}", file, e);
-            return 0;
+            LOG.warn("Failed to scan WAL file metadata: {}", file, e);
+            return WalFileScan.EMPTY;
         }
     }
 
@@ -444,11 +482,29 @@ public class WALManagerImpl implements WALManager {
         final long fileNumber;
         final File file;
         long maxSnapshotId;
+        long minSequenceId;
+        long maxSequenceId;
 
         WalFileInfo(long fileNumber, File file) {
             this.fileNumber = fileNumber;
             this.file = file;
             this.maxSnapshotId = 0;
+            this.minSequenceId = 0;
+            this.maxSequenceId = 0;
         }
+
+        void observeSequence(long sequenceId) {
+            if (sequenceId <= 0) {
+                return;
+            }
+            if (minSequenceId == 0 || sequenceId < minSequenceId) {
+                minSequenceId = sequenceId;
+            }
+            maxSequenceId = Math.max(maxSequenceId, sequenceId);
+        }
+    }
+
+    private record WalFileScan(long maxSnapshotId, long minSequenceId, long maxSequenceId) {
+        static final WalFileScan EMPTY = new WalFileScan(0, 0, 0);
     }
 }

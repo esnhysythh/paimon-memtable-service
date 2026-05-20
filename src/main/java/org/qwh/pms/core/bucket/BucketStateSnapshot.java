@@ -5,6 +5,11 @@ public record BucketStateSnapshot(
     long curMemTableSizeBytes,
     int immutableMemTableCount,
     long immutableMemTableTotalBytes,
+    long lastAssignedSequenceId,
+    long curMemTableMinSequenceId,
+    long curMemTableMaxSequenceId,
+    long immutableMemTableMinSequenceId,
+    long immutableMemTableMaxSequenceId,
     // TODO: 待 SST 模块实现后补充以下字段
     // int newSSTCount,
     // long newSSTTotalBytes,

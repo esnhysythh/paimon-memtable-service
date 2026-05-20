@@ -33,6 +33,10 @@ class SkipListCurMemTableTest {
         return new Value(s.getBytes());
     }
 
+    private Value value(String s, long sequenceId) {
+        return new Value(s.getBytes(), sequenceId);
+    }
+
     // ── put / get ──
 
     @Test
@@ -60,15 +64,16 @@ class SkipListCurMemTableTest {
     @Test
     void deleteSetsTombstone() {
         table.put(key("k1"), value("v1"));
-        table.delete(key("k1"));
+        table.put(key("k1"), Value.tombstone(1));
         Value result = table.get(key("k1"));
         assertNotNull(result);
         assertTrue(result.isTombstone());
+        assertEquals(1L, result.sequenceId());
     }
 
     @Test
     void deleteOnNonExistentKeyCreatesTombstone() {
-        table.delete(key("k1"));
+        table.put(key("k1"), Value.tombstone(1));
         Value result = table.get(key("k1"));
         assertNotNull(result);
         assertTrue(result.isTombstone());
@@ -77,7 +82,7 @@ class SkipListCurMemTableTest {
     @Test
     void putAfterDeleteOverwrites() {
         table.put(key("k1"), value("v1"));
-        table.delete(key("k1"));
+        table.put(key("k1"), Value.tombstone(1));
         table.put(key("k1"), value("v2"));
         Value result = table.get(key("k1"));
         assertFalse(result.isTombstone());
@@ -128,6 +133,22 @@ class SkipListCurMemTableTest {
         // Current should be empty
         assertEquals(0, table.estimatedEntryCount());
         assertNull(table.get(key("k1")));
+    }
+
+    @Test
+    void tracksSequenceBoundsAndTransfersThemToImmutable() {
+        table.put(key("k1"), value("v1", 10));
+        table.put(key("k2"), value("v2", 12));
+
+        assertEquals(10L, table.minSequenceId());
+        assertEquals(12L, table.maxSequenceId());
+
+        ImmutableMemTable frozen = table.freeze();
+
+        assertEquals(10L, frozen.minSequenceId());
+        assertEquals(12L, frozen.maxSequenceId());
+        assertEquals(0L, table.minSequenceId());
+        assertEquals(0L, table.maxSequenceId());
     }
 
     @Test
