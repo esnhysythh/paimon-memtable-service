@@ -375,12 +375,12 @@ public class WALManagerImpl implements WALManager {
 
             // Skip file header record
             Slice headerRecord = reader.readRecord();
-            if (headerRecord == null || headerRecord.length() < 12) {
+            if (headerRecord == null || headerRecord.length() < 20) {
                 return WalFileScan.EMPTY;
             }
             // Read header's initial maxSnapshotId
             long maxSnapshotId = headerRecord.getLong(4);
-            long headerLastSequenceId = headerRecord.length() >= 20 ? headerRecord.getLong(12) : 0;
+            long headerLastSequenceId = headerRecord.getLong(12);
             long minSequenceId = Long.MAX_VALUE;
             long maxSequenceId = headerLastSequenceId;
 

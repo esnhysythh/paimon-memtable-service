@@ -7,20 +7,26 @@ import java.util.Arrays;
  * <p>
  * <b>Immutability contract:</b> The internal byte[] is NOT defensively copied for performance.
  * Callers MUST NOT modify the array after passing it to this class.
+ * <p>
+ * Empty values are represented by a zero-length byte array. A null byte array is reserved
+ * exclusively for delete tombstones and must carry a positive sequence id.
  */
 public record Value(byte[] bytes, long sequenceId) {
-
-    public static final Value TOMBSTONE = new Value(null, 0);
 
     public Value(byte[] bytes) {
         this(bytes, 0);
     }
 
     public Value {
-        // null bytes is allowed only for TOMBSTONE
+        if (bytes == null && sequenceId <= 0) {
+            throw new IllegalArgumentException("tombstone must carry a positive sequence id");
+        }
     }
 
     public static Value tombstone(long sequenceId) {
+        if (sequenceId <= 0) {
+            throw new IllegalArgumentException("tombstone sequence id must be positive");
+        }
         return new Value(null, sequenceId);
     }
 

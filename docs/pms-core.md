@@ -88,6 +88,8 @@ sequence 的边界语义：
 - Paimon `snapshotId` 表示外部提交结果；WAL 安全截断应最终以 PMS 内部 `persistedSequenceId` 为主边界，不能只依赖文件内 `maxSnapshotId`。
 - V1 不保存同 Key 多版本；未来如果要支持 MVCC，可将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。
 
+**Value 编码语义**：PMS 不是通用 KV 存储，MemTable 中的 `Value.bytes` 不是任意用户字节值，而是一条 Paimon `InternalRow` 的序列化结果。非删除记录必须由后续 RowCodec/序列化管理器生成，代表完整的行编码。即使业务列全部为 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 或其他必要元信息，因此设计语义上不应为空 `byte[]`。`Value.bytes == null` 专用于 tombstone/delete，不表示业务层 NULL。
+
 ### 3.1 MemTableEngine
 
 管理内存中的数据缓冲，基于 SkipList 实现。接口拆分为 `CurMemTable`（可写）和 `ImmutableMemTable`（只读 + 引用计数），由 `CurMemTable.freeze()` 产生 `ImmutableMemTable`。
@@ -97,7 +99,6 @@ sequence 的边界语义：
 ```java
 interface CurMemTable {
     void put(Key key, Value value);
-    void delete(Key key);
     Value get(Key key);
     ImmutableMemTable freeze();  // 冻结为 immutable，返回只读实例
     long estimatedSize();
@@ -111,6 +112,7 @@ interface CurMemTable {
 
 - Schema 校验由上层处理，不在此接口传递。V1 中 PMS 绑定单表，Schema 不变（变更即 Fatal Error）。
 - Key 使用无符号字节比较（与 Paimon 主键序一致），参见 [paimon-primary-key-encoding.md](../../references/paimon-primary-key-encoding.md)。
+- 删除不通过 `CurMemTable.delete(Key)` 表达，而是写入 `Value.tombstone(sequenceId)`。这样 tombstone 与普通 upsert 一样携带明确的 sequence 边界。
 
 **ImmutableMemTable 接口**：
 
@@ -225,7 +227,8 @@ WAL 中存在两类性质不同的记录——数据记录（DATA）和控制记
 | SINK_SUCCESS | 0x02 | 成功提交的 Snapshot ID |
 
 说明：
-- DATA 记录中，Upsert 与 Delete 不占独立类型，通过 `valueLen >= 0` 表示 Upsert，`valueLen = -1` 表示 Delete。这与 Paimon Deduplicate Merge Engine 语义一致（后写覆盖，最新为 DELETE 则删除全部同主键记录）。
+- DATA 记录中，Upsert 与 Delete 不占独立类型，通过 `valueLen = -1` 表示 Delete，通过非负 `valueLen` 携带 Upsert payload。这与 Paimon Deduplicate Merge Engine 语义一致（后写覆盖，最新为 DELETE 则删除全部同主键记录）。
+- PMS 设计语义中，Upsert payload 应是 RowCodec 产生的 serialized `InternalRow`。`valueLen = 0` 不表示 tombstone，也不表示业务 NULL；它只是当前底层字节接口可能写出的空 payload，后续 RowCodec 接入后应视为非法或保留编码。
 - 不再需要 SINK_START：SINK_PREPARE 的存在本身已说明有 Sink 在进行中，SINK_START 不提供额外信息。
 - 不再需要 schemaId：V1 中 PMS 绑定单表、Schema 不变（变更即 Fatal Error），每条记录重复写 schemaId 是浪费。Schema 校验在启动恢复时做一次即可。
 
@@ -250,7 +253,8 @@ DATA (type=0x00):
 │ type     │ sequenceId │ keyLen   │ key      │ valueLen   │ value    │
 │ (1 byte) │ (8 byte)   │ (4 byte) │ (N byte) │ (4 byte)   │ (M byte) │
 └──────────┴────────────┴──────────┴──────────┴────────────┴──────────┘
-  valueLen >= 0 → Upsert（value 为实际值）
+  valueLen > 0  → Upsert（value 为 serialized InternalRow）
+  valueLen = 0  → 保留/非法行编码（不表示 tombstone 或业务 NULL）
   valueLen = -1 → Delete（无 value 字段）
 
 SINK_PREPARE (type=0x01):
@@ -270,7 +274,7 @@ SINK_SUCCESS (type=0x02):
 
 ```java
 interface WALManager {
-    // 写入数据记录（Upsert: valueLen >= 0; Delete: value 为 null）
+    // 写入数据记录（Upsert: value 为 serialized InternalRow; Delete: value 为 null）
     long appendDataRecord(byte[] key, byte[] value);
 
     long lastSequenceId();

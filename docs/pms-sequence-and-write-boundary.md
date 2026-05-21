@@ -160,13 +160,20 @@ freezeCurMemTable:
 
 ### 4.3 CurMemTable 删除语义
 
-引入 sequence 后，删除不能再通过无 sequence 的静态 `Value.TOMBSTONE` 表达。统一语义应为：
+引入 sequence 后，删除不能再通过无 sequence 的静态 `Value.TOMBSTONE` 表达；该常量应移除。统一语义应为：
 
 ```java
 curMemTable.put(key, Value.tombstone(sequenceId));
 ```
 
 因此 `CurMemTable.delete(Key)` 不应继续作为新写入路径 API 存在，除非它显式接收 `sequenceId`。
+
+PMS 的 `Value` 不是普通 KV 系统里的任意 byte value，而是序列化后的 Paimon `InternalRow`。因此：
+
+- `Value.bytes == null` 只表示删除 tombstone。
+- 非 tombstone 的 `Value.bytes` 应由 RowCodec/序列化管理器生成，表示完整的 `InternalRow` 编码。
+- 即使业务列全部为 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 等元信息，设计语义上不应是空 `byte[]`。
+- 当前 V1 底层字节接口暂不负责校验 `byte[]` 是否是合法行编码；该校验应在后续 RowCodec/序列化管理器接入后完成。
 
 ## 5. WAL 与 Sequence
 
@@ -177,6 +184,8 @@ PMS 尚未发布，不需要兼容旧 WAL 格式。V1 的 `DATA(type=0x00)` 直�
 ```text
 type(1) + sequenceId(8) + keyLen(4) + key + valueLen(4) + value
 ```
+
+其中 `valueLen = -1` 表示 delete/tombstone；`valueLen > 0` 表示 serialized `InternalRow`；`valueLen = 0` 不表示 tombstone 或业务 NULL，后续 RowCodec 接入后应视为非法或保留编码。
 
 ### 5.2 WAL 文件头保存 Sequence 水位
 

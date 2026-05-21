@@ -131,7 +131,15 @@ interface PMSBucketDirector {
 }
 ```
 
-### 5.1 BucketStateSnapshot
+### 5.1 写入 Value 语义
+
+`put(byte[] key, byte[] value)` 中的 `value` 不是通用 KV value，而是 Paimon `InternalRow` 的序列化结果。长期设计中，普通写入应由 RowCodec/序列化管理器把行数据编码成非空 byte payload 后再进入 BucketDirector。
+
+- `value == null` 不表示业务层 NULL，而是内部 delete/tombstone 语义；对外删除应使用 `delete(key)`。
+- 非删除写入的 `value` 应表示完整 serialized `InternalRow`。即使一行中所有业务列都是 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 等元信息，设计语义上不应为空 `byte[]`。
+- 当前 V1 BucketDirector 仍是底层字节接口，不负责校验 payload 是否符合未来 RowCodec 格式。RowCodec 接入后，空 payload、损坏 payload、schema 不匹配等问题应在序列化/反序列化边界被拒绝。
+
+### 5.2 BucketStateSnapshot
 
 ```java
 record BucketStateSnapshot(
