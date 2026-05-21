@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -61,6 +62,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public void put(byte[] key, byte[] value) {
+        Objects.requireNonNull(key, "key must not be null");
+        Objects.requireNonNull(value, "value must not be null; use delete(key) for tombstones or byte[0] for empty values");
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
@@ -76,6 +79,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public void delete(byte[] key) {
+        Objects.requireNonNull(key, "key must not be null");
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
@@ -91,6 +95,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public Optional<byte[]> get(byte[] key) {
+        Objects.requireNonNull(key, "key must not be null");
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();

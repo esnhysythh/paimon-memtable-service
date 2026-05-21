@@ -12,7 +12,7 @@ class ValueTest {
 
     @Test
     void isTombstoneForNull() {
-        assertTrue(Value.TOMBSTONE.isTombstone());
+        assertTrue(Value.tombstone(1).isTombstone());
     }
 
     @Test
@@ -21,8 +21,15 @@ class ValueTest {
     }
 
     @Test
+    void emptyByteArrayIsARealValue() {
+        Value value = new Value(new byte[0], 1);
+        assertFalse(value.isTombstone());
+        assertEquals(0, value.size());
+    }
+
+    @Test
     void sizeReturnsZeroForTombstone() {
-        assertEquals(0, Value.TOMBSTONE.size());
+        assertEquals(0, Value.tombstone(1).size());
     }
 
     @Test
@@ -58,13 +65,13 @@ class ValueTest {
 
     @Test
     void equalsReturnsTrueForTwoTombstones() {
-        assertEquals(Value.TOMBSTONE, new Value(null));
+        assertEquals(Value.tombstone(1), Value.tombstone(2));
     }
 
     @Test
     void equalsReturnsFalseForTombstoneVsData() {
-        assertNotEquals(Value.TOMBSTONE, new Value("data".getBytes()));
-        assertNotEquals(new Value("data".getBytes()), Value.TOMBSTONE);
+        assertNotEquals(Value.tombstone(1), new Value("data".getBytes()));
+        assertNotEquals(new Value("data".getBytes()), Value.tombstone(1));
     }
 
     @Test
@@ -84,7 +91,18 @@ class ValueTest {
 
     @Test
     void tombstoneHashCodeIsZero() {
-        assertEquals(0, Value.TOMBSTONE.hashCode());
+        assertEquals(0, Value.tombstone(1).hashCode());
+    }
+
+    @Test
+    void tombstoneCarriesSequenceId() {
+        assertEquals(7, Value.tombstone(7).sequenceId());
+    }
+
+    @Test
+    void tombstoneRequiresPositiveSequenceId() {
+        assertThrows(IllegalArgumentException.class, () -> Value.tombstone(0));
+        assertThrows(IllegalArgumentException.class, () -> new Value(null));
     }
 
     @Test
@@ -93,8 +111,8 @@ class ValueTest {
         set.add(new Value("v1".getBytes()));
         set.add(new Value("v1".getBytes()));
         set.add(new Value("v2".getBytes()));
-        set.add(Value.TOMBSTONE);
-        set.add(new Value(null));
+        set.add(Value.tombstone(1));
+        set.add(Value.tombstone(2));
         assertEquals(3, set.size(), "HashSet should deduplicate equal values (v1, v2, tombstone)");
     }
 

@@ -47,6 +47,32 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void putSupportsEmptyValue() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), new byte[0]);
+
+            Optional<byte[]> result = dir.get("k1".getBytes());
+            assertTrue(result.isPresent());
+            assertArrayEquals(new byte[0], result.get());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void putRejectsNullValue() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            assertThrows(NullPointerException.class, () -> dir.put("k1".getBytes(), null));
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
     void deleteMakesKeyInvisible() throws IOException {
         PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
         dir.init();

@@ -55,11 +55,9 @@ public class SkipListCurMemTable implements CurMemTable {
     @Override
     public ImmutableMemTable freeze() {
         // Capture current state, then swap in a fresh map — no data copied, only reference reassignment.
-        // Race tolerance: a concurrent put that already read the old map reference may write
-        // into the old map after we've handed it to the frozen instance. This is acceptable:
-        // the stray entry is valid data that simply gets flushed with the frozen batch.
-        // Same trade-off as RocksDB/LevelDB — strict consistency requires a flush coordinator
-        // at the engine level, not locking the hot put path.
+        // The caller must serialize put/delete/freeze with the same write boundary lock
+        // (PMSBucketDirectorImpl.writeMutex). That guarantees the frozen map and its
+        // sequence bounds describe the same committed write set.
         ConcurrentSkipListMap<Key, Value> oldMap = this.map;
         long oldSize = this.estimatedSize;
         int oldCount = this.estimatedEntryCount;
