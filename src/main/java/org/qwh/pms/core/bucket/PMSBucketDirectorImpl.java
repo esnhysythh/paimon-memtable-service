@@ -405,6 +405,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         @Override
         public void onSinkPrepare(byte[] commitMessage) {
             if (commitMessage.length > 0) {
+                // TODO: when the real Paimon sink is wired in, retain prepared commits
+                // without matching SINK_SUCCESS and retry commit during recovery.
                 SinkWalCodec.decodePrepare(commitMessage);
             }
         }

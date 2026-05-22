@@ -130,6 +130,33 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void pointLookupUsesCachedReaderAfterRegistration() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+
+        assertArrayEquals("v1".getBytes(), storage.get(meta, new Key("k1".getBytes())).orElseThrow().bytes());
+        try (RandomAccessFile file = new RandomAccessFile(meta.path().toFile(), "rw")) {
+            file.seek(file.length() - 1);
+            file.writeByte('X');
+        }
+
+        assertArrayEquals("v1".getBytes(), storage.get(meta, new Key("k1".getBytes())).orElseThrow().bytes());
+    }
+
+    @Test
+    void initIgnoresSstBeyondFlushBoundaryAsOrphan() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta orphan = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+
+        FileLocalStorageManager reloaded = storage();
+
+        assertTrue(Files.exists(orphan.path()));
+        assertTrue(reloaded.metas().isEmpty());
+        SSTMeta next = reloaded.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+        assertEquals(orphan.fileId() + 1, next.fileId());
+    }
+
+    @Test
     void corruptSstFailsReloadAfterFlushBoundaryWasPersisted() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
