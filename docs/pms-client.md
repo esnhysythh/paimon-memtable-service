@@ -14,7 +14,7 @@
 ```
 1. 建立 RPC 连接（连接池，默认 1 连接，可配置）
 2. 调用 Server 的 handshake 接口，获取当前 Schema 和 SchemaId
-3. 初始化 PMSerializer
+3. 初始化 RowCodec/PrimaryKeyCodec（命名和实现以后续 codec 阶段为准）
 4. 启动 SchemaTracker 定期检查线程
 ```
 
@@ -47,7 +47,9 @@ class PMSClient implements AutoCloseable {
 | `SCHEMA_MISMATCH` | Schema 不一致 | 触发 Reload 后重试 |
 | `SHUTTING_DOWN` | 服务停机 | 切换节点或等待 |
 
-### 2.2 PMSerializer (核心序列化器)
+### 2.2 RowCodec / PrimaryKeyCodec（核心序列化边界）
+
+当前阶段尚未实现正式 codec。本节描述的是后续 client/core 对接时需要满足的语义边界，具体类名和格式以后续 codec 阶段落地为准。
 
 **编码格式**：
 
@@ -70,7 +72,7 @@ class PMSClient implements AutoCloseable {
 **接口**：
 
 ```java
-class PMSerializer {
+class RowCodec {
     // 序列化
     byte[] serialize(RowData row);
     byte[] serialize(byte[] primaryKey, byte[] binaryRow);
@@ -79,8 +81,12 @@ class PMSerializer {
     RowData deserialize(byte[] data);
     byte[] extractColumn(byte[] data, int columnIndex);
 
-    // SchemaId
+    // SchemaId / SchemaVersion
     int currentSchemaId();
+}
+
+class PrimaryKeyCodec {
+    byte[] encodePrimaryKey(RowData row);
 }
 ```
 
@@ -104,14 +110,14 @@ class PMSerializer {
 │   ▼       ▼                                      │
 │  无操作  1. 请求 Server 获取最新 Schema            │
 │          2. 重新计算 SchemaId                     │
-│          3. 更新 PMSerializer                    │
+│          3. 更新 RowCodec/PrimaryKeyCodec        │
 │          4. 记录日志                              │
 └──────────────────────────────────────────────────┘
 ```
 
 **被动触发**：除定期检查外，当写入收到 `SCHEMA_MISMATCH` 响应时，立即触发 Reload，不等下次定期检查。
 
-**线程安全**：SchemaId 的更新使用 `volatile`，`PMSerializer` 的替换使用 `AtomicReference`，保证序列化过程中不会使用到半更新状态的 Serializer。
+**线程安全**：SchemaId 的更新使用 `volatile`，RowCodec/PrimaryKeyCodec 的替换使用 `AtomicReference`，保证序列化过程中不会使用到半更新状态的 codec。
 
 ## 3. 反压与重试策略
 

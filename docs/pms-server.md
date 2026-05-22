@@ -39,8 +39,8 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 3. 判断对齐情况（详见 [pms-core.md](pms-core.md) § 5.4）：
    - 若 Paimon 有更新（不应发生，因为独占），报警
    - 若本地有 SINK_PREPARE 但无 SINK_SUCCESS：
-     检查 preSink 文件在不在。在，则重试 commit；不在，则从本地 SST 重新生成 preSink
-   - 若只有 DATA_RECORD：重放数据恢复 MemTable
+     使用 WAL 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。当前 MockSinkManager 只用于打通 PMS 内部状态流转，不执行真实 Paimon 恢复。
+   - 若只有 DATA_RECORD：结合本地 `lastFlushedSequenceId` 恢复边界，只重放尚未被 SST 承载的 DATA 记录
 4. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程
 ```
 
@@ -118,9 +118,11 @@ class ConfigManager {
 | `pms.memtable.max_size_mb` | 256 | `memtableMaxSizeMb` |
 | `pms.wal.dir` | - | `walDir` |
 | `pms.wal.file_size_mb` | 256 | `walFileSizeMb` |
+| `pms.storage.dir` | - | `storageDir` |
 | `pms.storage.sinked_max_size_mb` | 10240 | `storageSinkedMaxSizeMb` |
 | `pms.storage.sinked_max_count` | 100 | `storageSinkedMaxCount` |
 | `pms.storage.compact_threshold_mb` | 32 | `storageCompactThresholdMb` |
+| `pms.storage.compact_min_files` | 4 | `storageCompactMinFiles` |
 | `pms.sink.interval_ms` | 30000 | `sinkIntervalMs` |
 | `pms.sink.max_pending_ssts` | 8 | `sinkMaxPendingSsts` |
 | `pms.flowcontrol.overloaded_immutable_count` | 4 | `flowcontrolOverloadedImmutableCount` |

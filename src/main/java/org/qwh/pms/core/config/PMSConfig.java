@@ -13,7 +13,7 @@ public record PMSConfig(
     public PMSConfig {
         if (memtable == null) memtable = new MemTableConfig(0, 0);
         if (wal == null) throw new IllegalArgumentException("WAL config must not be null");
-        if (storage == null) storage = new StorageConfig(0, 0, 0, 0);
+        if (storage == null) storage = new StorageConfig(null, 0, 0, 0, 0);
         if (sink == null) sink = new SinkConfig(0, 0);
         if (flowcontrol == null) flowcontrol = new FlowControlConfig(0, 0);
         if (paimon == null) throw new IllegalArgumentException("Paimon config must not be null");
@@ -31,6 +31,7 @@ public record PMSConfig(
                 getBoolean(props, "pms.wal.use_mmap", WalConfig.DEFAULT_USE_MMAP)
             ),
             new StorageConfig(
+                getRequiredString(props, "pms.storage.dir"),
                 getLong(props, "pms.storage.sinked_max_size_mb", StorageConfig.DEFAULT_SINKED_MAX_SIZE_MB),
                 getInt(props, "pms.storage.sinked_max_count", StorageConfig.DEFAULT_SINKED_MAX_COUNT),
                 getInt(props, "pms.storage.compact_threshold_mb", StorageConfig.DEFAULT_COMPACT_THRESHOLD_MB),
@@ -80,5 +81,13 @@ public record PMSConfig(
     private static String getString(Properties props, String key, String defaultValue) {
         String value = props.getProperty(key);
         return (value == null || value.isBlank()) ? defaultValue : value.trim();
+    }
+
+    private static String getRequiredString(Properties props, String key) {
+        String value = getString(props, key, null);
+        if (value == null) {
+            throw new IllegalArgumentException("Missing required config key: " + key);
+        }
+        return value;
     }
 }

@@ -12,6 +12,7 @@ class PMSConfigTest {
     void fromWithDefaultsOnly() {
         Properties props = new Properties();
         props.setProperty("pms.wal.dir", "/tmp/wal");
+        props.setProperty("pms.storage.dir", "/tmp/storage");
         props.setProperty("pms.paimon.table_path", "/tmp/table");
 
         PMSConfig config = PMSConfig.from(props);
@@ -26,6 +27,7 @@ class PMSConfigTest {
         assertFalse(config.wal().useMmap());
 
         // Storage defaults
+        assertEquals("/tmp/storage", config.storage().dir());
         assertEquals(StorageConfig.DEFAULT_SINKED_MAX_SIZE_MB, config.storage().sinkedMaxSizeMb());
         assertEquals(StorageConfig.DEFAULT_SINKED_MAX_COUNT, config.storage().sinkedMaxCount());
 
@@ -44,6 +46,7 @@ class PMSConfigTest {
     void fromWithCustomValues() {
         Properties props = new Properties();
         props.setProperty("pms.wal.dir", "/data/wal");
+        props.setProperty("pms.storage.dir", "/data/storage");
         props.setProperty("pms.paimon.table_path", "/data/table");
         props.setProperty("pms.memtable.max_entries", "500000");
         props.setProperty("pms.memtable.max_size_mb", "128");
@@ -57,6 +60,7 @@ class PMSConfigTest {
         assertEquals(500000, config.memtable().maxEntries());
         assertEquals(128, config.memtable().maxSizeMb());
         assertEquals(512, config.wal().fileSizeMb());
+        assertEquals("/data/storage", config.storage().dir());
         assertTrue(config.wal().useMmap());
         assertEquals(60000, config.sink().intervalMs());
         assertEquals(8, config.flowcontrol().overloadedImmutableCount());
@@ -65,6 +69,7 @@ class PMSConfigTest {
     @Test
     void fromMissingWalDirThrows() {
         Properties props = new Properties();
+        props.setProperty("pms.storage.dir", "/tmp/storage");
         props.setProperty("pms.paimon.table_path", "/tmp/table");
 
         assertThrows(IllegalArgumentException.class, () -> PMSConfig.from(props));
@@ -74,14 +79,26 @@ class PMSConfigTest {
     void fromMissingPaimonTablePathThrows() {
         Properties props = new Properties();
         props.setProperty("pms.wal.dir", "/tmp/wal");
+        props.setProperty("pms.storage.dir", "/tmp/storage");
 
         assertThrows(IllegalArgumentException.class, () -> PMSConfig.from(props));
+    }
+
+    @Test
+    void fromMissingStorageDirThrows() {
+        Properties props = new Properties();
+        props.setProperty("pms.wal.dir", "/tmp/wal");
+        props.setProperty("pms.paimon.table_path", "/tmp/table");
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> PMSConfig.from(props));
+        assertTrue(ex.getMessage().contains("pms.storage.dir"));
     }
 
     @Test
     void fromInvalidIntThrowsWithKeyName() {
         Properties props = new Properties();
         props.setProperty("pms.wal.dir", "/tmp/wal");
+        props.setProperty("pms.storage.dir", "/tmp/storage");
         props.setProperty("pms.paimon.table_path", "/tmp/table");
         props.setProperty("pms.memtable.max_entries", "not_a_number");
 
@@ -95,6 +112,7 @@ class PMSConfigTest {
     void fromInvalidLongThrowsWithKeyName() {
         Properties props = new Properties();
         props.setProperty("pms.wal.dir", "/tmp/wal");
+        props.setProperty("pms.storage.dir", "/tmp/storage");
         props.setProperty("pms.paimon.table_path", "/tmp/table");
         props.setProperty("pms.storage.sinked_max_size_mb", "not_a_number");
 
@@ -108,6 +126,7 @@ class PMSConfigTest {
     void fromBlankValueUsesDefault() {
         Properties props = new Properties();
         props.setProperty("pms.wal.dir", "/tmp/wal");
+        props.setProperty("pms.storage.dir", "/tmp/storage");
         props.setProperty("pms.paimon.table_path", "/tmp/table");
         props.setProperty("pms.memtable.max_entries", "   ");
 
