@@ -207,13 +207,28 @@ sequence 是单调边界坐标，不是连续行号。若某次 WAL 写入失败
 
 仅有 per-record sequence 还不足以安全截断 WAL。截断需要知道“Paimon 已经持久化包含到哪个 PMS sequence”。本文档使用 `persistedSequenceId` 表示这个已持久化的 PMS 内部边界。
 
-因此未来 Sink 控制记录需要扩展为类似：
+当前 SST 阶段先引入一个更早的本地恢复边界：`lastFlushedSequenceId`。它只表示“本地 SST 已经覆盖到哪个 sequence”，用于重启时跳过已经由 SST 承载的 WAL DATA 记录；它不表示数据已经进入 Paimon，也不能用于最终 WAL 截断。
 
 ```text
-SINK_SUCCESS_V2(snapshotId, persistedSequenceId)
+flush immutable -> SST 原子落盘成功
+  -> 原子写入 storage/flush-boundary.meta(lastFlushedSequenceId = sst.maxSequenceId)
+  -> 从 immutable 列表移除并加入 newSST 列表
+
+restart:
+  load SSTs
+  load lastFlushedSequenceId
+  replay WAL DATA where sequenceId > lastFlushedSequenceId
 ```
 
-或者在 `SINK_PREPARE_V2` 中记录本次 sink 覆盖的 `minSequenceId/maxSequenceId`，并在 success 阶段确认该范围已经持久化。
+若 SST 已落盘但边界文件尚未写入就崩溃，重启会重放更多 WAL 记录。这是安全的，代价只是恢复后 curMemTable 中临时包含已 flush 数据的重复表达。若边界文件已经写入，则对应 SST 成为恢复正确性的组成部分；启动时如果发现已持久化 flush 边界但 SST 损坏，应失败而不是静默跳过，以避免边界跳过 WAL 后丢失数据。
+
+因此 Sink 控制记录需要包含类似：
+
+```text
+SINK_SUCCESS(snapshotId, metadata(batchId, persistedSequenceId, sstIds))
+```
+
+当前实现已在 `SINK_PREPARE` payload 中记录本次 sink 覆盖的 `sstIds` 与 `minSequenceId/maxSequenceId`，并在 `SINK_SUCCESS` metadata 中确认 `persistedSequenceId` 与 `sstIds`。SST 是否 sinked 由成功记录推导，不单独写 SST state manifest。
 
 安全截断条件应变为：
 
@@ -250,13 +265,12 @@ PMS 当前阶段接受短提交锁，是为了保证边界正确性。它不应�
 - V1 使用轻量 sequence，不实现 MVCC。
 - 同一 Key 仍只保留 latest value。
 - 写入提交路径应串行化，flush/sink 慢路径不持写锁。
-- - sequence 可有空洞，但必须单调。
+- sequence 可有空洞，但必须单调。
+- `lastFlushedSequenceId` 只用于 SST/WAL 本地恢复边界，不用于 Paimon sink 成功判定。
 
 后续 TODO：
 
-- 将 `put/delete/freeze` 统一到同一写入提交锁。
 - 移除或改造 `CurMemTable.delete(Key)`，避免无 sequence tombstone。
-- 增加 `SINK_SUCCESS_V2(snapshotId, persistedSequenceId)` 或等价控制记录。
 - 将 WAL truncate 改为基于 `persistedSequenceId`。
 - 引入 WriteCoordinator，为 writer queue / group commit 预留扩展点。
 - 若未来需要 MVCC，将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。

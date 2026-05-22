@@ -5,7 +5,9 @@ import org.junit.jupiter.api.io.TempDir;
 import org.qwh.pms.core.config.*;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -22,8 +24,8 @@ class PMSBucketDirectorImplTest {
     private PMSConfig config(int memtableMaxEntries, int memtableMaxSizeMb) {
         return new PMSConfig(
             new MemTableConfig(memtableMaxEntries, memtableMaxSizeMb),
-            new WalConfig(tempDir.toString(), 256, false),
-            new StorageConfig(0, 0, 0, 0),
+            new WalConfig(tempDir.resolve("wal").toString(), 256, false),
+            new StorageConfig(tempDir.resolve("storage").toString(), 0, 0, 0, 0),
             new SinkConfig(0, 0),
             new FlowControlConfig(0, 0),
             new PaimonConfig("dummy", null)
@@ -220,6 +222,7 @@ class PMSBucketDirectorImplTest {
         assertThrows(IllegalStateException.class, () -> dir.delete("k".getBytes()));
         assertThrows(IllegalStateException.class, () -> dir.get("k".getBytes()));
         assertThrows(IllegalStateException.class, dir::freezeCurMemTable);
+        assertThrows(IllegalStateException.class, dir::sinkToPaimon);
         assertThrows(IllegalStateException.class, dir::stateSnapshot);
         dir.close();
     }
@@ -237,6 +240,131 @@ class PMSBucketDirectorImplTest {
             assertArrayEquals("v2".getBytes(), dir.get("k1".getBytes()).orElse(null));
         } finally {
             dir.close();
+        }
+    }
+
+    // ── Flush to SST ──
+
+    @Test
+    void flushMovesImmutableToNewSSTAndGetReadsFromSST() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(0, snap.immutableMemTableCount());
+            assertEquals(1L, snap.lastFlushedSequenceId());
+            assertEquals(1, snap.newSSTCount());
+            assertEquals(1L, snap.newSSTMinSequenceId());
+            assertEquals(1L, snap.newSSTMaxSequenceId());
+            assertTrue(snap.newSSTTotalBytes() > 0);
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void sstTombstoneStopsLookup() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.put("k1".getBytes(), "v2".getBytes());
+            dir.delete("k1".getBytes());
+            dir.freezeCurMemTable();
+
+            // Flush first immutable with v1, then second immutable with tombstone.
+            dir.flushImmutableMemTable();
+            dir.flushImmutableMemTable();
+
+            assertFalse(dir.get("k1".getBytes()).isPresent());
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(2, snap.newSSTCount());
+            assertEquals(1L, snap.newSSTMinSequenceId());
+            assertEquals(3L, snap.newSSTMaxSequenceId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void curMemTableOverridesFlushedSST() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.put("k1".getBytes(), "v2".getBytes());
+
+            assertArrayEquals("v2".getBytes(), dir.get("k1".getBytes()).orElse(null));
+        } finally {
+            dir.close();
+        }
+    }
+
+    // ── Sink boundary ──
+
+    @Test
+    void sinkMovesNewSSTsToSinkedAndKeepsDataReadable() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            Path newFile = tempDir.resolve("storage").resolve("sst-000001.new.sst");
+            Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+            assertTrue(Files.exists(newFile));
+
+            dir.sinkToPaimon();
+
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(0, snap.newSSTCount());
+            assertEquals(1, snap.sinkedSSTCount());
+            assertEquals(1L, snap.lastSinkedSnapshotId());
+            assertTrue(Files.exists(sinkedFile));
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void restartRecoversSinkedSSTFromWalAndRepairsFileNameLabel() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+
+        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        dir1.init();
+        dir1.put("k1".getBytes(), "v1".getBytes());
+        dir1.freezeCurMemTable();
+        dir1.flushImmutableMemTable();
+        dir1.sinkToPaimon();
+        dir1.close();
+
+        Path newFile = tempDir.resolve("storage").resolve("sst-000001.new.sst");
+        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+        Files.move(sinkedFile, newFile, StandardCopyOption.REPLACE_EXISTING);
+
+        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        dir2.init();
+        try {
+            assertArrayEquals("v1".getBytes(), dir2.get("k1".getBytes()).orElse(null));
+            BucketStateSnapshot snap = dir2.stateSnapshot();
+            assertEquals(0, snap.newSSTCount());
+            assertEquals(1, snap.sinkedSSTCount());
+            assertEquals(1L, snap.lastSinkedSnapshotId());
+            assertFalse(Files.exists(newFile));
+            assertTrue(Files.exists(sinkedFile));
+        } finally {
+            dir2.close();
         }
     }
 
@@ -283,6 +411,33 @@ class PMSBucketDirectorImplTest {
         try {
             // After recovery, k1=v2 (WAL replays all, latest wins)
             assertArrayEquals("v2".getBytes(), dir2.get("k1".getBytes()).orElse(null));
+        } finally {
+            dir2.close();
+        }
+    }
+
+    @Test
+    void recoverSkipsWalRecordsCoveredByFlushedSST() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+
+        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        dir1.init();
+        dir1.put("k1".getBytes(), "v1".getBytes());
+        dir1.freezeCurMemTable();
+        dir1.flushImmutableMemTable();
+        dir1.put("k2".getBytes(), "v2".getBytes());
+        dir1.close();
+
+        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        dir2.init();
+        try {
+            assertArrayEquals("v1".getBytes(), dir2.get("k1".getBytes()).orElse(null));
+            assertArrayEquals("v2".getBytes(), dir2.get("k2".getBytes()).orElse(null));
+
+            BucketStateSnapshot snap = dir2.stateSnapshot();
+            assertEquals(1L, snap.lastFlushedSequenceId());
+            assertEquals(1, snap.newSSTCount());
+            assertEquals(1, snap.curMemTableEstimatedEntryCount());
         } finally {
             dir2.close();
         }

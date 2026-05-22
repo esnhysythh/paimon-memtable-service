@@ -14,7 +14,7 @@
    └─ 根据表定义的主键列，从 RowData 中提取
    └─ 按 Paimon 主键序编码规则序列化为主键字节数组
 
-2. 调用 PMSerializer 将 RowData 序列化为二进制串
+2. 调用 RowCodec 将 RowData/InternalRow 序列化为二进制串
 
 3. 调用 PMSClient.write() 发送
    └─ 成功 → 继续

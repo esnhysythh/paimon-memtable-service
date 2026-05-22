@@ -1,6 +1,7 @@
 package org.qwh.pms.core.config;
 
 public record StorageConfig(
+    String dir,
     long sinkedMaxSizeMb,
     int sinkedMaxCount,
     int compactThresholdMb,
@@ -11,7 +12,14 @@ public record StorageConfig(
     public static final int DEFAULT_COMPACT_THRESHOLD_MB = 32;
     public static final int DEFAULT_COMPACT_MIN_FILES = 4;
 
+    public StorageConfig(long sinkedMaxSizeMb, int sinkedMaxCount, int compactThresholdMb, int compactMinFiles) {
+        this(null, sinkedMaxSizeMb, sinkedMaxCount, compactThresholdMb, compactMinFiles);
+    }
+
     public StorageConfig {
+        if (dir != null && dir.isBlank()) {
+            dir = null;
+        }
         if (sinkedMaxSizeMb <= 0) sinkedMaxSizeMb = DEFAULT_SINKED_MAX_SIZE_MB;
         if (sinkedMaxCount <= 0) sinkedMaxCount = DEFAULT_SINKED_MAX_COUNT;
         if (compactThresholdMb <= 0) compactThresholdMb = DEFAULT_COMPACT_THRESHOLD_MB;

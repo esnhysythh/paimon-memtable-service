@@ -10,6 +10,8 @@ public interface WALManager {
 
     void appendSinkSuccess(long snapshotId);
 
+    void appendSinkSuccess(long snapshotId, byte[] metadata);
+
     void replay(ReplayCallback callback, long highWatermarkSnapshotId);
 
     void truncate(long safeSnapshotId);

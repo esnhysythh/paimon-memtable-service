@@ -12,9 +12,11 @@ public interface PMSBucketDirector {
 
     void freezeCurMemTable();
 
-    // TODO: 待 SST 模块实现后补充以下方法
-    // void flushImmutableMemTable();
-    // void sinkToPaimon();
+    void flushImmutableMemTable();
+
+    void sinkToPaimon();
+
+    // TODO: 待 Sink/Compaction 模块实现后补充以下方法
     // void evictOldestSinkedSST();
     // void compactLocalSSTs();
     // void degradeMemCache();

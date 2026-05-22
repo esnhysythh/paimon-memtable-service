@@ -21,7 +21,7 @@ pms-core 定义所有核心配置的类型和默认值。配置的加载与解�
 // 各模块配置
 record MemTableConfig(int maxEntries, int maxSizeMb) { ... }   // 默认 1_000_000 / 256
 record WalConfig(String dir, int fileSizeMb, boolean useMmap) { ... }  // 必填 dir / 默认 256 / false
-record StorageConfig(long sinkedMaxSizeMb, int sinkedMaxCount,
+record StorageConfig(String dir, long sinkedMaxSizeMb, int sinkedMaxCount,
                      int compactThresholdMb, int compactMinFiles) { ... }
 record SinkConfig(int intervalMs, int maxPendingSsts) { ... }  // 默认 30000 / 8
 record FlowControlConfig(int overloadedImmutableCount,
@@ -50,6 +50,7 @@ record PMSConfig(
 | `pms.wal.dir` | WalConfig | dir | 必填 |
 | `pms.wal.file_size_mb` | WalConfig | fileSizeMb | 256 |
 | `pms.wal.use_mmap` | WalConfig | useMmap | false |
+| `pms.storage.dir` | StorageConfig | dir | 必填 |
 | `pms.storage.sinked_max_size_mb` | StorageConfig | sinkedMaxSizeMb | 10240 |
 | `pms.storage.sinked_max_count` | StorageConfig | sinkedMaxCount | 100 |
 | `pms.storage.compact_threshold_mb` | StorageConfig | compactThresholdMb | 32 |
@@ -152,27 +153,13 @@ interface ImmutableMemTable {
 
 ### 3.2 LocalStorageManager
 
-负责 `newSST` 和 `sinkedSST` 的落盘与读取。
+负责 `newSST` 和 `sinkedSST` 的落盘、读取和归并。SST 采用参考 LevelDB/RocksDB Block Based Table 的自定义行存格式，文件由 Data Blocks、BloomFilter Block、Index Block、Properties Block 和 Footer 组成。详细格式、与 LevelDB 的一致点和差异点参见 [pms-core-sst-format.md](pms-core-sst-format.md)。
 
-**SST 文件格式**（自定义行存）：
-
-```
-┌──────────────────────────────────────────────────────┐
-│ [Data Block 0]                                      │
-│ [Data Block 1]                                      │
-│ ...                                                  │
-│ [BloomFilter Block]                                  │
-│ [Index Block]                                        │
-│ [Footer]                                             │
-│   ├─ Magic: "PMS_SST_1"                             │
-│   ├─ Version, Block Count                            │
-│   ├─ BloomFilter / Index Block Offset                │
-│   └─ Footer CRC32 ── 覆盖 Footer 之前的全部数据      │
-└──────────────────────────────────────────────────────┘
-```
-
+核心语义：
 - Key 按主键序排列（与 Paimon 底层主键序编码 100% 一致，保证无需再排序即可写入 Paimon）。
-- V1 仅 Footer CRC32 校验全文件完整性，不做逐 Data Block CRC。
+- PMS V1 不采用 LevelDB `InternalKey = userKey + sequence + valueType` 设计；SST 排序 Key 只包含 user key，`sequenceId` 和 tombstone 信息放在 `Value` payload 与 `SSTMeta` 中。
+- SST 查询必须能区分 miss、PUT 命中和 DELETE tombstone 命中，避免已删除数据从更老层或 Paimon 穿透中复活。
+- V1 仅使用 Footer 中的全文件 CRC 校验完整性；逐 Data Block CRC 可作为后续演进。
 
 **核心接口**：
 
@@ -181,8 +168,11 @@ interface LocalStorageManager {
     // 将 ImmutableMemTable 刷盘为 newSST
     SSTMeta flushToSST(ImmutableMemTable memTable);
 
-    // 读取 SST 中的指定 Key
-    Optional<byte[]> get(SSTMeta meta, byte[] key);
+    // 读取 SST 中的指定 Key:
+    // Optional.empty() = miss
+    // Optional.of(Value with bytes != null) = PUT 命中
+    // Optional.of(Value with bytes == null) = DELETE tombstone 命中
+    Optional<Value> get(SSTMeta meta, Key key);
 
     // 多路归并合并多个 SST，保留最新 Key
     SSTMeta compactSSTs(List<SSTMeta> metas);
@@ -195,15 +185,27 @@ interface LocalStorageManager {
 }
 ```
 
+**SSTMeta** 至少包含文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、createdAtMillis、状态和引用计数。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。
+
+SST 文件名使用 `sst-%06d.new.sst` / `sst-%06d.sinked.sst` 作为可观察标签。文件名不是可靠状态来源；启动恢复时以 WAL 中的 sink success 信息推导真实状态，并 best-effort 修正文件名标签。
+
 **BloomFilter**：
 - 每个 SST 文件包含基于主键的 BloomFilter。
+- PUT 和 DELETE tombstone 都必须加入 BloomFilter；tombstone 命中时需要阻断更老层查询。
 - 写入 SST 时构建，基于期望 FPP（False Positive Rate，默认 0.01）分配位图大小。
 - 查询时先检查 BloomFilter，通过则读取 Data Block，不通过则跳过。
 
 **SST 文件校验**：
-- 读取时校验 Footer CRC32，覆盖 Footer 之前的全部数据。
+- 打开或注册 SST 时校验 Footer 中的全文件 CRC32，覆盖 Footer 之前的全部数据。
 - 校验失败 → 标记该 SST 文件为损坏，记录告警日志。损坏 SST 中的数据从其他层（更新层的 MemTable 或 Paimon 穿透）补全。
+- 若本地 `flush-boundary.meta` 已经记录 `lastFlushedSequenceId > 0`，说明 SST 已经参与 WAL 恢复边界。此时启动阶段发现 SST 损坏应失败，而不是静默跳过，否则可能因为 WAL replay 跳过已 flush sequence 而丢失数据。
 - V1 不做逐 Block 降级读取。
+
+**本地 Flush 恢复边界**：
+- `LocalStorageManager` 在 storage 目录维护 `flush-boundary.meta`，记录 `lastFlushedSequenceId`。
+- `flushToSST` 成功写出 SST 后，BucketDirector 原子推进该边界到 `SSTMeta.maxSequenceId`。
+- 重启时先加载 SST 和该边界，再 replay WAL；`sequenceId <= lastFlushedSequenceId` 的 DATA 记录由 SST 承载，不再回放到 curMemTable。
+- 该边界只表示本地 SST 已覆盖的数据范围，不表示 Paimon 已 commit；未来 WAL truncate 仍需以 sink 成功后的 `persistedSequenceId` 为准。
 
 ### 3.3 WALManager
 
@@ -223,8 +225,8 @@ WAL 中存在两类性质不同的记录——数据记录（DATA）和控制记
 | 类型 | 值 | 说明 |
 |------|---|------|
 | DATA | 0x00 | 数据记录，包含 sequenceId；Upsert 或 Delete 由 valueLen 区分 |
-| SINK_PREPARE | 0x01 | Paimon 返回的 CommitMessage 字节流 |
-| SINK_SUCCESS | 0x02 | 成功提交的 Snapshot ID |
+| SINK_PREPARE | 0x01 | prepared sink payload，包含 batchId、sstIds、sequence 范围、Paimon CommitMessage 等 |
+| SINK_SUCCESS | 0x02 | 成功提交的 snapshotId，可携带 sink success metadata |
 
 说明：
 - DATA 记录中，Upsert 与 Delete 不占独立类型，通过 `valueLen = -1` 表示 Delete，通过非负 `valueLen` 携带 Upsert payload。这与 Paimon Deduplicate Merge Engine 语义一致（后写覆盖，最新为 DELETE 则删除全部同主键记录）。
@@ -262,12 +264,17 @@ SINK_PREPARE (type=0x01):
 │ type     │ msgLen             │ commitMessage     │
 │ (1 byte) │ (4 byte)           │ (N byte)          │
 └──────────┴────────────────────┴───────────────────┘
+  commitMessage 在当前实现中由 SinkWalCodec 编码，包含 batchId、commitIdentifier、
+  sstIds、min/max sequence、prepared payload、fileRefs 和行数统计。
 
 SINK_SUCCESS (type=0x02):
-┌──────────┬────────────────────┐
-│ type     │ snapshotId         │
-│ (1 byte) │ (8 byte)           │
-└──────────┴────────────────────┘
+┌──────────┬────────────────────┬─────────────┬───────────────────┐
+│ type     │ snapshotId         │ metadataLen │ metadata          │
+│ (1 byte) │ (8 byte)           │ (4 byte)    │ (N byte)          │
+└──────────┴────────────────────┴─────────────┴───────────────────┘
+  metadata 可为空以兼容旧格式；当前 SinkWalCodec metadata 包含 batchId、
+  snapshotId、persistedSequenceId 和 sstIds。SST 是否已经 sinked 由成功记录中的
+  sstIds 推导，不单独写 SST state manifest。
 ```
 
 **接口**：
@@ -282,6 +289,7 @@ interface WALManager {
     // 写入控制记录
     void appendSinkPrepare(byte[] commitMessage);
     void appendSinkSuccess(long snapshotId);
+    void appendSinkSuccess(long snapshotId, byte[] metadata);
 
     // 恢复重放
     void replay(ReplayCallback callback, long highWatermarkSnapshotId);
@@ -298,6 +306,7 @@ interface ReplayCallback {
     default void onDataRecord(long sequenceId, byte[] key, byte[] value) { ... }
     void onSinkPrepare(byte[] commitMessage);
     void onSinkSuccess(long snapshotId);
+    default void onSinkSuccess(long snapshotId, byte[] metadata) { ... }
 }
 ```
 
@@ -311,49 +320,39 @@ interface ReplayCallback {
 - 安全截断条件：存在 `SINK_SUCCESS(snapshotId=X)` 且 Paimon 侧 Snapshot X 确实存在。
 - 截断时删除所有 `maxSnapshotId <= 安全 Snapshot ID` 的 WAL 文件，正在写入的文件永不删除。
 - 截断触发：由 `BackgroundTaskScheduler` 定期执行（默认每 5 分钟），也可在 WAL 配额使用率超过 80% 时立即触发。
-- V1.3 后续实现应改为以 `persistedSequenceId` 为主要截断条件：只有当 WAL 文件 `maxSequenceId <= persistedSequenceId` 时才可删除。当前 snapshotId 条件只能作为临时策略。
+- 后续实现应改为以 `persistedSequenceId` 为主要截断条件：只有当 WAL 文件 `maxSequenceId <= persistedSequenceId` 时才可删除。当前 snapshotId 条件只能作为临时策略；`persistedSequenceId` 已由新版 `SINK_SUCCESS` metadata 承载。
 
 **WAL 恢复时校验**：
 - 传输层：由 LevelDB LogReader 逐 chunk 校验 CRC32C。尾部不完整 chunk 自动截断，中间 chunk 校验失败报告损坏。
 - 应用层：解析 PMS Payload 时校验 type 合法性、keyLen/valueLen 范围。
 - 中间记录校验失败 → 磁盘损坏 → 报错，人工介入（V1 单盘无法从备盘恢复）。
 
-### 3.4 PaimonSinkManager
+### 3.4 SinkManager 与后续 Paimon Sink
 
-封装对 Paimon 底层 API 的调用，严格遵循 2PC 流程。
+封装 PMS 内部 sink 边界。当前实现为 `MockSinkManager`，只用于打通 BucketDirector、SST 状态转换和 WAL 记录；后续真实实现再封装 Paimon 底层 API，并严格遵循 2PC 流程。
 
 **2PC 流程**：
 
 ```
-1. 提取本地所有 newSST 和 ImmutableMemTable
-2. 归并生成 preSink Parquet 文件
-   └─ 多路归并：按主键序归并 newSST + ImmutableMemTable，保留最新 Key
-   └─ 输出 Parquet 格式（与 Paimon 底层格式一致）
-3. 调用 Paimon prepareCommit → CommitMessage
-4. 通知 WALManager 写入 SINK_PREPARE
+1. 选择本地待 sink 的 newSST，形成 `SinkBatch(batchId, sstIds, minSeq, maxSeq)`
+2. 将 SST 适配为有序 iterator，归并同 Key 最新记录
+3. 调用 Paimon prepareCommit → CommitMessage 和 data file refs
+4. 通知 WALManager 写入 `SINK_PREPARE`，payload 包含 batch、sstIds、sequence 范围和 prepared commit 信息
 5. 调用 Paimon commit → 新 Snapshot
-6. 通知 WALManager 写入 SINK_SUCCESS（含 Snapshot ID）
-7. 保留 preSink 文件直到 SINK_SUCCESS 落盘
-   └─ 防止崩溃重试时需重新生成 preSink
+6. 通知 WALManager 写入 `SINK_SUCCESS`，metadata 包含 batch、snapshotId、persistedSequenceId 和 sstIds
+7. BucketDirector 根据 WAL 成功记录将对应 SST 视为 sinked，并 best-effort rename 文件名标签
 ```
 
 **接口**：
 
 ```java
-interface PaimonSinkManager {
-    // 执行完整的 Sink 流程
-    SinkResult sink(SinkContext context);
-
-    // 触发 Paimon Compaction
-    void compact();
-
-    // 获取当前最新 Snapshot ID
-    long latestSnapshotId();
-
-    // 基于 Manifest 索引穿透查询
-    Optional<byte[]> paimonGet(byte[] key);
+interface SinkManager {
+    PreparedSinkCommit prepare(SinkBatch batch);
+    SinkCommitResult commit(PreparedSinkCommit prepared);
 }
 ```
+
+当前实现使用 `MockSinkManager` 跑通 PMS 内部状态流转，后续真实实现从 Paimon-sink-demo 迁移 `PaimonFlusher/PaimonCommitter` 能力并替换 mock。
 
 **Compaction 集成**：
 - 调用 Paimon 原生 `Table.compact()` 接口，不自己实现合并逻辑。
@@ -522,9 +521,8 @@ RecoveryManager 启动
 4. 检查是否存在 SINK_PREPARE 但无 SINK_SUCCESS
    ┌───────────────────────────────────────────────────────┐
    │ 有 SINK_PREPARE，无 SINK_SUCCESS                       │
-   │ → 检查 preSink 文件是否存在                            │
-   │   ├─ 存在 → 使用 CommitMessage 重试 Paimon commit     │
-   │   └─ 不存在 → 从本地 SST 重新生成 preSink，重试全流程  │
+   │ → 使用 WAL 中保存的 prepared commit payload 和 fileRefs │
+   │   校验 Paimon data files 后重试 commit                 │
    ├───────────────────────────────────────────────────────┤
    │ 无 SINK_PREPARE                                       │
    │ → 仅重放 DATA 记录恢复 MemTable                       │
@@ -532,7 +530,8 @@ RecoveryManager 启动
         │
         ▼
 5. 重放 DATA 记录，恢复 curMemTable
-   - 根据 WAL 截断点，只重放安全边界之后的记录；当前实现支持 snapshotId highWatermark，后续应切换为 persistedSequenceId
+   - 本地 SST 已覆盖的数据由 lastFlushedSequenceId 跳过
+   - Paimon 已提交的数据后续应由 persistedSequenceId 控制 WAL truncate
    - 扫描 DATA 记录中的 sequenceId，恢复 lastSequenceId，保证后续写入继续递增
    - 传输层由 LevelDB LogReader 逐 chunk 校验 CRC32C
    - 应用层解析 PMS Payload 时校验 type 合法性

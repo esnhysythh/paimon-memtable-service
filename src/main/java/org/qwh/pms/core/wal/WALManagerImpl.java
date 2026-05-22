@@ -136,12 +136,22 @@ public class WALManagerImpl implements WALManager {
 
     @Override
     public synchronized void appendSinkSuccess(long snapshotId) {
-        ensureNotClosed();
+        appendSinkSuccess(snapshotId, new byte[0]);
+    }
 
-        int payloadSize = 1 + 8;
+    @Override
+    public synchronized void appendSinkSuccess(long snapshotId, byte[] metadata) {
+        ensureNotClosed();
+        if (metadata == null) {
+            metadata = new byte[0];
+        }
+
+        int payloadSize = 1 + 8 + 4 + metadata.length;
         DynamicSliceOutput output = new DynamicSliceOutput(payloadSize);
         output.writeByte(TYPE_SINK_SUCCESS);
         output.writeLong(snapshotId);
+        output.writeInt(metadata.length);
+        writeBytes(output, metadata);
 
         long fileNumber = currentWriter.getFileNumber();
         addRecord(output.slice(), true);
@@ -262,8 +272,16 @@ public class WALManagerImpl implements WALManager {
                             requireBytes(input, 1 + 8, "SINK_SUCCESS payload");
                             input.readByte(); // skip type
                             long snapshotId = input.readLong();
+                            byte[] metadata = new byte[0];
+                            if (input.available() > 0) {
+                                requireBytes(input, 4, "SINK_SUCCESS metadata length");
+                                int metadataLen = readNonNegativeLength(input, "metadataLen");
+                                requireBytes(input, metadataLen, "SINK_SUCCESS metadata");
+                                metadata = new byte[metadataLen];
+                                input.readBytes(metadata);
+                            }
                             requireFullyConsumed(input, "SINK_SUCCESS");
-                            callback.onSinkSuccess(snapshotId);
+                            callback.onSinkSuccess(snapshotId, metadata);
                             if (snapshotId >= highWatermarkSnapshotId) {
                                 pastHighWatermark = true;
                             }

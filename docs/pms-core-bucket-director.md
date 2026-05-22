@@ -1,7 +1,7 @@
 # PMS Bucket Director 设计文档
 
 ## 1. 模块定位
-`PMSBucketDirector` 是 `pms-core` 的总协调器，管理一条 Paimon 表数据从写入到最终落盘的完整生命周期。它不直接持有数据，而是协调 MemTableEngine、LocalStorageManager、WALManager、PaimonSinkManager 四个子组件的协作。
+`PMSBucketDirector` 是 `pms-core` 的总协调器，管理一条 Paimon 表数据从写入到最终落盘的完整生命周期。它不直接持有数据，而是协调 MemTableEngine、LocalStorageManager、WALManager、SinkManager 四个子组件的协作。当前 `SinkManager` 使用 mock 实现打通状态流转，后续替换为真实 Paimon sink 实现。
 
 ## 2. 核心职责
 - 管理数据单元的状态机流转。
@@ -79,8 +79,8 @@ PMS 中的数据单元经历以下状态流转：
 每个状态流转操作必须是原子的，确保查询路径不会看到中间状态：
 
 - **freeze**：`curMemTable` 引用用 volatile 修饰，原子切换为新的空 MemTable，原 MemTable 标记为 immutable 并加入 `newImmutableList`。冻结结果必须携带 `minSequenceId/maxSequenceId`，后续 Flush/Sink/WAL 截断以该边界推进。
-- **flush**：Flush 完成后，将对应 ImmutableMemTable 从 `newImmutableList` 移至 `newSSTWithMemList`，同时注册 newSST 的 BloomFilter。
-- **sink**：Sink 完成后，将 newSSTWithMem 条目批量移至 `sinkedSSTWithMemList`。
+- **flush**：SST 文件原子落盘成功后，先推进本地 `lastFlushedSequenceId`，再将对应 ImmutableMemTable 从 `newImmutableList` 移至 `newSSTWithMemList`，同时注册 newSST 的 BloomFilter。若边界推进失败，ImmutableMemTable 仍保留在内存列表中，不进入已 flush 状态。
+- **sink**：`SINK_PREPARE` 先将 batch、SST id 列表、sequence 范围和 prepared commit payload 写入 WAL；Paimon commit 成功后，`SINK_SUCCESS` 将 batch、snapshotId、persistedSequenceId 和 SST id 列表写入 WAL。随后内存中将对应 newSST 批量移至 sinkedSST，并 best-effort rename 文件名用于人工观察。SST 是否 sinked 的可靠判断以 WAL 成功记录为准，不以文件名为准。
 - **mem退役**：ImmutableMemTable 的引用计数归零后，从对应列表中移除，只保留 SST 引用。
 - **evict**：淘汰最老的 sinkedSST，从列表移除并删除磁盘文件（需确认无查询引用）。
 
@@ -96,6 +96,16 @@ PMS 中的数据单元经历以下状态流转：
 5. sinkedSSTs (BloomFilter 加速)  ── 磁盘读取
 6. Paimon 穿透查询                ── 最慢，基于 Manifest 索引定位
 ```
+
+各层内部读取统一使用 `Value` 语义表达三态：
+
+| 层级结果 | 含义 | BucketDirector 动作 |
+|----------|------|---------------------|
+| `null` 或 `Optional.empty()` | miss | 继续查下一层 |
+| `Value.bytes() != null` | PUT 命中 | 返回该 value bytes |
+| `Value.bytes() == null` | DELETE tombstone 命中 | 停止穿透，返回 `Optional.empty()` |
+
+因此 LocalStorageManager 的 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 穿透中复活。
 
 **查询穿透过程中的并发**：初期方案为直接遍历 volatile 列表，不做快照拷贝。层列表通过 volatile 引用替换整个列表，查询线程不会看到半更新状态。详见 [pms-core.md](pms-core.md) § 5.2。
 
@@ -113,15 +123,15 @@ interface PMSBucketDirector {
 
     // ── 状态流转触发 ──
     void freezeCurMemTable();
-    void flushImmutableMemTable();    // TODO: 待 SST 模块实现
-    void sinkToPaimon();             // TODO: 待 Paimon 集成实现
-    void evictOldestSinkedSST();     // TODO: 待 SST 模块实现
+    void flushImmutableMemTable();
+    void sinkToPaimon();             // 当前为 MockSinkManager，真实 Paimon sink 后续替换
+    void evictOldestSinkedSST();     // TODO: 待淘汰策略实现
 
     // ── 本地 SST 合并 ──
-    void compactLocalSSTs();         // TODO: 待 SST 模块实现
+    void compactLocalSSTs();         // TODO: 待 SST compact 实现
 
     // ── Mem 缓存退化 ──
-    void degradeMemCache();          // TODO: 待 SST 模块实现
+    void degradeMemCache();          // TODO: 待双持状态完整实现
 
     // ── 状态快照（供管理接口使用）──
     BucketStateSnapshot stateSnapshot();
@@ -152,17 +162,20 @@ record BucketStateSnapshot(
     long curMemTableMaxSequenceId,
     long immutableMemTableMinSequenceId,
     long immutableMemTableMaxSequenceId,
-    int newSSTCount,                    // TODO: 待 SST 模块实现后补充
-    long newSSTTotalBytes,              // TODO: 待 SST 模块实现后补充
-    int sinkedSSTCount,                 // TODO: 待 SST 模块实现后补充
-    long sinkedSSTTotalBytes,           // TODO: 待 SST 模块实现后补充
-    int withMemCount,                   // TODO: 待 SST 模块实现后补充
-    long withMemTotalBytes,             // TODO: 待 SST 模块实现后补充
+    long lastFlushedSequenceId,
+    int newSSTCount,
+    long newSSTTotalBytes,
+    long newSSTMinSequenceId,
+    long newSSTMaxSequenceId,
+    int sinkedSSTCount,
+    long sinkedSSTTotalBytes,
+    int withMemCount,                   // TODO: 待双持状态完整实现后补充
+    long withMemTotalBytes,             // TODO: 待双持状态完整实现后补充
     long lastSinkedSnapshotId
 ) {}
 ```
 
-> 当前实现包含 MemTable 统计、轻量 sequence 边界和 lastSinkedSnapshotId，SST 相关字段待 SST 模块实现后补充。
+> 当前实现包含 MemTable 统计、轻量 sequence 边界、`lastFlushedSequenceId`、newSST/sinkedSST 统计和 lastSinkedSnapshotId；双持状态统计待后续补充。
 
 ## 6. 冻结与刷盘策略
 
@@ -175,8 +188,10 @@ record BucketStateSnapshot(
 ### 6.2 Flush 策略
 
 - Freeze 后立即异步提交 Flush 任务。
-- Flush 任务将 ImmutableMemTable 序列化为 SST 文件（自定义行存格式，参见 [pms-core.md](pms-core.md) § 3.2）。
+- Flush 任务将 ImmutableMemTable 序列化为 SST 文件（自定义行存格式，参见 [pms-core-sst-format.md](pms-core-sst-format.md)）。
 - Flush 输出的 SST 元数据必须记录源 ImmutableMemTable 的 `minSequenceId/maxSequenceId`。
+- SST 文件原子落盘后，BucketDirector 将 `lastFlushedSequenceId` 推进到该 SST 的 `maxSequenceId`。重启恢复时，WAL 中 `sequenceId <= lastFlushedSequenceId` 的 DATA 记录不再回放到 curMemTable，而由已加载 SST 承载。
+- `lastFlushedSequenceId` 是本地 SST/WAL 恢复边界，不表示 Paimon Sink 已成功；后续 WAL 截断仍应等待 Sink 成功后的 `persistedSequenceId`。
 - Flush 期间，新的写入继续进入新的 curMemTable，不阻塞。
 
 ### 6.3 并发限制
@@ -192,37 +207,83 @@ record BucketStateSnapshot(
 - 距上次 Sink 间隔超过 `PMSConfig.sinkIntervalMs`（默认 30s）。
 - 流控 OVERLOADED 水位下提前触发。
 
-### 7.2 Sink 流程（与 PaimonSinkManager 协作）
+### 7.2 Sink 流程（当前 MockSinkManager，后续真实 Paimon 实现）
 
+当前实现先使用 `MockSinkManager` 打通边界，不真实写 Paimon。接口形态对齐后续真实 Paimon sink，后续可将编排逻辑从 BucketDirector 中抽出为更薄的 `SinkCoordinator`：
+
+```java
+interface SinkManager {
+    PreparedSinkCommit prepare(SinkBatch batch);
+    SinkCommitResult commit(PreparedSinkCommit prepared);
+}
+
+record SinkBatch(String batchId, List<SSTMeta> ssts, long minSequenceId, long maxSequenceId) {}
+
+record PreparedSinkCommit(
+    String batchId,
+    long commitIdentifier,
+    List<Long> sstIds,
+    long minSequenceId,
+    long maxSequenceId,
+    byte[] payload,
+    List<SinkFileRef> fileRefs,
+    long inputRecordCount,
+    long outputRecordCount
+) {}
+
+record SinkCommitResult(String batchId, long snapshotId, long persistedSequenceId, List<Long> sstIds) {}
 ```
-PMSBucketDirector                        PaimonSinkManager
-     │                                          │
-     │  1. 收集所有 newSST + ImmutableMemTable   │
-     │──────────────────────────────────────────►│
-     │                                          │
-     │  2. 合并 newSST + MemTable → preSink      │
-     │     (归并排序，保留最新 Key)               │
-     │──────────────────────────────────────────►│
-     │                                          │
-     │  3. Paimon prepareCommit → CommitMessage  │
-     │◄──────────────────────────────────────────│
-     │                                          │
-     │  4. WALManager 写入 SINK_PREPARE          │
-     │──────────────────────────────────────────►│
-     │                                          │
-     │  5. Paimon commit → new Snapshot          │
-     │◄──────────────────────────────────────────│
-     │                                          │
-     │  6. WALManager 写入 SINK_SUCCESS          │
-     │──────────────────────────────────────────►│
-     │                                          │
-     │  7. 更新内部状态: new → sinked            │
-     │                                          │
+
+`PreparedSinkCommit.payload` 未来承载 Paimon `CommitMessage` 序列化结果；`fileRefs` 对应 Paimon prepare 阶段生成的数据文件引用，用于恢复前校验。
+
+当前编排顺序：
+
+```text
+PMSBucketDirector / future SinkCoordinator        SinkManager
+     |                                                  |
+     | 1. select newSST -> SinkBatch                    |
+     |------------------------------------------------->|
+     | 2. prepare(batch)                                |
+     |<-------------------------------------------------|
+     |    PreparedSinkCommit                            |
+     |                                                  |
+     | 3. WALManager append SINK_PREPARE(payload)       |
+     |                                                  |
+     | 4. commit(prepared)                              |
+     |------------------------------------------------->|
+     |<-------------------------------------------------|
+     |    SinkCommitResult                              |
+     |                                                  |
+     | 5. WALManager append SINK_SUCCESS(metadata)      |
+     |                                                  |
+     | 6. move newSST -> sinkedSST                      |
+     |    best-effort rename file label                 |
 ```
+
+### 7.2.1 SST 状态恢复与文件名标签
+
+SST 的可靠状态不单独写 manifest，也不写入 SST footer。启动时：
+
+```text
+1. 扫描 storage 目录得到全部 SST
+2. replay WAL 中的 SINK_PREPARE / SINK_SUCCESS
+3. 由成功的 SINK_SUCCESS 中的 sstIds 推导 sinkedSST 集合
+4. allSST - sinkedSST = newSST
+5. best-effort 修正文件名标签
+```
+
+文件名只用于人工观察：
+
+```text
+sst-000001.new.sst
+sst-000001.sinked.sst
+```
+
+如果文件名和 WAL 推导状态不一致，以 WAL 为准并尝试 rename 修正。rename 失败只记录 warning，不影响正确性。
 
 ### 7.3 Sink 失败处理
 
-- **prepareCommit 失败**：重试最多 3 次。仍失败则标记 Sink 异常，上报告警，不继续 commit。
+- **prepare 失败**：重试最多 3 次。仍失败则标记 Sink 异常，上报告警，不继续 commit。
 - **commit 失败**：依赖 WAL 中的 `SINK_PREPARE` 记录，重启后重试 commit（参见 [pms-core.md](pms-core.md) § 5.4）。
 - Sink 失败期间，新的 Freeze 和 Flush 仍可正常进行，写入路径不受影响。只是 newSST 会堆积，可能导致水位上升至 OVERLOADED。
 
