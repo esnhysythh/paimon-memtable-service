@@ -187,7 +187,7 @@ interface LocalStorageManager {
 
 **SSTMeta** 至少包含文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、createdAtMillis、状态和引用计数。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。
 
-SST 文件名使用 `sst-%06d.new.sst` / `sst-%06d.sinked.sst` 作为可观察标签。文件名不是可靠状态来源；启动恢复时以 WAL 中的 sink success 信息推导真实状态，并 best-effort 修正文件名标签。
+SST 文件名使用 `sst-%06d.new.sst` / `sst-%06d.sinked.sst` 作为可观察标签。文件名不是可靠状态来源；启动恢复时以 WAL 中的 sink success 信息推导真实状态，并 best-effort 修正文件名标签。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
 
 **BloomFilter**：
 - 每个 SST 文件包含基于主键的 BloomFilter。
@@ -205,6 +205,7 @@ SST 文件名使用 `sst-%06d.new.sst` / `sst-%06d.sinked.sst` 作为可观察�
 - `LocalStorageManager` 在 storage 目录维护 `flush-boundary.meta`，记录 `lastFlushedSequenceId`。
 - `flushToSST` 成功写出 SST 后，BucketDirector 原子推进该边界到 `SSTMeta.maxSequenceId`。
 - 重启时先加载 SST 和该边界，再 replay WAL；`sequenceId <= lastFlushedSequenceId` 的 DATA 记录由 SST 承载，不再回放到 curMemTable。
+- SST 文件和 `flush-boundary.meta` 都必须在 rename 前 force 文件内容，并在 rename 后 force storage 目录，避免崩溃后边界可见但文件或目录项丢失。
 - 该边界只表示本地 SST 已覆盖的数据范围，不表示 Paimon 已 commit；未来 WAL truncate 仍需以 sink 成功后的 `persistedSequenceId` 为准。
 
 ### 3.3 WALManager

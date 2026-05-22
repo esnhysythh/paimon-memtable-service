@@ -191,6 +191,7 @@ record BucketStateSnapshot(
 - Flush 任务将 ImmutableMemTable 序列化为 SST 文件（自定义行存格式，参见 [pms-core-sst-format.md](pms-core-sst-format.md)）。
 - Flush 输出的 SST 元数据必须记录源 ImmutableMemTable 的 `minSequenceId/maxSequenceId`。
 - SST 文件原子落盘后，BucketDirector 将 `lastFlushedSequenceId` 推进到该 SST 的 `maxSequenceId`。重启恢复时，WAL 中 `sequenceId <= lastFlushedSequenceId` 的 DATA 记录不再回放到 curMemTable，而由已加载 SST 承载。
+- 如果崩溃发生在 SST 写出之后、`lastFlushedSequenceId` 推进之前，重启时该 SST 的 `maxSequenceId` 会超过恢复边界，因此被视为 orphan 并忽略，由 WAL replay 恢复对应数据，避免重复数据源。
 - `lastFlushedSequenceId` 是本地 SST/WAL 恢复边界，不表示 Paimon Sink 已成功；后续 WAL 截断仍应等待 Sink 成功后的 `persistedSequenceId`。
 - Flush 期间，新的写入继续进入新的 curMemTable，不阻塞。
 

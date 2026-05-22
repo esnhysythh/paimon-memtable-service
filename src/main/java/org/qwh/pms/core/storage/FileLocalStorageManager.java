@@ -14,7 +14,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -26,6 +28,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     private final Path dir;
     private final FlushBoundaryStore flushBoundaryStore;
     private final TreeMap<Long, SSTMeta> metas = new TreeMap<>();
+    private final Map<Long, SSTReader> readers = new HashMap<>();
     private final AtomicLong nextFileId = new AtomicLong(1);
     private long lastFlushedSequenceId;
 
@@ -44,9 +47,20 @@ public class FileLocalStorageManager implements LocalStorageManager {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "sst-*.sst")) {
             for (Path path : stream) {
                 try {
-                    SSTMeta meta = SSTReader.readMeta(path, parseState(path));
-                    metas.put(meta.fileId(), meta);
+                    SSTReader reader = SSTReader.open(path, parseState(path));
+                    SSTMeta meta = reader.meta();
                     maxFileId = Math.max(maxFileId, meta.fileId());
+                    if (meta.maxSequenceId() > lastFlushedSequenceId) {
+                        LOG.warn(
+                            "Ignore orphan SST beyond flush boundary: path={}, maxSequenceId={}, lastFlushedSequenceId={}",
+                            path,
+                            meta.maxSequenceId(),
+                            lastFlushedSequenceId
+                        );
+                        continue;
+                    }
+                    metas.put(meta.fileId(), meta);
+                    readers.put(meta.fileId(), reader);
                 } catch (IOException | RuntimeException e) {
                     if (lastFlushedSequenceId > 0) {
                         throw new IOException(
@@ -115,6 +129,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 SSTFormat.DEFAULT_RESTART_INTERVAL
             ).write(nextFileId.getAndIncrement(), memTable);
             metas.put(meta.fileId(), meta);
+            readers.put(meta.fileId(), SSTReader.open(meta));
             return meta;
         } catch (IOException e) {
             throw new RuntimeException("flush to SST failed", e);
@@ -122,9 +137,9 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     @Override
-    public Optional<Value> get(SSTMeta meta, Key key) {
+    public synchronized Optional<Value> get(SSTMeta meta, Key key) {
         try {
-            return SSTReader.open(meta).get(key);
+            return readerFor(meta).get(key);
         } catch (IOException e) {
             throw new RuntimeException("SST read failed: " + meta.path(), e);
         }
@@ -140,6 +155,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
         try {
             Files.deleteIfExists(meta.path());
             metas.remove(meta.fileId());
+            readers.remove(meta.fileId());
         } catch (IOException e) {
             throw new RuntimeException("delete SST failed: " + meta.path(), e);
         }
@@ -167,7 +183,19 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 LOG.warn("Failed to rename SST state label from {} to {}", meta.path(), targetPath, e);
             }
         }
-        metas.put(meta.fileId(), meta.withPathAndState(newPath, target));
+        SSTMeta updated = meta.withPathAndState(newPath, target);
+        metas.put(meta.fileId(), updated);
+        readers.remove(meta.fileId());
+    }
+
+    private SSTReader readerFor(SSTMeta meta) throws IOException {
+        SSTReader reader = readers.get(meta.fileId());
+        if (reader != null && reader.meta().path().equals(meta.path())) {
+            return reader;
+        }
+        reader = SSTReader.open(meta);
+        readers.put(meta.fileId(), reader);
+        return reader;
     }
 
     private Path pathFor(long fileId, SSTState state) {

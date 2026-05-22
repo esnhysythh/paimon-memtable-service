@@ -6,12 +6,13 @@ import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -43,8 +44,7 @@ final class SSTWriter {
         long entryCount = 0;
         long dataBlockCount = 0;
 
-        try (CountingCrcOutputStream out = new CountingCrcOutputStream(
-            Files.newOutputStream(tmp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE))) {
+        try (CountingCrcOutputStream out = new CountingCrcOutputStream(new FileOutputStream(tmp.toFile()))) {
             Iterator<Entry> iterator = memTable.iterator();
             while (iterator.hasNext()) {
                 Entry entry = iterator.next();
@@ -85,8 +85,10 @@ final class SSTWriter {
             byte[] footer = encodeFooter(bloomHandle, indexHandle, propertiesHandle, (int) out.crcValue());
             out.writeFooter(footer);
             out.flush();
+            out.force();
 
             Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            StorageFiles.forceDirectory(dir);
             return new SSTMeta(
                 fileId,
                 target,
@@ -172,12 +174,12 @@ final class SSTWriter {
     }
 
     private static class CountingCrcOutputStream extends OutputStream {
-        private final OutputStream delegate;
+        private final FileOutputStream delegate;
         private final CRC32 crc = new CRC32();
         private long position;
         private boolean footer;
 
-        CountingCrcOutputStream(OutputStream delegate) {
+        CountingCrcOutputStream(FileOutputStream delegate) {
             this.delegate = delegate;
         }
 
@@ -193,6 +195,11 @@ final class SSTWriter {
             footer = true;
             write(data);
             footer = false;
+        }
+
+        void force() throws IOException {
+            FileChannel channel = delegate.getChannel();
+            channel.force(true);
         }
 
         @Override

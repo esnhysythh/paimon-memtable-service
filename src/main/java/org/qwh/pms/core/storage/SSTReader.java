@@ -34,6 +34,21 @@ final class SSTReader {
     static SSTReader open(SSTMeta meta) throws IOException {
         Footer footer = readFooter(meta.path());
         verifyFullFileCrc(meta.path(), footer.expectedCrc32);
+        return openVerified(meta, footer);
+    }
+
+    static SSTReader open(Path path, SSTState state) throws IOException {
+        Footer footer = readFooter(path);
+        verifyFullFileCrc(path, footer.expectedCrc32);
+        SSTMeta meta = readMeta(path, state, footer);
+        return openVerified(meta, footer);
+    }
+
+    SSTMeta meta() {
+        return meta;
+    }
+
+    private static SSTReader openVerified(SSTMeta meta, Footer footer) throws IOException {
         byte[] bloomBlock = readBlock(meta.path(), footer.bloomHandle);
         byte[] indexBlock = readBlock(meta.path(), footer.indexHandle);
         return new SSTReader(
@@ -83,6 +98,10 @@ final class SSTReader {
     static SSTMeta readMeta(Path path, SSTState state) throws IOException {
         Footer footer = readFooter(path);
         verifyFullFileCrc(path, footer.expectedCrc32);
+        return readMeta(path, state, footer);
+    }
+
+    private static SSTMeta readMeta(Path path, SSTState state, Footer footer) throws IOException {
         byte[] properties = readBlock(path, footer.propertiesHandle);
         ByteArrayInputStream in = new ByteArrayInputStream(properties);
         byte[] header = StorageCoding.readExact(in, 4 + 8 + 4);
