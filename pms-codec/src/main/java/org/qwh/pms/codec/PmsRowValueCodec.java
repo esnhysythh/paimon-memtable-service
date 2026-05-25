@@ -51,10 +51,7 @@ public final class PmsRowValueCodec {
                             + writerType.getFieldCount());
         }
 
-        RowKind rowKind = normalize(row.getRowKind());
-        if (rowKind == RowKind.DELETE) {
-            return encodeHeader(0, rowKind, writerSchemaId, 0, 0);
-        }
+        requirePresentRowKind(row.getRowKind());
 
         List<FieldRef> notNullFields = new ArrayList<>();
         List<Integer> nullFieldIds = new ArrayList<>();
@@ -104,7 +101,7 @@ public final class PmsRowValueCodec {
                                 + (notNullFields.size() + nullFieldIds.size()) * idWidth
                                 + notNullFields.size() * offsetWidth
                                 + payloadLength);
-        writeHeader(out, flags, rowKind, writerSchemaId, notNullFields.size(), nullFieldIds.size());
+        writeHeader(out, flags, writerSchemaId, notNullFields.size(), nullFieldIds.size());
 
         for (FieldRef field : notNullFields) {
             writeUnsigned(out, field.fieldId(), idWidth);
@@ -134,11 +131,7 @@ public final class PmsRowValueCodec {
 
     public InternalRow decode(RowType readType, byte[] rowValue, ValidationMode validationMode) {
         RowValueView view = parse(rowValue, validationMode);
-        if (view.isTombstone()) {
-            GenericRow row = new GenericRow(RowKind.DELETE, readType.getFieldCount());
-            return row;
-        }
-        GenericRow row = new GenericRow(view.rowKind(), readType.getFieldCount());
+        GenericRow row = new GenericRow(RowKind.INSERT, readType.getFieldCount());
         for (int i = 0; i < readType.getFields().size(); i++) {
             decodeFieldInto(row, i, readType.getFields().get(i), view);
         }
@@ -160,11 +153,7 @@ public final class PmsRowValueCodec {
     public InternalRow decodeProjected(
             RowType readType, byte[] rowValue, int[] projectedFieldIds, ValidationMode validationMode) {
         RowValueView view = parse(rowValue, validationMode);
-        GenericRow row = new GenericRow(view.rowKind(), projectedFieldIds.length);
-        if (view.isTombstone()) {
-            row.setRowKind(RowKind.DELETE);
-            return row;
-        }
+        GenericRow row = new GenericRow(RowKind.INSERT, projectedFieldIds.length);
         for (int outputIndex = 0; outputIndex < projectedFieldIds.length; outputIndex++) {
             DataField field = readType.getField(projectedFieldIds[outputIndex]);
             decodeFieldInto(row, outputIndex, field, view);
@@ -202,27 +191,20 @@ public final class PmsRowValueCodec {
         throw new IllegalArgumentException("Missing non-null field without default value: " + field.name());
     }
 
-    private static RowKind normalize(RowKind rowKind) {
+    private static void requirePresentRowKind(RowKind rowKind) {
         if (rowKind == RowKind.INSERT || rowKind == RowKind.UPDATE_AFTER) {
-            return RowKind.INSERT;
+            return;
         }
         if (rowKind == RowKind.DELETE || rowKind == RowKind.UPDATE_BEFORE) {
-            return RowKind.DELETE;
+            throw new IllegalArgumentException(
+                    "DELETE and UPDATE_BEFORE must be handled by PMS KV delete, not encoded as row value");
         }
         throw new IllegalArgumentException("Unsupported row kind: " + rowKind);
-    }
-
-    private static byte[] encodeHeader(
-            int flags, RowKind rowKind, int writerSchemaId, int notNullCount, int nullCount) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream(HEADER_SIZE);
-        writeHeader(out, flags, rowKind, writerSchemaId, notNullCount, nullCount);
-        return out.toByteArray();
     }
 
     private static void writeHeader(
             ByteArrayOutputStream out,
             int flags,
-            RowKind rowKind,
             int writerSchemaId,
             int notNullCount,
             int nullCount) {
@@ -231,8 +213,6 @@ public final class PmsRowValueCodec {
         }
         writeU8(out, VERSION);
         writeU8(out, flags);
-        writeU8(out, rowKind.toByteValue());
-        writeU8(out, 0);
         writeI32le(out, writerSchemaId);
         writeU16le(out, notNullCount);
         writeU16le(out, nullCount);

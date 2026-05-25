@@ -4,7 +4,7 @@ import java.io.ByteArrayOutputStream;
 
 final class ByteUtils {
 
-    static final int HEADER_SIZE = 12;
+    static final int HEADER_SIZE = 10;
     static final int VERSION = 1;
     static final int FLAG_LARGE_ROW = 1;
     static final int FLAG_HAS_CHECKSUM = 1 << 1;
