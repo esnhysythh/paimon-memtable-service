@@ -1,7 +1,9 @@
 # PMS Core Engine 设计文档
 
 ## 1. 模块定位
-纯粹的单机 LSM 存储引擎，完全不依赖任何 RPC 框架、Web 容器或外部配置中心。只负责数据的内存管理、本地持久化、WAL 协调以及与 Paimon API 的交互。
+单机 LSM 缓冲引擎，完全不依赖任何 RPC 框架、Web 容器或外部配置中心。`pms-core` 负责数据的内存管理、本地持久化、WAL 协调、SST 生命周期和内部 sink 状态机边界。
+
+`pms-core` 的运行语义服务于 Paimon，但接口保持 byte-oriented：`byte[] key`、`byte[] value` 和 `delete(key)`。Paimon `InternalRow`、`RowType`、字段投影和主键编码由后续独立的 `pms-codec` 模块负责，上层组合模块把 codec 输出接入 `pms-core`。
 
 ## 2. 配置契约
 
@@ -90,6 +92,8 @@ sequence 的边界语义：
 - V1 不保存同 Key 多版本；未来如果要支持 MVCC，可将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。
 
 **Value 编码语义**：PMS 不是通用 KV 存储，MemTable 中的 `Value.bytes` 不是任意用户字节值，而是一条 Paimon `InternalRow` 的序列化结果。非删除记录必须由后续 RowCodec/序列化管理器生成，代表完整的行编码。即使业务列全部为 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 或其他必要元信息，因此设计语义上不应为空 `byte[]`。`Value.bytes == null` 专用于 tombstone/delete，不表示业务层 NULL。
+
+RowCodec 不在 value 内部表达 delete。进入 `pms-core` 前，调用方必须将 `INSERT/UPDATE_AFTER` 归一化为 `put(key, rowValueBytes)`，将 `DELETE/UPDATE_BEFORE` 归一化为 `delete(key)`。WAL 和 SST 层继续用 `valueLen = -1` 表达 tombstone。
 
 ### 3.1 MemTableEngine
 

@@ -49,25 +49,16 @@ class PMSClient implements AutoCloseable {
 
 ### 2.2 RowCodec / PrimaryKeyCodec（核心序列化边界）
 
-当前阶段尚未实现正式 codec。本节描述的是后续 client/core 对接时需要满足的语义边界，具体类名和格式以后续 codec 阶段落地为准。
+当前阶段尚未在主项目中实现正式 codec。后续客户端与服务端应复用 `pms-codec` 中定义的行编码和主键编码，详见 [pms-codec.md](pms-codec.md)。
 
-**编码格式**：
+旧的 `[SchemaId + Column Offsets + Column Data]` 草案不再作为后续实现依据。新的 row value format 采用 `metadata + payload` 结构，使用 Paimon `DataField.id()` 作为持久字段标识，并显式区分非 NULL、NULL 和 missing 字段。
 
+delete/tombstone 不通过 row value 内部的 `RowKind.DELETE` 表达，而是由 PMS KV 层表达：
+
+```text
+INSERT/UPDATE_AFTER  -> put(primaryKeyBytes, rowValueBytes)
+DELETE/UPDATE_BEFORE -> delete(primaryKeyBytes)
 ```
-[SchemaId (4 bytes)] + [Column Offsets (N * 4 bytes)] + [Column1 Data] + [Column2 Data] + ...
-```
-
-| 字段 | 大小 | 说明 |
-|------|------|------|
-| SchemaId | 4 bytes | Paimon 当前 Schema 结构的 Hash 值 |
-| Column Offsets | N * 4 bytes | 每列数据的起始偏移量（相对于 Payload 起始位置） |
-| Column Data | 变长 | 各列的二进制数据 |
-
-**设计要点**：
-
-- **SchemaId 计算**：对 Paimon Schema 的列名 + 列类型做 Hash（MurmurHash3），保证相同的 Schema 结构产生相同的 SchemaId。Schema 变更（增删列、改类型）一定会导致 SchemaId 变化。
-- **偏移量设计**：使用偏移量而非长度，允许查询时直接定位某一列，无需遍历前方所有列。
-- **NULL 列处理**：偏移量为 0xFFFFFFFF 表示该列为 NULL，无后续数据。
 
 **接口**：
 

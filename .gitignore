@@ -10,6 +10,9 @@ target/
 *.iml
 *.ipr
 
+### Claude Code ###
+.claude
+
 ### Eclipse ###
 .apt_generated
 .classpath
