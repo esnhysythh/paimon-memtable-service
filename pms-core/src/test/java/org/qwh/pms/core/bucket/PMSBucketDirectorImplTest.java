@@ -396,6 +396,61 @@ class PMSBucketDirectorImplTest {
         }
     }
 
+    @Test
+    void restartRetriesPreparedSinkWithoutSuccess() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+
+        FailingCommitSinkManager failingSink = new FailingCommitSinkManager();
+        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg, failingSink);
+        dir1.init();
+        try {
+            dir1.put("k1".getBytes(), "v1".getBytes());
+            dir1.freezeCurMemTable();
+            dir1.flushImmutableMemTable();
+
+            RuntimeException error = assertThrows(RuntimeException.class, dir1::sinkToPaimon);
+            assertTrue(error.getMessage().contains("commit failed after prepare"));
+            assertEquals(1, failingSink.prepareCalls);
+            assertEquals(1, failingSink.commitCalls);
+        } finally {
+            dir1.close();
+        }
+
+        Path newFile = tempDir.resolve("storage").resolve("sst-000001.new.sst");
+        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+        assertTrue(Files.exists(newFile));
+        assertFalse(Files.exists(sinkedFile));
+
+        RecordingSinkManager recoveringSink = new RecordingSinkManager(77);
+        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg, recoveringSink);
+        dir2.init();
+        try {
+            assertEquals(0, recoveringSink.prepareCalls);
+            assertEquals(1, recoveringSink.commitCalls);
+            assertArrayEquals("v1".getBytes(), dir2.get("k1".getBytes()).orElse(null));
+
+            BucketStateSnapshot snap = dir2.stateSnapshot();
+            assertEquals(0, snap.newSSTCount());
+            assertEquals(1, snap.sinkedSSTCount());
+            assertEquals(77L, snap.lastSinkedSnapshotId());
+            assertFalse(Files.exists(newFile));
+            assertTrue(Files.exists(sinkedFile));
+        } finally {
+            dir2.close();
+        }
+
+        RecordingSinkManager alreadyRecoveredSink = new RecordingSinkManager(88);
+        PMSBucketDirectorImpl dir3 = new PMSBucketDirectorImpl(cfg, alreadyRecoveredSink);
+        dir3.init();
+        try {
+            assertEquals(0, alreadyRecoveredSink.prepareCalls);
+            assertEquals(0, alreadyRecoveredSink.commitCalls);
+            assertEquals(77L, dir3.stateSnapshot().lastSinkedSnapshotId());
+        } finally {
+            dir3.close();
+        }
+    }
+
     // ── Recovery ──
 
     @Test
@@ -597,6 +652,18 @@ class PMSBucketDirectorImplTest {
                 prepared.maxSequenceId(),
                 prepared.sstIds()
             );
+        }
+    }
+
+    private static final class FailingCommitSinkManager extends RecordingSinkManager {
+        FailingCommitSinkManager() {
+            super(1);
+        }
+
+        @Override
+        public SinkCommitResult commit(PreparedSinkCommit prepared) {
+            commitCalls++;
+            throw new RuntimeException("commit failed after prepare");
         }
     }
 }

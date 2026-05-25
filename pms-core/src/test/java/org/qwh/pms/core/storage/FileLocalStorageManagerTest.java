@@ -13,6 +13,8 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -76,6 +78,32 @@ class FileLocalStorageManagerTest {
         assertTrue(value.isPresent());
         assertTrue(value.get().isTombstone());
         assertEquals(7L, value.get().sequenceId());
+    }
+
+    @Test
+    void iteratorScansEntriesInKeyOrder() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable(
+            "k2", "v2".getBytes(), 2L,
+            "k1", "v1".getBytes(), 1L,
+            "k3", null, 3L
+        ));
+
+        List<String> keys = new ArrayList<>();
+        List<Long> sequences = new ArrayList<>();
+        List<Boolean> tombstones = new ArrayList<>();
+        try (SSTEntryIterator iterator = storage.openIterator(meta)) {
+            while (iterator.hasNext()) {
+                var entry = iterator.next();
+                keys.add(new String(entry.key().bytes()));
+                sequences.add(entry.value().sequenceId());
+                tombstones.add(entry.value().isTombstone());
+            }
+        }
+
+        assertEquals(List.of("k1", "k2", "k3"), keys);
+        assertEquals(List.of(1L, 2L, 3L), sequences);
+        assertEquals(List.of(false, false, true), tombstones);
     }
 
     @Test

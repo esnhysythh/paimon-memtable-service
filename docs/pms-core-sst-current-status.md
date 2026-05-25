@@ -14,6 +14,7 @@
 - SST Footer 记录 Bloom/Index/Properties 的 `BlockHandle` 和全文件 CRC32。
 - SST 注册时会校验全文件 CRC32 并缓存 reader；点查路径通过缓存的 BloomFilter + Index Block 定位 Data Block，不重复扫描全文件 CRC。
 - SST 查询接口返回 `Optional<Value>`，可区分 miss、PUT 命中和 DELETE tombstone 命中。
+- SST 已暴露 ordered iterator，可按 key 顺序扫描 `Entry<Key, Value>`，供后续 sink 模块做多 SST streaming merge。
 - Tombstone 在磁盘层由 `valueLen = -1` 表达，与 WAL DATA 记录一致。
 
 ### 2.2 BucketDirector 与本地恢复边界
@@ -79,13 +80,11 @@ sst-000001.sinked.sst
 
 ### 3.2 尚未完成
 
-- SST full scan iterator / ordered iterator 尚未实现。
-- 多 SST 按 key 归并、同 key 取最大 sequence 的 merge 层尚未实现。
-- RowCodec 尚未在本项目中落地，当前 `Value.bytes` 只是底层 byte payload。
-- `InternalRow -> byte[]` 和 `byte[] -> InternalRow` 尚未打通。
-- `InternalRow -> Key` 的 primary key codec 尚未实现。
-- 真实 Paimon sink 尚未接入。
-- `SinkCoordinator` 尚未抽出，目前 prepare/WAL/commit/WAL/state update 流程仍在 BucketDirector 内。
+- 多 SST 按 key streaming merge 已在 `pms-sink-paimon` 初步落地。
+- RowCodec 已在 `pms-codec` 落地，并已由 `pms-sink-paimon` 在 sink 路径使用。
+- `InternalRow -> byte[]`、`byte[] -> InternalRow`、`InternalRow -> Key` 已具备基础实现。
+- 真实 Paimon sink 已初步接入，支持 prepare/commit、WAL payload round-trip、重复 commit 幂等、nullable 非主键场景下的 tombstone delete、多 SST streaming merge 后写入 Paimon、分区表 + 复合主键 delete、prepared file ref 校验失败拒绝 commit，以及非法表能力拒绝；非主键 `NOT NULL` 场景下，Paimon 高层 `TableWrite` 当前会先做整行 nullability 校验，因此 key-only DELETE row 会被拒绝。
+- `SinkCoordinator` 已抽出，负责 prepare/WAL/commit/WAL 编排；BucketDirector 仍负责选择待 sink SST、推进本地 SST 状态和刷新内存视图。WAL replay 已能识别没有匹配 `SINK_SUCCESS` 的 prepared commit，并在重启初始化时重试 commit。
 - 本地 SST compact、sinkedSST evict、双持 Mem 缓存退化仍未实现。
 - WAL truncate 仍未切换到 `persistedSequenceId` 主导。
 
@@ -132,7 +131,7 @@ interface RowCodecFactory {
 建议后续工作拆为：
 
 1. **Codec 阶段**：实现 RowCodec、PrimaryKeyCodec、mock codec 和基础往返测试。
-2. **SST Iterator 阶段**：实现 SST 顺序读取和多 SST ordered merge。
+2. **SST Iterator 阶段**：SST 顺序读取已在 `pms-core` 落地；多 SST ordered merge 在 `pms-sink-paimon` 中推进。
 3. **Sink 适配阶段**：将 SST iterator + RowCodec 适配到 Paimon-sink-demo 的 ordered iterator 输入。
 4. **真实 Paimon sink 阶段**：用 demo 中的 PaimonFlusher/PaimonCommitter 替换 MockSinkManager。
-5. **Coordinator 阶段**：抽出薄的 SinkCoordinator，减轻 BucketDirector 职责。
+5. **Coordinator 阶段**：薄 `SinkCoordinator` 已抽出；后续继续收敛更完整的 sink 调度、失败退避和指标暴露。

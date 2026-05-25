@@ -2,6 +2,7 @@ package org.qwh.pms.core.storage;
 
 import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
+import org.qwh.pms.core.memtable.model.Entry;
 
 import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
@@ -62,6 +63,34 @@ final class BlockReaders {
             previousKey = keyBytes;
         }
         return Optional.empty();
+    }
+
+    static List<Entry> readDataBlockEntries(byte[] block) {
+        ParsedBlock parsed = parseBlockTail(block);
+        List<Entry> entries = new ArrayList<>();
+        byte[] previousKey = new byte[0];
+        ByteArrayInputStream in = new ByteArrayInputStream(Arrays.copyOfRange(block, 0, parsed.dataEnd));
+        while (in.available() > 0) {
+            int shared = StorageCoding.readVarInt(in);
+            int unshared = StorageCoding.readVarInt(in);
+            byte[] header = readBytes(in, 12);
+            long sequenceId = StorageCoding.readLongLE(header, 0);
+            int valueLen = StorageCoding.readIntLE(header, 8);
+            byte[] keyBytes = reconstructKey(previousKey, shared, readBytes(in, unshared));
+            Key key = new Key(keyBytes);
+            Value value;
+            if (valueLen == SSTFormat.VALUE_LEN_DELETE) {
+                value = Value.tombstone(sequenceId);
+            } else {
+                if (valueLen < 0) {
+                    throw new IllegalArgumentException("invalid valueLen: " + valueLen);
+                }
+                value = new Value(readBytes(in, valueLen), sequenceId);
+            }
+            entries.add(new Entry(key, value));
+            previousKey = keyBytes;
+        }
+        return entries;
     }
 
     private static BlockHandle decodeUnpaddedHandle(byte[] value) {
