@@ -52,7 +52,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 - `memtable-engine`: 管理 SkipList、内存状态机、引用计数。
 - `local-storage`: 本地行存 SST 的写入/读取/归并/BloomFilter，SST 文件带 Footer CRC 校验。
 - `wal-engine`: V1 单盘 WAL 的写入、索引与重放。
-- `sink`: 当前定义 `SinkManager` 边界并提供 `MockSinkManager`，后续真实 Paimon sink 会迁移到独立适配模块。
+- `sink`: 定义 `SinkManager` SPI、`SinkBatch`、`PreparedSinkCommit`、`SinkCommitResult` 和 WAL 编码；当前提供 `MockSinkManager`，后续真实 Paimon sink 由上层注入实现。
 - `bucket-director`: 总协调器，管理状态机流转、查询穿透、后台任务协调。详见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 - `statistic`: 可观测性基础设施。TODO: 详细设计待核心组件稳定后再补充。
 - 详见 [pms-core.md](docs/pms-core.md)。
@@ -67,6 +67,7 @@ Paimon 行格式与 PMS KV bytes 的适配层，依赖 Paimon 类型系统，但
 
 ### 4.3 pms-sink-paimon
 真实 Paimon Sink 适配层，后续用于替换 `pms-core` 中当前的 `MockSinkManager`。
+- 实现 `pms-core` 定义的 `SinkManager` SPI，由 `pms-server` 注入 `PMSBucketDirectorImpl`。
 - 读取 `pms-core` 暴露的 SST ordered iterator。
 - 使用 `pms-codec` 将 value bytes 解码为 Paimon `InternalRow`。
 - 调用 Paimon 2PC API 完成 prepare / commit，并把 `persistedSequenceId`、`sstIds` 等结果写回 WAL 成功记录。
