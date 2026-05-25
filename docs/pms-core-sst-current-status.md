@@ -81,7 +81,7 @@ sst-000001.sinked.sst
 
 - SST full scan iterator / ordered iterator 尚未实现。
 - 多 SST 按 key 归并、同 key 取最大 sequence 的 merge 层尚未实现。
-- RowCodec 尚未实现，当前 `Value.bytes` 只是底层 byte payload。
+- RowCodec 尚未在本项目中落地，当前 `Value.bytes` 只是底层 byte payload。
 - `InternalRow -> byte[]` 和 `byte[] -> InternalRow` 尚未打通。
 - `InternalRow -> Key` 的 primary key codec 尚未实现。
 - 真实 Paimon sink 尚未接入。
@@ -99,7 +99,7 @@ Value.bytes  = serialized Paimon InternalRow
 Value null   = delete tombstone
 ```
 
-建议下一阶段引入独立 codec 边界：
+建议下一阶段引入独立 `pms-codec` 模块：
 
 ```java
 interface RowCodec {
@@ -108,7 +108,7 @@ interface RowCodec {
 }
 
 interface PrimaryKeyCodec {
-    Key encodeKey(InternalRow row);
+    byte[] encodeKey(InternalRow row);
 }
 
 interface RowCodecFactory {
@@ -121,6 +121,8 @@ interface RowCodecFactory {
 
 - Tombstone 不通过 RowCodec 表达，仍由 `Value.bytes == null` 表达。
 - `decode(null)` 不应表示 delete。
+- `INSERT/UPDATE_AFTER` 归一化为 `put(key, valueBytes)`；`DELETE/UPDATE_BEFORE` 归一化为 `delete(key)`。
+- `pms-codec` 不反向依赖 `pms-core`，因此 primary key codec 返回 `byte[]`，由调用方构造 core 层的 `Key` 或调用 bucket 接口。
 - V1 绑定单表，运行期间 RowType/Schema 不变；检测到 schema 变更应视为 fatal。
 - 真实 RowCodec 应优先复用 Paimon 自身的 `InternalRow` / `RowType` / serializer 能力，避免手写不兼容格式。
 - Mock codec 可以用于打通测试，但类名应明确标记 mock/test，避免误认为生产编码。
