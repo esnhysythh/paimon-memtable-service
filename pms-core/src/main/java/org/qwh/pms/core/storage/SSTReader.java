@@ -2,6 +2,7 @@ package org.qwh.pms.core.storage;
 
 import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
+import org.qwh.pms.core.memtable.model.Entry;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -9,6 +10,8 @@ import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.zip.CRC32;
@@ -76,6 +79,10 @@ final class SSTReader {
             return Optional.empty();
         }
         return BlockReaders.findInDataBlock(readBlock(meta.path(), handle), key);
+    }
+
+    SSTEntryIterator iterator() {
+        return new ReaderIterator();
     }
 
     private BlockHandle findDataBlock(Key key) {
@@ -221,4 +228,32 @@ final class SSTReader {
 
     private record Footer(BlockHandle bloomHandle, BlockHandle indexHandle, BlockHandle propertiesHandle,
                           int expectedCrc32) {}
+
+    private final class ReaderIterator implements SSTEntryIterator {
+        private int blockIndex;
+        private Iterator<Entry> current = Collections.emptyIterator();
+
+        @Override
+        public boolean hasNext() {
+            loadNextBlockIfNeeded();
+            return current.hasNext();
+        }
+
+        @Override
+        public Entry next() {
+            loadNextBlockIfNeeded();
+            return current.next();
+        }
+
+        private void loadNextBlockIfNeeded() {
+            while (!current.hasNext() && blockIndex < indexEntries.size()) {
+                BlockHandle handle = indexEntries.get(blockIndex++).handle();
+                try {
+                    current = BlockReaders.readDataBlockEntries(readBlock(meta.path(), handle)).iterator();
+                } catch (IOException e) {
+                    throw new RuntimeException("SST iteration failed: " + meta.path(), e);
+                }
+            }
+        }
+    }
 }

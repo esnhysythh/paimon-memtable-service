@@ -13,6 +13,8 @@ public interface LocalStorageManager {
 
     Optional<Value> get(SSTMeta meta, Key key);
 
+    SSTEntryIterator openIterator(SSTMeta meta);
+
     SSTMeta compactSSTs(List<SSTMeta> metas);
 
     void deleteSST(SSTMeta meta);
