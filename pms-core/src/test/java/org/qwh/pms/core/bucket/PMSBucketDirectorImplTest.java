@@ -3,7 +3,13 @@ package org.qwh.pms.core.bucket;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.qwh.pms.core.config.*;
+import org.qwh.pms.core.sink.PreparedSinkCommit;
+import org.qwh.pms.core.sink.SinkBatch;
+import org.qwh.pms.core.sink.SinkCommitResult;
+import org.qwh.pms.core.sink.SinkManager;
+import org.qwh.pms.core.storage.SSTMeta;
 
+import java.nio.charset.StandardCharsets;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -338,6 +344,28 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void sinkUsesInjectedSinkManager() throws IOException {
+        RecordingSinkManager sinkManager = new RecordingSinkManager(99);
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256), sinkManager);
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            dir.sinkToPaimon();
+
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(1, sinkManager.commitCalls);
+            assertEquals("sink-1-1", sinkManager.preparedBatchId);
+            assertEquals(1L, sinkManager.preparedMaxSequenceId);
+            assertEquals(99L, dir.stateSnapshot().lastSinkedSnapshotId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
     void restartRecoversSinkedSSTFromWalAndRepairsFileNameLabel() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 
@@ -526,6 +554,49 @@ class PMSBucketDirectorImplTest {
             assertArrayEquals("v4".getBytes(), dir2.get("k4".getBytes()).orElse(null));
         } finally {
             dir2.close();
+        }
+    }
+
+    private static class RecordingSinkManager implements SinkManager {
+        private final long snapshotId;
+        int prepareCalls;
+        int commitCalls;
+        String preparedBatchId;
+        long preparedMaxSequenceId;
+
+        RecordingSinkManager(long snapshotId) {
+            this.snapshotId = snapshotId;
+        }
+
+        @Override
+        public PreparedSinkCommit prepare(SinkBatch batch) {
+            prepareCalls++;
+            preparedBatchId = batch.batchId();
+            preparedMaxSequenceId = batch.maxSequenceId();
+            List<Long> sstIds = batch.ssts().stream().map(SSTMeta::fileId).toList();
+            long inputRecordCount = batch.ssts().stream().mapToLong(SSTMeta::entryCount).sum();
+            return new PreparedSinkCommit(
+                batch.batchId(),
+                batch.maxSequenceId(),
+                sstIds,
+                batch.minSequenceId(),
+                batch.maxSequenceId(),
+                ("recording-prepare:" + batch.batchId()).getBytes(StandardCharsets.UTF_8),
+                List.of(),
+                inputRecordCount,
+                inputRecordCount
+            );
+        }
+
+        @Override
+        public SinkCommitResult commit(PreparedSinkCommit prepared) {
+            commitCalls++;
+            return new SinkCommitResult(
+                prepared.batchId(),
+                snapshotId,
+                prepared.maxSequenceId(),
+                prepared.sstIds()
+            );
         }
     }
 }

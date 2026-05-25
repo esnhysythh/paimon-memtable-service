@@ -50,10 +50,15 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private volatile boolean closed = false;
 
     public PMSBucketDirectorImpl(PMSConfig config) {
+        this(config, new MockSinkManager());
+    }
+
+    public PMSBucketDirectorImpl(PMSConfig config, SinkManager sinkManager) {
+        Objects.requireNonNull(config, "config must not be null");
+        this.sinkManager = Objects.requireNonNull(sinkManager, "sinkManager must not be null");
         this.memTableConfig = config.memtable();
         this.walManager = new WALManagerImpl(config);
         this.storageManager = new FileLocalStorageManager(config.storage());
-        this.sinkManager = new MockSinkManager();
         this.curMemTable = new SkipListCurMemTable(memTableConfig);
     }
 
