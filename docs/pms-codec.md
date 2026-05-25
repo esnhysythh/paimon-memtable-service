@@ -106,12 +106,15 @@ row value 不保存 `RowKind`。如果未来需要在 value 内保存 row kind�
 ## 7. PrimaryKeyCodec
 
 `PrimaryKeyCodec` 负责把 Paimon 主键字段编码成 PMS key bytes。
+具体 byte layout、类型支持矩阵、前缀扫描和 TiDB 对照见 [pms-primary-key-codec.md](pms-primary-key-codec.md)。
 
 要求：
 
 - 编码结果必须与 Paimon 主键排序语义一致。
 - `pms-core` 的 `Key.compareTo()` 使用无符号字节序，因此 key bytes 必须能在无符号 lexicographical compare 下得到正确顺序。
 - 编码结果应稳定，不依赖字段 ordinal 的偶然布局。
+- 联合主键字段按 primary key 定义顺序拼接，支持 `encodePrefix(...)` 与 `PrefixNext` 构造前缀扫描范围。
+- 第一版拒绝 NULL primary key。
 - 第一版需要覆盖主键类型支持矩阵，并用排序一致性测试固定行为。
 
 建议接口：
@@ -119,6 +122,12 @@ row value 不保存 `RowKind`。如果未来需要在 value 内保存 row kind�
 ```java
 interface PrimaryKeyCodec {
     byte[] encodeKey(InternalRow row);
+
+    byte[] encodePrefix(InternalRow row, int primaryKeyFieldCount);
+
+    InternalRow decodeKey(byte[] key);
+
+    InternalRow decodePrefix(byte[] prefix, int primaryKeyFieldCount);
 }
 ```
 
