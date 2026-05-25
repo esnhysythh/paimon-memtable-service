@@ -36,9 +36,7 @@ SST delete      = valueLen = -1
 Row value       = 只表示一条存在的行
 ```
 
-因此 row value codec 不把 `RowKind.DELETE` 编码为特殊 value bytes。
-
-当前 `pms-codec` 子模块刚从 row-codec-demo 迁入，代码中仍暂时保留 demo 版本的 `RowKind.DELETE` 12-byte header tombstone 行为。该行为只表示迁移中的过渡状态，不是目标生产语义；下一步会单独删除这套 value 内部 tombstone 表达，并同步调整测试。
+因此 row value codec 不把 `RowKind.DELETE` 编码为特殊 value bytes。`RowValueCodec.encode(...)` 遇到 `DELETE/UPDATE_BEFORE` 应直接拒绝，调用方必须转为 `PMSBucketDirector.delete(key)`。
 
 ## 4. RowKind 归一化
 
@@ -56,6 +54,7 @@ Row value       = 只表示一条存在的行
 ## 5. Row Value Codec
 
 row value format 采用 TiDB rowcodec 风格的 `metadata + payload` 结构，但不追求与 TiDB 字节兼容。
+具体 byte layout、header 字段、字段查找和列值编码规则见 [pms-row-codec-format.md](pms-row-codec-format.md)。
 
 目标：
 
@@ -84,13 +83,11 @@ interface RowValueCodec {
 
 ## 6. Row Value Header
 
-第一版 header 保留 12 bytes，避免后续频繁改变固定头部大小：
+第一版 header 固定 10 bytes：
 
 ```text
 VERSION               1 byte
 FLAGS                 1 byte
-RESERVED_0            1 byte
-RESERVED_1            1 byte
 WRITER_SCHEMA_ID      4 bytes, little-endian uint32
 NOT_NULL_FIELD_COUNT  2 bytes, little-endian
 NULL_FIELD_COUNT      2 bytes, little-endian
@@ -104,7 +101,7 @@ bit 1: HAS_CHECKSUM, reserved
 bit 2..7: reserved
 ```
 
-row value 不保存 `RowKind.DELETE`。如果未来需要在 value 内保存 row kind，应通过新 version 或新 flag 显式升级。
+row value 不保存 `RowKind`。如果未来需要在 value 内保存 row kind，应通过新 version 或新 flag 显式升级。
 
 ## 7. PrimaryKeyCodec
 
@@ -161,9 +158,9 @@ SST ordered iterator<Entry<byte[] key, byte[] value>>
 
 1. 完成 Maven 父工程与 `pms-core` 子模块平移。
 2. 新增 `pms-codec` 子模块，从 row-codec-demo 迁入 row value codec。
+3. 去除 demo 中 value 内部 `RowKind.DELETE` tombstone 语义。
 
 后续：
 
-1. 去除 demo 中 value 内部 `RowKind.DELETE` tombstone 语义。
-2. 补齐 `PrimaryKeyCodec` 和排序一致性测试。
-3. 实现 SST ordered iterator，再接入真实 Paimon sink。
+1. 补齐 `PrimaryKeyCodec` 和排序一致性测试。
+2. 实现 SST ordered iterator，再接入真实 Paimon sink。

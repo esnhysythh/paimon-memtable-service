@@ -1,7 +1,5 @@
 package org.qwh.pms.codec;
 
-import org.apache.paimon.types.RowKind;
-
 import java.util.Arrays;
 
 import static org.qwh.pms.codec.ByteUtils.FLAG_HAS_CHECKSUM;
@@ -15,9 +13,9 @@ import static org.qwh.pms.codec.ByteUtils.u8;
 /**
  * Parsed view of a PMS row value.
  *
- * <p>The view validates and materializes only row metadata: version, flags, row kind, writer schema
- * id, field-id arrays, end offsets and payload boundaries. It keeps the original row value bytes
- * and returns payload slices on demand, so creating a view does not deserialize any field value.
+ * <p>The view validates and materializes only row metadata: version, flags, writer schema id,
+ * field-id arrays, end offsets and payload boundaries. It keeps the original row value bytes and
+ * returns payload slices on demand, so creating a view does not deserialize any field value.
  *
  * <p>This is the object that makes top-level column projection cheap: callers binary-search a
  * field id through {@link #lookup(int)} and decode only the requested {@link #payloadSlice(int)}.
@@ -26,7 +24,6 @@ public final class RowValueView {
 
     private final byte[] bytes;
     private final int flags;
-    private final RowKind rowKind;
     private final int writerSchemaId;
     private final int[] notNullFieldIds;
     private final int[] nullFieldIds;
@@ -37,7 +34,6 @@ public final class RowValueView {
     private RowValueView(
             byte[] bytes,
             int flags,
-            RowKind rowKind,
             int writerSchemaId,
             int[] notNullFieldIds,
             int[] nullFieldIds,
@@ -46,7 +42,6 @@ public final class RowValueView {
             int payloadLength) {
         this.bytes = bytes;
         this.flags = flags;
-        this.rowKind = rowKind;
         this.writerSchemaId = writerSchemaId;
         this.notNullFieldIds = notNullFieldIds;
         this.nullFieldIds = nullFieldIds;
@@ -72,22 +67,9 @@ public final class RowValueView {
         if ((flags & FLAG_HAS_CHECKSUM) != 0) {
             throw new IllegalArgumentException("Checksum flag is reserved but not implemented");
         }
-        RowKind rowKind = RowKind.fromByteValue(bytes[2]);
-        if (rowKind != RowKind.INSERT && rowKind != RowKind.DELETE) {
-            throw new IllegalArgumentException("Persistent row kind must be INSERT or DELETE: " + rowKind);
-        }
-
-        int writerSchemaId = i32le(bytes, 4);
-        int notNullCount = u16le(bytes, 8);
-        int nullCount = u16le(bytes, 10);
-
-        if (rowKind == RowKind.DELETE) {
-            if (notNullCount != 0 || nullCount != 0 || bytes.length != HEADER_SIZE) {
-                throw new IllegalArgumentException("DELETE tombstone must contain only an empty header");
-            }
-            return new RowValueView(
-                    bytes, flags, rowKind, writerSchemaId, new int[0], new int[0], new int[0], HEADER_SIZE, 0);
-        }
+        int writerSchemaId = i32le(bytes, 2);
+        int notNullCount = u16le(bytes, 6);
+        int nullCount = u16le(bytes, 8);
 
         boolean largeRow = (flags & FLAG_LARGE_ROW) != 0;
         int idWidth = largeRow ? 4 : 1;
@@ -130,7 +112,7 @@ public final class RowValueView {
             throw new IllegalArgumentException("Unexpected trailing bytes after payload");
         }
         return new RowValueView(
-                bytes, flags, rowKind, writerSchemaId, notNullFieldIds, nullFieldIds, endOffsets, cursor, payloadLength);
+                bytes, flags, writerSchemaId, notNullFieldIds, nullFieldIds, endOffsets, cursor, payloadLength);
     }
 
     public int version() {
@@ -141,16 +123,8 @@ public final class RowValueView {
         return flags;
     }
 
-    public RowKind rowKind() {
-        return rowKind;
-    }
-
     public int writerSchemaId() {
         return writerSchemaId;
-    }
-
-    public boolean isTombstone() {
-        return rowKind == RowKind.DELETE;
     }
 
     public FieldLookup lookup(int fieldId) {
