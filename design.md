@@ -114,6 +114,7 @@ flink-connector -> pms-client
 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) | SST 当前实现状态、mock 边界与后续 codec 交接说明 |
 | [pms-codec.md](docs/pms-codec.md) | Paimon 行编码、主键编码、RowKind 与 tombstone 边界 |
 | [pms-row-codec-format.md](docs/pms-row-codec-format.md) | PMS row value byte layout、字段查找、列值编码规则 |
+| [pms-primary-key-codec.md](docs/pms-primary-key-codec.md) | PMS primary key ordered byte layout、TiDB mem-comparable 对照、前缀扫描规则 |
 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) | Sequence、写入边界、锁粒度与 WAL 优化设计说明 |
 | [pms-core-statistic.md](docs/pms-core-statistic.md) | 可观测性基础设施（待详细设计） |
 | [pms-server.md](docs/pms-server.md) | 服务端外壳 |
