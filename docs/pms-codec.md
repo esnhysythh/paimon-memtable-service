@@ -38,6 +38,8 @@ Row value       = 只表示一条存在的行
 
 因此 row value codec 不把 `RowKind.DELETE` 编码为特殊 value bytes。
 
+当前 `pms-codec` 子模块刚从 row-codec-demo 迁入，代码中仍暂时保留 demo 版本的 `RowKind.DELETE` 12-byte header tombstone 行为。该行为只表示迁移中的过渡状态，不是目标生产语义；下一步会单独删除这套 value 内部 tombstone 表达，并同步调整测试。
+
 ## 4. RowKind 归一化
 
 进入 `pms-core` 前，调用方必须把 Paimon `RowKind` 归一化为 PMS latest-state KV 操作：
@@ -155,8 +157,13 @@ SST ordered iterator<Entry<byte[] key, byte[] value>>
 
 ## 9. 后续落地顺序
 
-1. 先完成 Maven 父工程与 `pms-core` 子模块平移。
+已完成：
+
+1. 完成 Maven 父工程与 `pms-core` 子模块平移。
 2. 新增 `pms-codec` 子模块，从 row-codec-demo 迁入 row value codec。
-3. 去除 demo 中 value 内部 `RowKind.DELETE` tombstone 语义。
-4. 补齐 `PrimaryKeyCodec` 和排序一致性测试。
-5. 实现 SST ordered iterator，再接入真实 Paimon sink。
+
+后续：
+
+1. 去除 demo 中 value 内部 `RowKind.DELETE` tombstone 语义。
+2. 补齐 `PrimaryKeyCodec` 和排序一致性测试。
+3. 实现 SST ordered iterator，再接入真实 Paimon sink。
