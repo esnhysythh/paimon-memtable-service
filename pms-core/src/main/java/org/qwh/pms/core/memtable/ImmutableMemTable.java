@@ -5,6 +5,7 @@ import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
 
 import java.util.Iterator;
+import java.util.Optional;
 
 /**
  * 冻结后的只读 MemTable。不接受写入，支持查询和引用计数管理。
@@ -15,6 +16,8 @@ public interface ImmutableMemTable {
     Value get(Key key);
 
     Iterator<Entry> iterator();
+
+    Iterator<Entry> iterator(Key startInclusive, Optional<Key> endExclusive);
 
     long estimatedSize();
 

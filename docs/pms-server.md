@@ -15,6 +15,15 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 |------|------|------|-------------|
 | `write` | `WriteRequest(key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
 | `get` | `GetRequest(key)` | `GetResponse(status, value?)` | `PMSBucketDirector.get()` |
+| `prefix` | `PrefixRequest(primaryKeyPrefix)` | `PrefixResponse(status, rows)` | `PMSBucketDirector.prefixScan()` |
+
+**主键前缀查询语义**：
+
+- 请求 JSON 只接受主键字段。
+- 字段必须按 Paimon primary key 定义顺序提供连续前缀。例如主键为 `(id, sub_id, version)` 时，允许 `{ "id": 1 }` 和 `{ "id": 1, "sub_id": 2 }`，不允许跳过 `id` 只传 `sub_id`。
+- 至少提供第一个主键字段。
+- 返回行按 PMS primary key encoded bytes 升序排列。
+- 本地多层数据按 sequence 选择最新版本；最新版本为 tombstone 的 key 不返回，避免旧层数据复活。
 
 **写入响应状态**：
 

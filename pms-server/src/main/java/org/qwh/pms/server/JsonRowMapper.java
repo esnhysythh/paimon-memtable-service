@@ -13,9 +13,11 @@ import org.apache.paimon.types.RowType;
 
 import java.math.BigDecimal;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 final class JsonRowMapper {
     private final RowType rowType;
@@ -47,6 +49,41 @@ final class JsonRowMapper {
             if (!values.containsKey(fieldName) || values.get(fieldName) == null) {
                 throw new IllegalArgumentException("Missing primary key field: " + fieldName);
             }
+            row.setField(i, toPaimonValue(field.type(), values.get(fieldName)));
+        }
+        return row;
+    }
+
+    GenericRow keyPrefixTuple(Map<String, Object> values, List<String> primaryKeys) {
+        Set<String> primaryKeySet = new HashSet<>(primaryKeys);
+        for (String fieldName : values.keySet()) {
+            if (!primaryKeySet.contains(fieldName)) {
+                throw new IllegalArgumentException("Prefix query only accepts primary key fields: " + fieldName);
+            }
+        }
+
+        int prefixLength = 0;
+        while (prefixLength < primaryKeys.size()) {
+            String fieldName = primaryKeys.get(prefixLength);
+            if (!values.containsKey(fieldName) || values.get(fieldName) == null) {
+                break;
+            }
+            prefixLength++;
+        }
+        if (prefixLength == 0) {
+            throw new IllegalArgumentException("Prefix query requires at least the first primary key field: " + primaryKeys.get(0));
+        }
+        for (int i = prefixLength; i < primaryKeys.size(); i++) {
+            String fieldName = primaryKeys.get(i);
+            if (values.containsKey(fieldName) && values.get(fieldName) != null) {
+                throw new IllegalArgumentException("Primary key prefix fields must be continuous; missing field: " + primaryKeys.get(prefixLength));
+            }
+        }
+
+        GenericRow row = new GenericRow(RowKind.INSERT, prefixLength);
+        for (int i = 0; i < prefixLength; i++) {
+            String fieldName = primaryKeys.get(i);
+            DataField field = rowType.getField(fieldName);
             row.setField(i, toPaimonValue(field.type(), values.get(fieldName)));
         }
         return row;

@@ -6,6 +6,8 @@ import org.qwh.pms.core.memtable.model.Value;
 
 import java.util.Iterator;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -35,6 +37,14 @@ public class SkipListImmutableMemTable implements ImmutableMemTable {
     @Override
     public Iterator<Entry> iterator() {
         return new EntryIterator(map.entrySet().iterator());
+    }
+
+    @Override
+    public Iterator<Entry> iterator(Key startInclusive, Optional<Key> endExclusive) {
+        NavigableMap<Key, Value> range = endExclusive
+            .map(end -> map.subMap(startInclusive, true, end, false))
+            .orElseGet(() -> map.tailMap(startInclusive, true));
+        return new EntryIterator(range.entrySet().iterator());
     }
 
     @Override

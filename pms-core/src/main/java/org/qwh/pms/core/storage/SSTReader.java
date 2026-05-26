@@ -85,15 +85,30 @@ final class SSTReader {
         return new ReaderIterator();
     }
 
+    SSTEntryIterator iterator(Key startInclusive, Optional<Key> endExclusive) {
+        if (meta.entryCount() == 0 || startInclusive.compareTo(meta.maxKey()) > 0) {
+            return new ReaderIterator(indexEntries.size(), startInclusive, endExclusive);
+        }
+        if (endExclusive.isPresent() && endExclusive.get().compareTo(meta.minKey()) <= 0) {
+            return new ReaderIterator(indexEntries.size(), startInclusive, endExclusive);
+        }
+        return new ReaderIterator(findDataBlockIndex(startInclusive), startInclusive, endExclusive);
+    }
+
     private BlockHandle findDataBlock(Key key) {
+        int index = findDataBlockIndex(key);
+        return index >= indexEntries.size() ? null : indexEntries.get(index).handle();
+    }
+
+    private int findDataBlockIndex(Key key) {
         int left = 0;
         int right = indexEntries.size() - 1;
-        BlockHandle candidate = null;
+        int candidate = indexEntries.size();
         while (left <= right) {
             int mid = (left + right) >>> 1;
             BlockReaders.IndexEntry entry = indexEntries.get(mid);
             if (entry.key().compareTo(key) >= 0) {
-                candidate = entry.handle();
+                candidate = mid;
                 right = mid - 1;
             } else {
                 left = mid + 1;
@@ -232,17 +247,55 @@ final class SSTReader {
     private final class ReaderIterator implements SSTEntryIterator {
         private int blockIndex;
         private Iterator<Entry> current = Collections.emptyIterator();
+        private final Key startInclusive;
+        private final Optional<Key> endExclusive;
+        private Entry next;
+
+        private ReaderIterator() {
+            this(0, null, Optional.empty());
+        }
+
+        private ReaderIterator(int blockIndex, Key startInclusive, Optional<Key> endExclusive) {
+            this.blockIndex = blockIndex;
+            this.startInclusive = startInclusive;
+            this.endExclusive = endExclusive;
+        }
 
         @Override
         public boolean hasNext() {
-            loadNextBlockIfNeeded();
-            return current.hasNext();
+            loadNextIfNeeded();
+            return next != null;
         }
 
         @Override
         public Entry next() {
-            loadNextBlockIfNeeded();
-            return current.next();
+            loadNextIfNeeded();
+            Entry result = next;
+            next = null;
+            return result;
+        }
+
+        private void loadNextIfNeeded() {
+            if (next != null) {
+                return;
+            }
+            while (true) {
+                loadNextBlockIfNeeded();
+                if (!current.hasNext()) {
+                    return;
+                }
+                Entry candidate = current.next();
+                if (startInclusive != null && candidate.key().compareTo(startInclusive) < 0) {
+                    continue;
+                }
+                if (endExclusive.isPresent() && candidate.key().compareTo(endExclusive.get()) >= 0) {
+                    current = Collections.emptyIterator();
+                    blockIndex = indexEntries.size();
+                    return;
+                }
+                next = candidate;
+                return;
+            }
         }
 
         private void loadNextBlockIfNeeded() {

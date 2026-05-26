@@ -5,6 +5,7 @@ import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
 
 import java.util.Iterator;
+import java.util.Optional;
 
 /**
  * 当前活跃的可写 MemTable。写入线程通过 put/delete 操作数据，
@@ -38,4 +39,6 @@ public interface CurMemTable {
     boolean shouldFreeze();
 
     Iterator<Entry> iterator();
+
+    Iterator<Entry> iterator(Key startInclusive, Optional<Key> endExclusive);
 }

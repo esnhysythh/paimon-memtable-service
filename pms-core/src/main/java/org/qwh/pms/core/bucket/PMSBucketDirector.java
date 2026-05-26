@@ -1,6 +1,9 @@
 package org.qwh.pms.core.bucket;
 
 import java.util.Optional;
+import java.util.List;
+import org.qwh.pms.core.memtable.model.Entry;
+import org.qwh.pms.core.memtable.model.Value;
 
 public interface PMSBucketDirector {
 
@@ -9,6 +12,12 @@ public interface PMSBucketDirector {
     void delete(byte[] key);
 
     Optional<byte[]> get(byte[] key);
+
+    Optional<Value> lookup(byte[] key);
+
+    List<Entry> scan(byte[] startInclusive, Optional<byte[]> endExclusive);
+
+    List<Entry> prefixScan(byte[] prefix);
 
     void freezeCurMemTable();
 

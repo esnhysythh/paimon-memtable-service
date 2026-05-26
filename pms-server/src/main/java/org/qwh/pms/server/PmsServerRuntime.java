@@ -1,6 +1,7 @@
 package org.qwh.pms.server;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -108,6 +109,10 @@ public final class PmsServerRuntime implements AutoCloseable {
 
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
         return service().get(primaryKeyValues);
+    }
+
+    public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
+        return service().prefixScan(primaryKeyPrefixValues);
     }
 
     public void flush() {

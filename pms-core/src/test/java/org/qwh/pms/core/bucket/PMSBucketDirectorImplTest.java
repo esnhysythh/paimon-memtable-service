@@ -3,6 +3,7 @@ package org.qwh.pms.core.bucket;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.qwh.pms.core.config.*;
+import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
@@ -89,6 +90,25 @@ class PMSBucketDirectorImplTest {
             dir.delete("k1".getBytes());
             Optional<byte[]> result = dir.get("k1".getBytes());
             assertFalse(result.isPresent());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void lookupPreservesTombstoneAsThreeStateResult() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.delete("k1".getBytes());
+
+            var result = dir.lookup("k1".getBytes());
+
+            assertTrue(result.isPresent());
+            assertTrue(result.get().isTombstone());
+            assertFalse(dir.lookup("missing".getBytes()).isPresent());
+            assertFalse(dir.get("k1".getBytes()).isPresent());
         } finally {
             dir.close();
         }
@@ -310,6 +330,53 @@ class PMSBucketDirectorImplTest {
             dir.put("k1".getBytes(), "v2".getBytes());
 
             assertArrayEquals("v2".getBytes(), dir.get("k1".getBytes()).orElse(null));
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void scanMergesAllLocalLayersByLatestSequenceAndFiltersTombstones() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("p/1".getBytes(), "old-1".getBytes());
+            dir.put("p/2".getBytes(), "old-2".getBytes());
+            dir.put("q/1".getBytes(), "outside".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.sinkToPaimon();
+
+            dir.put("p/1".getBytes(), "new-1".getBytes());
+            dir.delete("p/2".getBytes());
+            dir.put("p/3".getBytes(), "new-3".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            dir.put("p/4".getBytes(), "cur-4".getBytes());
+
+            List<Entry> entries = dir.prefixScan("p/".getBytes());
+
+            assertEquals(List.of("p/1", "p/3", "p/4"), keys(entries));
+            assertEquals(List.of("new-1", "new-3", "cur-4"), values(entries));
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void scanUsesEndExclusiveAndReturnsKeyOrder() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("a".getBytes(), "va".getBytes());
+            dir.put("b".getBytes(), "vb".getBytes());
+            dir.put("c".getBytes(), "vc".getBytes());
+
+            List<Entry> entries = dir.scan("b".getBytes(), Optional.of("c".getBytes()));
+
+            assertEquals(List.of("b"), keys(entries));
+            assertEquals(List.of("vb"), values(entries));
         } finally {
             dir.close();
         }
@@ -610,6 +677,18 @@ class PMSBucketDirectorImplTest {
         } finally {
             dir2.close();
         }
+    }
+
+    private static List<String> keys(List<Entry> entries) {
+        return entries.stream()
+            .map(entry -> new String(entry.key().bytes(), StandardCharsets.UTF_8))
+            .toList();
+    }
+
+    private static List<String> values(List<Entry> entries) {
+        return entries.stream()
+            .map(entry -> new String(entry.value().bytes(), StandardCharsets.UTF_8))
+            .toList();
     }
 
     private static class RecordingSinkManager implements SinkManager {

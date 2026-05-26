@@ -7,6 +7,8 @@ import org.qwh.pms.core.memtable.model.Value;
 
 import java.util.Iterator;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
 
 public class SkipListCurMemTable implements CurMemTable {
@@ -106,6 +108,14 @@ public class SkipListCurMemTable implements CurMemTable {
         // Direct iterator over entrySet, no Stream — avoids boxing overhead and
         // is compatible with future off-heap implementations (e.g. OakMap zero-copy).
         return new EntryIterator(map.entrySet().iterator());
+    }
+
+    @Override
+    public Iterator<Entry> iterator(Key startInclusive, Optional<Key> endExclusive) {
+        NavigableMap<Key, Value> range = endExclusive
+            .map(end -> map.subMap(startInclusive, true, end, false))
+            .orElseGet(() -> map.tailMap(startInclusive, true));
+        return new EntryIterator(range.entrySet().iterator());
     }
 
     private void updateEstimatedSize(Key key, Value value, Value old) {
