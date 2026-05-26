@@ -72,6 +72,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 }
             }
         }
+        validateFlushBoundaryCoveredBySST();
         nextFileId.set(maxFileId + 1);
     }
 
@@ -218,5 +219,25 @@ public class FileLocalStorageManager implements LocalStorageManager {
             return SSTState.SINKED;
         }
         return SSTState.NEW;
+    }
+
+    private void validateFlushBoundaryCoveredBySST() throws IOException {
+        if (lastFlushedSequenceId <= 0) {
+            return;
+        }
+        long maxRecoveredSequenceId = metas.values().stream()
+            .mapToLong(SSTMeta::maxSequenceId)
+            .max()
+            .orElse(0);
+        if (maxRecoveredSequenceId < lastFlushedSequenceId) {
+            throw new IOException(
+                "SST files are missing after flush boundary was persisted: lastFlushedSequenceId="
+                    + lastFlushedSequenceId
+                    + ", maxRecoveredSequenceId="
+                    + maxRecoveredSequenceId
+                    + ", storageDir="
+                    + dir
+            );
+        }
     }
 }

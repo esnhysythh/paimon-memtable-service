@@ -203,10 +203,26 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void missingSstFailsReloadAfterFlushBoundaryWasPersisted() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        storage.persistFlushedSequenceId(meta.maxSequenceId());
+        Files.delete(meta.path());
+
+        FileLocalStorageManager reloaded = new FileLocalStorageManager(
+            new StorageConfig(tempDir.toString(), 0, 0, 0, 0)
+        );
+
+        IOException error = assertThrows(IOException.class, reloaded::init);
+        assertTrue(error.getMessage().contains("SST files are missing after flush boundary was persisted"));
+    }
+
+    @Test
     void flushBoundaryIsMonotonic() throws IOException {
         FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 10L));
 
-        storage.persistFlushedSequenceId(10);
+        storage.persistFlushedSequenceId(meta.maxSequenceId());
         storage.persistFlushedSequenceId(8);
 
         FileLocalStorageManager reloaded = storage();
