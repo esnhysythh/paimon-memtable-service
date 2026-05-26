@@ -30,6 +30,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 
 public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
@@ -45,6 +46,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private volatile List<SSTMeta> newSSTs = new ArrayList<>();
     private volatile List<SSTMeta> sinkedSSTs = new ArrayList<>();
     private volatile long lastSinkedSnapshotId;
+    private volatile RecoverySummary lastRecoverySummary = RecoverySummary.empty();
 
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
     private final Object writeMutex = new Object();
@@ -55,10 +57,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     public PMSBucketDirectorImpl(PMSConfig config, SinkManager sinkManager) {
+        this(config, storageManager -> sinkManager);
+    }
+
+    public PMSBucketDirectorImpl(PMSConfig config, Function<FileLocalStorageManager, SinkManager> sinkManagerFactory) {
         Objects.requireNonNull(config, "config must not be null");
+        Objects.requireNonNull(sinkManagerFactory, "sinkManagerFactory must not be null");
         this.memTableConfig = config.memtable();
         this.walManager = new WALManagerImpl(config);
         this.storageManager = new FileLocalStorageManager(config.storage());
+        SinkManager sinkManager = Objects.requireNonNull(
+            sinkManagerFactory.apply(storageManager),
+            "sinkManagerFactory must not return null"
+        );
         this.sinkCoordinator = new SinkCoordinator(sinkManager, walManager);
         this.curMemTable = new SkipListCurMemTable(memTableConfig);
     }
@@ -71,6 +82,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds());
         refreshSSTLists();
         lastSinkedSnapshotId = recoveredSink.lastSinkedSnapshotId();
+        lastRecoverySummary = new RecoverySummary(
+            recoveryState.recoveredDataRecords(),
+            recoveryState.skippedFlushedRecords(),
+            recoveryState.lastFlushedSequenceId(),
+            recoveryState.pendingPreparedSinkCount(),
+            recoveredSink.sinkedSSTIds().size() - recoveryState.sinkedSSTCount(),
+            recoveredSink.sinkedSSTIds().size(),
+            lastSinkedSnapshotId,
+            newSSTs.size(),
+            sinkedSSTs.size(),
+            curMemTable.estimatedEntryCount()
+        );
+        LOG.info("PMS recovery summary: {}", lastRecoverySummary);
         LOG.info("PMSBucketDirector initialized, curMemTable entries={}", curMemTable.estimatedEntryCount());
     }
 
@@ -92,7 +116,15 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             cb.skippedFlushedRecords,
             lastFlushedSequenceId
         );
-        return new RecoveryState(cb.sinkReplay.state());
+        SinkRecoveryState sinkRecoveryState = cb.sinkReplay.state();
+        return new RecoveryState(
+            cb.dataRecords.size(),
+            cb.skippedFlushedRecords,
+            lastFlushedSequenceId,
+            sinkRecoveryState.pendingPrepares().size(),
+            sinkRecoveryState.sinkedSSTIds().size(),
+            sinkRecoveryState
+        );
     }
 
     private SinkRecoveryState recoverPreparedSinks(SinkRecoveryState state) {
@@ -297,6 +329,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
+    public RecoverySummary lastRecoverySummary() {
+        return lastRecoverySummary;
+    }
+
     @Override
     public void close() {
         lifecycleLock.writeLock().lock();
@@ -434,7 +470,14 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private record DataRecord(long sequenceId, byte[] key, byte[] value) {}
 
-    private record RecoveryState(SinkRecoveryState sinkRecoveryState) {}
+    private record RecoveryState(
+        long recoveredDataRecords,
+        long skippedFlushedRecords,
+        long lastFlushedSequenceId,
+        long pendingPreparedSinkCount,
+        long sinkedSSTCount,
+        SinkRecoveryState sinkRecoveryState
+    ) {}
 
     private record SequenceStats(long totalBytes, long minSequenceId, long maxSequenceId) {}
 
