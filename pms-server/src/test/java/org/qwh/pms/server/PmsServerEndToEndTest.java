@@ -14,6 +14,7 @@ import org.qwh.pms.sink.paimon.PaimonSinkManager;
 
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.function.BooleanSupplier;
@@ -231,6 +232,40 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void prefixScanReturnsLatestRowsAcrossLocalLayersAndFiltersTombstones() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, compositePkSchema()).start()) {
+            server.write(Map.of("id", 1, "sub_id", 1, "marker", "old-1"));
+            server.write(Map.of("id", 1, "sub_id", 2, "marker", "old-2"));
+            server.write(Map.of("id", 2, "sub_id", 1, "marker", "outside"));
+            server.flush();
+            server.sink();
+
+            server.write(Map.of("id", 1, "sub_id", 1, "marker", "new-1"));
+            server.delete(Map.of("id", 1, "sub_id", 2));
+            server.flush();
+
+            server.write(Map.of("id", 1, "sub_id", 3, "marker", "cur-3"));
+
+            List<Map<String, Object>> rows = server.prefixScan(Map.of("id", 1));
+
+            assertEquals(
+                List.of(
+                    Map.of("id", 1, "sub_id", 1, "marker", "new-1"),
+                    Map.of("id", 1, "sub_id", 3, "marker", "cur-3")
+                ),
+                rows
+            );
+
+            Map<String, Object> response = server.postJson("/prefix", "{\"id\":1}");
+            assertEquals(2L, number(response, "count"));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> httpRows = (List<Map<String, Object>>) response.get("rows");
+            assertEquals(rows, httpRows);
+            assertEquals(400, server.postResult("/prefix", "{\"sub_id\":1}").statusCode());
+        }
+    }
+
+    @Test
     void schedulerAutomaticallyFlushesAndSinks() throws Exception {
         Properties props = baseProperties();
         props.setProperty("pms.server.scheduler.enabled", "true");
@@ -329,6 +364,18 @@ class PmsServerEndToEndTest {
             .column("id", DataTypes.INT())
             .column("marker", DataTypes.STRING())
             .primaryKey("id")
+            .option("bucket", "1")
+            .option("file.format", "parquet")
+            .option("merge-engine", "deduplicate")
+            .build();
+    }
+
+    private static Schema compositePkSchema() {
+        return Schema.newBuilder()
+            .column("id", DataTypes.INT())
+            .column("sub_id", DataTypes.INT())
+            .column("marker", DataTypes.STRING())
+            .primaryKey("id", "sub_id")
             .option("bucket", "1")
             .option("file.format", "parquet")
             .option("merge-engine", "deduplicate")

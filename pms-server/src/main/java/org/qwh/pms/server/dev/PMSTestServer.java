@@ -21,6 +21,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
@@ -145,6 +146,10 @@ public final class PMSTestServer implements AutoCloseable {
 
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKey) {
         return runtime().get(primaryKey);
+    }
+
+    public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefix) {
+        return runtime().prefixScan(primaryKeyPrefix);
     }
 
     public void flush() {

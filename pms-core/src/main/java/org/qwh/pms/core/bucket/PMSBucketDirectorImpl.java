@@ -5,6 +5,7 @@ import org.qwh.pms.core.config.PMSConfig;
 import org.qwh.pms.core.memtable.CurMemTable;
 import org.qwh.pms.core.memtable.ImmutableMemTable;
 import org.qwh.pms.core.memtable.SkipListCurMemTable;
+import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.MockSinkManager;
@@ -23,12 +24,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 
@@ -173,6 +178,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public Optional<byte[]> get(byte[] key) {
+        return lookup(key).flatMap(this::bytesFromValue);
+    }
+
+    @Override
+    public Optional<Value> lookup(byte[] key) {
         Objects.requireNonNull(key, "key must not be null");
         lifecycleLock.readLock().lock();
         try {
@@ -181,25 +191,67 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
             Value v = curMemTable.get(k);
             if (v != null) {
-                return bytesFromValue(v);
+                return Optional.of(v);
             }
 
             List<ImmutableMemTable> immutables = immutableMemTables;
             for (int i = immutables.size() - 1; i >= 0; i--) {
                 v = immutables.get(i).get(k);
                 if (v != null) {
-                    return bytesFromValue(v);
+                    return Optional.of(v);
                 }
             }
 
             Optional<Value> newSSTValue = lookupSSTs(newSSTs, k);
             if (newSSTValue.isPresent()) {
-                return bytesFromValue(newSSTValue.get());
+                return newSSTValue;
             }
-            return lookupSSTs(sinkedSSTs, k).flatMap(this::bytesFromValue);
+            return lookupSSTs(sinkedSSTs, k);
         } finally {
             lifecycleLock.readLock().unlock();
         }
+    }
+
+    @Override
+    public List<Entry> scan(byte[] startInclusive, Optional<byte[]> endExclusive) {
+        Objects.requireNonNull(startInclusive, "startInclusive must not be null");
+        Objects.requireNonNull(endExclusive, "endExclusive must not be null");
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            Key start = new Key(startInclusive);
+            Optional<Key> end = endExclusive.map(Key::new);
+            if (end.isPresent() && start.compareTo(end.get()) >= 0) {
+                return List.of();
+            }
+
+            TreeMap<Key, Value> latest = new TreeMap<>();
+            collectLatest(latest, curMemTable.iterator(start, end));
+
+            List<ImmutableMemTable> immutables = immutableMemTables;
+            for (ImmutableMemTable immutable : immutables) {
+                collectLatest(latest, immutable.iterator(start, end));
+            }
+
+            collectLatestFromSSTs(latest, newSSTs, start, end);
+            collectLatestFromSSTs(latest, sinkedSSTs, start, end);
+
+            List<Entry> result = new ArrayList<>();
+            for (Map.Entry<Key, Value> entry : latest.entrySet()) {
+                if (!entry.getValue().isTombstone()) {
+                    result.add(new Entry(entry.getKey(), entry.getValue()));
+                }
+            }
+            return result;
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
+    }
+
+    @Override
+    public List<Entry> prefixScan(byte[] prefix) {
+        Objects.requireNonNull(prefix, "prefix must not be null");
+        return scan(prefix, prefixNext(prefix));
     }
 
     @Override
@@ -350,6 +402,36 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             Optional<Value> result = storageManager.get(ssts.get(i), key);
             if (result.isPresent()) {
                 return result;
+            }
+        }
+        return Optional.empty();
+    }
+
+    private void collectLatestFromSSTs(TreeMap<Key, Value> latest, List<SSTMeta> ssts, Key start, Optional<Key> end) {
+        for (SSTMeta sst : ssts) {
+            try (var iterator = storageManager.openIterator(sst, start, end)) {
+                collectLatest(latest, iterator);
+            }
+        }
+    }
+
+    private static void collectLatest(TreeMap<Key, Value> latest, Iterator<Entry> iterator) {
+        while (iterator.hasNext()) {
+            Entry entry = iterator.next();
+            Value current = latest.get(entry.key());
+            if (current == null || entry.value().sequenceId() > current.sequenceId()) {
+                latest.put(entry.key(), entry.value());
+            }
+        }
+    }
+
+    private static Optional<byte[]> prefixNext(byte[] prefix) {
+        byte[] next = Arrays.copyOf(prefix, prefix.length);
+        for (int i = next.length - 1; i >= 0; i--) {
+            int value = next[i] & 0xFF;
+            if (value != 0xFF) {
+                next[i] = (byte) (value + 1);
+                return Optional.of(Arrays.copyOf(next, i + 1));
             }
         }
         return Optional.empty();

@@ -178,6 +178,10 @@ interface LocalStorageManager {
     // Optional.of(Value with bytes == null) = DELETE tombstone 命中
     Optional<Value> get(SSTMeta meta, Key key);
 
+    // 打开 [startInclusive, endExclusive) 范围内的 SST 有序 iterator。
+    // endExclusive 为 Optional.empty() 时表示扫描到文件末尾。
+    SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive);
+
     // 多路归并合并多个 SST，保留最新 Key
     SSTMeta compactSSTs(List<SSTMeta> metas);
 

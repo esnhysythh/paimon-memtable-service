@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -98,6 +99,15 @@ public final class PmsTableService implements AutoCloseable {
         return director.get(key)
             .map(value -> valueCodec.decode(table.rowType(), value))
             .map(rowMapper::toJsonObject);
+    }
+
+    public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
+        byte[] prefix = keyCodec.encodePrefixTuple(rowMapper.keyPrefixTuple(primaryKeyPrefixValues, primaryKeys));
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (var entry : director.prefixScan(prefix)) {
+            rows.add(rowMapper.toJsonObject(valueCodec.decode(table.rowType(), entry.value().bytes())));
+        }
+        return rows;
     }
 
     public void flush() {

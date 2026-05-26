@@ -107,6 +107,30 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void rangeIteratorScansOnlyRequestedKeyRange() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable(
+            "a", "va".getBytes(), 1L,
+            "b", "vb".getBytes(), 2L,
+            "c", "vc".getBytes(), 3L,
+            "d", "vd".getBytes(), 4L
+        ));
+
+        List<String> keys = new ArrayList<>();
+        try (SSTEntryIterator iterator = storage.openIterator(
+            meta,
+            new Key("b".getBytes()),
+            Optional.of(new Key("d".getBytes()))
+        )) {
+            while (iterator.hasNext()) {
+                keys.add(new String(iterator.next().key().bytes()));
+            }
+        }
+
+        assertEquals(List.of("b", "c"), keys);
+    }
+
+    @Test
     void metaCarriesKeyAndSequenceBoundaries() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable(

@@ -228,6 +228,7 @@ SST 查询接口必须表达三态：
 
 ```java
 Optional<Value> get(SSTMeta meta, Key key);
+SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive);
 ```
 
 语义：
@@ -239,6 +240,8 @@ Optional<Value> get(SSTMeta meta, Key key);
 | `Optional.of(value)` 且 `value.bytes() == null` | DELETE tombstone 命中 | 停止穿透，返回查询不存在 |
 
 禁止使用 `Optional<byte[]>` 表达 SST 查询结果，因为它无法区分 miss 和 tombstone。
+
+范围 iterator 输出 `[startInclusive, endExclusive)` 内的原始 SST entry，包含 PUT 和 DELETE tombstone，且按 key 升序排列。它不在 SST 层做多版本合并；跨 memtable、NEW SST、SINKED SST 的 latest sequence 选择和 tombstone 过滤由 BucketDirector 统一完成。
 
 ## 12. Flush 规则
 

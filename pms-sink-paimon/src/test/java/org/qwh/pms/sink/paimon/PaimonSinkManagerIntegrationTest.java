@@ -492,6 +492,11 @@ class PaimonSinkManagerIntegrationTest {
         }
 
         @Override
+        public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
+            return openIterator(meta);
+        }
+
+        @Override
         public SSTMeta compactSSTs(List<SSTMeta> metas) {
             throw new UnsupportedOperationException();
         }

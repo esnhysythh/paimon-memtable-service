@@ -86,7 +86,7 @@ PMS 中的数据单元经历以下状态流转：
 
 ## 4. 查询穿透
 
-`get(key)` 按以下顺序穿透，命中即返回：
+`lookup(key)` 按以下顺序穿透，命中即返回三态 `Optional<Value>`；`get(key)` 是面向旧调用方的便捷包装，会把 tombstone 转换为 `Optional.empty()`：
 
 ```
 1. curMemTable                    ── 命中概率最高，延迟最低
@@ -107,6 +107,28 @@ PMS 中的数据单元经历以下状态流转：
 
 因此 LocalStorageManager 的 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 穿透中复活。
 
+### 4.1 Range / Prefix Scan
+
+`scan(startInclusive, endExclusive)` 在 core 层提供 byte-oriented 范围扫描能力，`prefixScan(prefix)` 通过 `PrefixNext(prefix)` 转换为 `[prefix, prefixNext)` 范围。`pms-core` 不理解 Paimon row/schema，只按 `Key` 的 unsigned lexicographical order 执行范围扫描；上层可使用 `PmsPrimaryKeyCodec.encodePrefix...` 构造主键前缀。
+
+范围扫描覆盖以下本地层：
+
+```text
+curMemTable
+immutableMemTables
+newSSTs
+sinkedSSTs
+```
+
+合并规则：
+
+- 每层输出 `[start, end)` 内的有序 `Entry`。
+- BucketDirector 按 key 聚合，并以 `Value.sequenceId` 最大的 entry 作为最新版本。
+- 最新版本为 tombstone 时，该 key 不返回给调用方，同时阻止更老层数据复活。
+- 返回结果按 key 升序排列。
+
+该设计理由是：点查可以利用层级新旧顺序命中即返回，但 range/prefix scan 必须同时观察所有层，否则无法正确处理不同 key 在不同层上的最新 sequence，也无法在 tombstone 覆盖旧 SST/Paimon 数据时维持 Deduplicate 语义。
+
 **查询穿透过程中的并发**：初期方案为直接遍历 volatile 列表，不做快照拷贝。层列表通过 volatile 引用替换整个列表，查询线程不会看到半更新状态。详见 [pms-core.md](pms-core.md) § 5.2。
 
 ## 5. 接口定义
@@ -120,6 +142,9 @@ interface PMSBucketDirector {
 
     // ── 查询 ──
     Optional<byte[]> get(byte[] key);
+    Optional<Value> lookup(byte[] key);
+    List<Entry> scan(byte[] startInclusive, Optional<byte[]> endExclusive);
+    List<Entry> prefixScan(byte[] prefix);
 
     // ── 状态流转触发 ──
     void freezeCurMemTable();

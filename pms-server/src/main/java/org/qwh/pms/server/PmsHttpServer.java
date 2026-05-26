@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -67,6 +68,14 @@ public final class PmsHttpServer implements AutoCloseable {
             response.put("status", "OK");
             response.put("found", row.isPresent());
             response.put("row", row.orElse(null));
+            return ok(response);
+        }));
+        server.createContext("/prefix", exchange -> handle(exchange, "POST", () -> {
+            Map<String, Object> response = new LinkedHashMap<>();
+            List<Map<String, Object>> rows = runtime.prefixScan(requestObject(exchange));
+            response.put("status", "OK");
+            response.put("count", rows.size());
+            response.put("rows", rows);
             return ok(response);
         }));
         server.createContext("/flush", exchange -> handle(exchange, "POST", () -> {

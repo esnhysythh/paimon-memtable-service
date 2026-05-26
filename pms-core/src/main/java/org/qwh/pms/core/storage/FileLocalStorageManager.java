@@ -156,6 +156,15 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     @Override
+    public synchronized SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
+        try {
+            return readerFor(meta).iterator(startInclusive, endExclusive);
+        } catch (IOException e) {
+            throw new RuntimeException("SST range iterator open failed: " + meta.path(), e);
+        }
+    }
+
+    @Override
     public SSTMeta compactSSTs(List<SSTMeta> metas) {
         throw new UnsupportedOperationException("SST compaction is not implemented yet");
     }

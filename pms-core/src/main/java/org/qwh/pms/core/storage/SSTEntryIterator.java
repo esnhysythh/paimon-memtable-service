@@ -2,11 +2,9 @@ package org.qwh.pms.core.storage;
 
 import org.qwh.pms.core.memtable.model.Entry;
 
-public interface SSTEntryIterator extends AutoCloseable {
+import java.util.Iterator;
 
-    boolean hasNext();
-
-    Entry next();
+public interface SSTEntryIterator extends Iterator<Entry>, AutoCloseable {
 
     @Override
     default void close() {}
