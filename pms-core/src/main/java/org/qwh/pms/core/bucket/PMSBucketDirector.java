@@ -4,6 +4,7 @@ import java.util.Optional;
 import java.util.List;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Value;
+import org.qwh.pms.core.storage.SSTMeta;
 
 public interface PMSBucketDirector {
 
@@ -25,8 +26,9 @@ public interface PMSBucketDirector {
 
     void sinkToPaimon();
 
-    // TODO: 待 Sink/Compaction 模块实现后补充以下方法
-    // void evictOldestSinkedSST();
+    Optional<SSTMeta> evictOldestSinkedSST();
+
+    // TODO: 待 Compaction 模块实现后补充以下方法
     // void compactLocalSSTs();
     // void degradeMemCache();
 

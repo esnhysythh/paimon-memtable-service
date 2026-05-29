@@ -13,10 +13,12 @@ public record BucketStateSnapshot(
     long lastFlushedSequenceId,
     int newSSTCount,
     long newSSTTotalBytes,
+    long newSSTTotalRows,
     long newSSTMinSequenceId,
     long newSSTMaxSequenceId,
     int sinkedSSTCount,
     long sinkedSSTTotalBytes,
+    long sinkedSSTTotalRows,
     int withMemCount,
     long withMemTotalBytes,
     long lastSinkedSnapshotId

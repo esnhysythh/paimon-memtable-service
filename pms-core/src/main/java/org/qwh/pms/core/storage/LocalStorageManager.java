@@ -21,5 +21,5 @@ public interface LocalStorageManager {
 
     void deleteSST(SSTMeta meta);
 
-    void evictOldest();
+    Optional<SSTMeta> evictOldestSinkedSST();
 }

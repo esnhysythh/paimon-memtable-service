@@ -19,13 +19,13 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
 ### 2.2 查询路径
-点查请求按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → Paimon 穿透`。本地 SST 带有 BloomFilter 加速；Paimon 穿透基于 Manifest 索引定位底层 Parquet 读取。
+点查请求按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → Paimon 穿透`。本地 SST 带有 BloomFilter 加速；V1 当前在 `pms-server` 层通过 Paimon `ReadBuilder` 主键等值过滤完成 Paimon 穿透，以保持 `pms-core` byte-oriented 且不依赖 Paimon API。
 
-> **TODO:** Paimon 穿透查询的 Manifest 索引设计待补充。V1 可采用全量加载索引策略，后续按需分级优化。
+> **TODO:** 后续补充 Paimon 穿透查询的 Manifest 索引设计，用于替换/优化 V1 的 `ReadBuilder` 点查路径。
 
 ### 2.3 缓存与淘汰
 - **内存淘汰**：ImmutableMemTable 维护引用计数，归零后退役释放内存。带 Mem 缓存的双持状态（newSSTWithMem / sinkedSSTWithMem）可在内存不足时退化为不带 Mem 的状态。
-- **本地 SST 淘汰**：对已 Sink 的 `sinkedSST` 采用"只淘汰最老"策略，规避幽灵数据问题。
+- **本地 SST 淘汰**：按本地 SST 总大小、总文件数或总物理 entry 数触发；实际只对已 Sink 的 `sinkedSST` 采用"只淘汰最老"策略，规避幽灵数据问题。
 - **小文件合并**：对较小/零碎的 SST（含带 Mem 缓存的 SSTWithMem）进行多路归并合并，减少文件数量，提升查询效率。详见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) § 8.3。
 
 ## 3. 关键机制

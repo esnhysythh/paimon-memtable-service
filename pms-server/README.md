@@ -48,8 +48,9 @@ directories and the target Paimon table.
 | `pms.wal.file_size_mb` | `256` | WAL segment size. |
 | `pms.wal.use_mmap` | `false` | Whether WAL uses mmap writer. |
 | `pms.storage.dir` | required | Local SST/state directory. |
-| `pms.storage.sinked_max_size_mb` | `10240` | Local sinked SST retention size. |
-| `pms.storage.sinked_max_count` | `100` | Local sinked SST retention count. |
+| `pms.storage.sinked_max_size_mb` | `10240` | Local SST retention size threshold; only sinked SSTs can be evicted. |
+| `pms.storage.sinked_max_count` | `100` | Local SST retention file-count threshold; only sinked SSTs can be evicted. |
+| `pms.storage.local_sst_max_rows` | `0` | Local SST physical entry-count threshold. `0` disables row-based retention. |
 | `pms.storage.compact_threshold_mb` | `32` | Local compaction threshold. |
 | `pms.storage.compact_min_files` | `4` | Minimum files for local compaction. |
 | `pms.paimon.warehouse` | required | Paimon warehouse path. |

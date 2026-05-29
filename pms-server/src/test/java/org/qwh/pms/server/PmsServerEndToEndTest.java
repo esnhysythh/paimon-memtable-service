@@ -232,6 +232,78 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void getFallsThroughToPaimonAfterLocalMissAndTombstoneBlocksFallback() throws Exception {
+        Path warehouse = tempDir.resolve("warehouse");
+
+        PmsServerConfig writerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("writer"), warehouse)
+        );
+        try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
+            writer.write(Map.of("id", 1, "marker", "paimon-a"));
+            writer.flush();
+            writer.sink();
+            assertEquals(Map.of(1, "paimon-a"), writer.readIntStringRows());
+        }
+
+        PmsServerConfig readerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("reader"), warehouse)
+        );
+        try (PMSTestServer reader = PMSTestServer.create(readerConfig, schema()).start()) {
+            assertEquals(
+                Map.of("id", 1, "marker", "paimon-a"),
+                reader.get(Map.of("id", 1)).orElseThrow()
+            );
+
+            reader.delete(Map.of("id", 1));
+
+            assertFalse(reader.get(Map.of("id", 1)).isPresent());
+            assertEquals(Map.of(1, "paimon-a"), reader.readIntStringRows());
+        }
+    }
+
+    @Test
+    void sinkRetiresOldestSinkedSSTAndGetFallsThroughToPaimonAfterRetirement() throws Exception {
+        Properties props = baseProperties();
+        props.setProperty("pms.storage.local_sst_max_rows", "2");
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
+            server.write(Map.of("id", 1, "marker", "retained-1"));
+            server.flush();
+            server.sink();
+
+            server.write(Map.of("id", 2, "marker", "retained-2"));
+            server.flush();
+            server.sink();
+
+            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+            assertTrue(Files.exists(oldestSinked));
+            assertEquals(
+                Map.of("id", 1, "marker", "retained-1"),
+                server.get(Map.of("id", 1)).orElseThrow()
+            );
+
+            server.write(Map.of("id", 3, "marker", "retained-3"));
+            server.flush();
+            server.sink();
+
+            Map<String, Object> state = server.getJson("/state");
+            assertEquals(0L, number(state, "newSSTTotalRows"));
+            assertEquals(2L, number(state, "sinkedSSTTotalRows"));
+            assertEquals(2L, number(state, "sinkedSSTCount"));
+            assertFalse(Files.exists(oldestSinked));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000002.sinked.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000003.sinked.sst")));
+
+            assertEquals(
+                Map.of("id", 1, "marker", "retained-1"),
+                server.get(Map.of("id", 1)).orElseThrow()
+            );
+            assertEquals(Map.of(1, "retained-1", 2, "retained-2", 3, "retained-3"), server.readIntStringRows());
+        }
+    }
+
+    @Test
     void prefixScanReturnsLatestRowsAcrossLocalLayersAndFiltersTombstones() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, compositePkSchema()).start()) {
             server.write(Map.of("id", 1, "sub_id", 1, "marker", "old-1"));
@@ -387,14 +459,18 @@ class PmsServerEndToEndTest {
     }
 
     private Properties baseProperties() {
+        return baseProperties(tempDir, tempDir.resolve("warehouse"));
+    }
+
+    private Properties baseProperties(Path rootDir, Path warehouse) {
         Properties props = new Properties();
         props.setProperty("pms.server.host", "127.0.0.1");
         props.setProperty("pms.server.port", "0");
-        props.setProperty("pms.paimon.warehouse", tempDir.resolve("warehouse").toUri().toString());
+        props.setProperty("pms.paimon.warehouse", warehouse.toUri().toString());
         props.setProperty("pms.paimon.database", "pms_db");
         props.setProperty("pms.paimon.table", "server_pk");
-        props.setProperty("pms.wal.dir", tempDir.resolve("wal").toString());
-        props.setProperty("pms.storage.dir", tempDir.resolve("storage").toString());
+        props.setProperty("pms.wal.dir", rootDir.resolve("wal").toString());
+        props.setProperty("pms.storage.dir", rootDir.resolve("storage").toString());
         return props;
     }
 
