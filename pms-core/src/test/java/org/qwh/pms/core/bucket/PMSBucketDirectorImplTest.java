@@ -433,6 +433,57 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void evictOldestSinkedSSTDeletesOnlyOldestSinkedFile() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.sinkToPaimon();
+
+            dir.put("k3".getBytes(), "v3".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            BucketStateSnapshot before = dir.stateSnapshot();
+            assertEquals(1, before.newSSTCount());
+            assertEquals(1L, before.newSSTTotalRows());
+            assertEquals(2, before.sinkedSSTCount());
+            assertEquals(2L, before.sinkedSSTTotalRows());
+
+            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+            Path newerSinked = tempDir.resolve("storage").resolve("sst-000002.sinked.sst");
+            Path unsinked = tempDir.resolve("storage").resolve("sst-000003.new.sst");
+            assertTrue(Files.exists(oldestSinked));
+            assertTrue(Files.exists(newerSinked));
+            assertTrue(Files.exists(unsinked));
+
+            Optional<SSTMeta> evicted = dir.evictOldestSinkedSST();
+
+            assertTrue(evicted.isPresent());
+            assertEquals(1L, evicted.get().fileId());
+            assertFalse(Files.exists(oldestSinked));
+            assertTrue(Files.exists(newerSinked));
+            assertTrue(Files.exists(unsinked));
+            assertFalse(dir.get("k1".getBytes()).isPresent());
+            assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElse(null));
+            assertArrayEquals("v3".getBytes(), dir.get("k3".getBytes()).orElse(null));
+
+            BucketStateSnapshot after = dir.stateSnapshot();
+            assertEquals(1, after.newSSTCount());
+            assertEquals(1L, after.newSSTTotalRows());
+            assertEquals(1, after.sinkedSSTCount());
+            assertEquals(1L, after.sinkedSSTTotalRows());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
     void restartRecoversSinkedSSTFromWalAndRepairsFileNameLabel() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 

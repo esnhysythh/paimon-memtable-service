@@ -181,10 +181,12 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     @Override
-    public synchronized void evictOldest() {
-        metas.values().stream()
-            .min(Comparator.comparingLong(SSTMeta::createdAtMillis))
-            .ifPresent(this::deleteSST);
+    public synchronized Optional<SSTMeta> evictOldestSinkedSST() {
+        Optional<SSTMeta> oldest = metas.values().stream()
+            .filter(meta -> meta.state() == SSTState.SINKED)
+            .min(Comparator.comparingLong(SSTMeta::createdAtMillis).thenComparingLong(SSTMeta::fileId));
+        oldest.ifPresent(this::deleteSST);
+        return oldest;
     }
 
     private void updateStateLabel(SSTMeta meta, SSTState target) {

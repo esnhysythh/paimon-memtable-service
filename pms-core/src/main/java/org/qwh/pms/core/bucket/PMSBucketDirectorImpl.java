@@ -342,6 +342,31 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
+    public Optional<SSTMeta> evictOldestSinkedSST() {
+        lifecycleLock.readLock().lock();
+        try {
+            ensureNotClosed();
+            synchronized (writeMutex) {
+                Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
+                if (evicted.isPresent()) {
+                    long evictedFileId = evicted.get().fileId();
+                    sinkedSSTs = sinkedSSTs.stream()
+                        .filter(meta -> meta.fileId() != evictedFileId)
+                        .toList();
+                    LOG.debug(
+                        "Evicted sinked SST: fileId={}, remainingSinkedSSTCount={}",
+                        evictedFileId,
+                        sinkedSSTs.size()
+                    );
+                }
+                return evicted;
+            }
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
+    }
+
+    @Override
     public BucketStateSnapshot stateSnapshot() {
         lifecycleLock.readLock().lock();
         try {
@@ -368,10 +393,12 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 storageManager.lastFlushedSequenceId(),
                 newSsts.size(),
                 newStats.totalBytes(),
+                newStats.totalRows(),
                 newStats.minSequenceId(),
                 newStats.maxSequenceId(),
                 sinkedSsts.size(),
                 sinkedStats.totalBytes(),
+                sinkedStats.totalRows(),
                 0,
                 0L,
                 lastSinkedSnapshotId
@@ -498,16 +525,18 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private static SSTStats sstStats(List<SSTMeta> ssts) {
         long totalBytes = 0;
+        long totalRows = 0;
         long minSequenceId = 0;
         long maxSequenceId = 0;
         for (SSTMeta sst : ssts) {
             totalBytes += sst.fileSize();
+            totalRows += sst.entryCount();
             if (sst.minSequenceId() > 0 && (minSequenceId == 0 || sst.minSequenceId() < minSequenceId)) {
                 minSequenceId = sst.minSequenceId();
             }
             maxSequenceId = Math.max(maxSequenceId, sst.maxSequenceId());
         }
-        return new SSTStats(totalBytes, minSequenceId, maxSequenceId);
+        return new SSTStats(totalBytes, totalRows, minSequenceId, maxSequenceId);
     }
 
     private static class CollectingReplayCallback implements ReplayCallback {
@@ -563,5 +592,5 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private record SequenceStats(long totalBytes, long minSequenceId, long maxSequenceId) {}
 
-    private record SSTStats(long totalBytes, long minSequenceId, long maxSequenceId) {}
+    private record SSTStats(long totalBytes, long totalRows, long minSequenceId, long maxSequenceId) {}
 }

@@ -1,7 +1,12 @@
 package org.qwh.pms.server;
 
+import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
@@ -9,6 +14,8 @@ import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
+import org.qwh.pms.core.config.StorageConfig;
+import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
@@ -33,6 +40,7 @@ public final class PmsTableService implements AutoCloseable {
     private final PmsRowValueCodec valueCodec;
     private final JsonRowMapper rowMapper;
     private final List<String> primaryKeys;
+    private final StorageConfig storageConfig;
     private final ReentrantLock maintenanceLock = new ReentrantLock();
 
     @FunctionalInterface
@@ -45,11 +53,13 @@ public final class PmsTableService implements AutoCloseable {
     }
 
     private PmsTableService(
+            PmsServerConfig config,
             PaimonTableLoader.LoadedTable loadedTable,
             PMSBucketDirectorImpl director) {
         this.loadedTable = loadedTable;
         this.table = loadedTable.table();
         this.director = director;
+        this.storageConfig = config.coreConfig().storage();
         RowType rowType = table.rowType();
         this.primaryKeys = List.copyOf(table.primaryKeys());
         this.keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, primaryKeys);
@@ -74,7 +84,7 @@ public final class PmsTableService implements AutoCloseable {
         try {
             director.init();
             LOG.info("PMS table service opened for {}.{}", config.database(), config.table());
-            return new PmsTableService(loadedTable, director);
+            return new PmsTableService(config, loadedTable, director);
         } catch (IOException | RuntimeException e) {
             LOG.error("Failed to open PMS table service for {}.{}", config.database(), config.table(), e);
             director.close();
@@ -95,10 +105,17 @@ public final class PmsTableService implements AutoCloseable {
     }
 
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
-        byte[] key = keyCodec.encodeKeyTuple(rowMapper.keyTuple(primaryKeyValues, primaryKeys));
-        return director.get(key)
-            .map(value -> valueCodec.decode(table.rowType(), value))
-            .map(rowMapper::toJsonObject);
+        GenericRow keyTuple = rowMapper.keyTuple(primaryKeyValues, primaryKeys);
+        byte[] key = keyCodec.encodeKeyTuple(keyTuple);
+        Optional<Value> local = director.lookup(key);
+        if (local.isPresent()) {
+            Value value = local.get();
+            if (value.isTombstone()) {
+                return Optional.empty();
+            }
+            return Optional.of(rowMapper.toJsonObject(valueCodec.decode(table.rowType(), value.bytes())));
+        }
+        return lookupPaimon(keyTuple);
     }
 
     public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
@@ -127,7 +144,17 @@ public final class PmsTableService implements AutoCloseable {
         try {
             LOG.info("PMS sink started");
             director.sinkToPaimon();
+            retainLocalSSTsLocked();
             LOG.info("PMS sink completed");
+        } finally {
+            maintenanceLock.unlock();
+        }
+    }
+
+    public void retainLocalSSTs() {
+        maintenanceLock.lock();
+        try {
+            retainLocalSSTsLocked();
         } finally {
             maintenanceLock.unlock();
         }
@@ -139,6 +166,66 @@ public final class PmsTableService implements AutoCloseable {
 
     public Map<String, Object> recoverySummary() {
         return recoverySummaryToMap(director.lastRecoverySummary());
+    }
+
+    private Optional<Map<String, Object>> lookupPaimon(GenericRow keyTuple) {
+        ReadBuilder readBuilder = table.newReadBuilder()
+            .withFilter(primaryKeyPredicate(keyTuple))
+            .withLimit(1);
+        try (RecordReader<InternalRow> reader =
+                 readBuilder.newRead().createReader(readBuilder.newScan().plan())) {
+            PaimonLookupResult result = new PaimonLookupResult();
+            reader.forEachRemaining(row -> {
+                if (result.row == null) {
+                    result.row = rowMapper.toJsonObject(row);
+                }
+            });
+            return Optional.ofNullable(result.row);
+        } catch (IOException e) {
+            throw new RuntimeException("Paimon point lookup failed for primary keys " + primaryKeys, e);
+        }
+    }
+
+    private Predicate primaryKeyPredicate(GenericRow keyTuple) {
+        PredicateBuilder builder = new PredicateBuilder(table.rowType());
+        List<Predicate> predicates = new ArrayList<>(primaryKeys.size());
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            predicates.add(builder.equal(builder.indexOf(primaryKeys.get(i)), keyTuple.getField(i)));
+        }
+        return PredicateBuilder.and(predicates);
+    }
+
+    private void retainLocalSSTsLocked() {
+        int evictedCount = 0;
+        while (shouldEvictSinkedSST(director.stateSnapshot())) {
+            var evicted = director.evictOldestSinkedSST();
+            if (evicted.isEmpty()) {
+                break;
+            }
+            evictedCount++;
+            LOG.info(
+                "Evicted sinked SST by retention: fileId={}, fileSize={}, entryCount={}",
+                evicted.get().fileId(),
+                evicted.get().fileSize(),
+                evicted.get().entryCount()
+            );
+        }
+        if (evictedCount > 0) {
+            LOG.info("PMS local SST retention completed, evictedSinkedSSTCount={}", evictedCount);
+        }
+    }
+
+    private boolean shouldEvictSinkedSST(BucketStateSnapshot state) {
+        if (state.sinkedSSTCount() <= 0) {
+            return false;
+        }
+        long localSSTCount = (long) state.newSSTCount() + state.sinkedSSTCount();
+        long localSSTBytes = state.newSSTTotalBytes() + state.sinkedSSTTotalBytes();
+        long localSSTRows = state.newSSTTotalRows() + state.sinkedSSTTotalRows();
+        long maxBytes = storageConfig.sinkedMaxSizeMb() * 1024L * 1024L;
+        return localSSTBytes > maxBytes
+            || localSSTCount > storageConfig.sinkedMaxCount()
+            || (storageConfig.localSstMaxRows() > 0 && localSSTRows > storageConfig.localSstMaxRows());
     }
 
     @Override
@@ -163,10 +250,12 @@ public final class PmsTableService implements AutoCloseable {
         result.put("lastFlushedSequenceId", state.lastFlushedSequenceId());
         result.put("newSSTCount", state.newSSTCount());
         result.put("newSSTTotalBytes", state.newSSTTotalBytes());
+        result.put("newSSTTotalRows", state.newSSTTotalRows());
         result.put("newSSTMinSequenceId", state.newSSTMinSequenceId());
         result.put("newSSTMaxSequenceId", state.newSSTMaxSequenceId());
         result.put("sinkedSSTCount", state.sinkedSSTCount());
         result.put("sinkedSSTTotalBytes", state.sinkedSSTTotalBytes());
+        result.put("sinkedSSTTotalRows", state.sinkedSSTTotalRows());
         result.put("withMemCount", state.withMemCount());
         result.put("withMemTotalBytes", state.withMemTotalBytes());
         result.put("lastSinkedSnapshotId", state.lastSinkedSnapshotId());
@@ -186,5 +275,9 @@ public final class PmsTableService implements AutoCloseable {
         result.put("sinkedSSTCount", recovery.sinkedSSTCount());
         result.put("curMemTableEstimatedEntryCount", recovery.curMemTableEstimatedEntryCount());
         return result;
+    }
+
+    private static final class PaimonLookupResult {
+        private Map<String, Object> row;
     }
 }

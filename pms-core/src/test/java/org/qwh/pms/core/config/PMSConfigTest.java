@@ -30,6 +30,7 @@ class PMSConfigTest {
         assertEquals("/tmp/storage", config.storage().dir());
         assertEquals(StorageConfig.DEFAULT_SINKED_MAX_SIZE_MB, config.storage().sinkedMaxSizeMb());
         assertEquals(StorageConfig.DEFAULT_SINKED_MAX_COUNT, config.storage().sinkedMaxCount());
+        assertEquals(StorageConfig.DEFAULT_LOCAL_SST_MAX_ROWS, config.storage().localSstMaxRows());
 
         // Sink defaults
         assertEquals(SinkConfig.DEFAULT_INTERVAL_MS, config.sink().intervalMs());
@@ -52,6 +53,7 @@ class PMSConfigTest {
         props.setProperty("pms.memtable.max_size_mb", "128");
         props.setProperty("pms.wal.file_size_mb", "512");
         props.setProperty("pms.wal.use_mmap", "true");
+        props.setProperty("pms.storage.local_sst_max_rows", "1000");
         props.setProperty("pms.sink.interval_ms", "60000");
         props.setProperty("pms.flowcontrol.overloaded_immutable_count", "8");
 
@@ -61,6 +63,7 @@ class PMSConfigTest {
         assertEquals(128, config.memtable().maxSizeMb());
         assertEquals(512, config.wal().fileSizeMb());
         assertEquals("/data/storage", config.storage().dir());
+        assertEquals(1000L, config.storage().localSstMaxRows());
         assertTrue(config.wal().useMmap());
         assertEquals(60000, config.sink().intervalMs());
         assertEquals(8, config.flowcontrol().overloadedImmutableCount());

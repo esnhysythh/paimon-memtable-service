@@ -34,6 +34,7 @@ public record PMSConfig(
                 getRequiredString(props, "pms.storage.dir"),
                 getLong(props, "pms.storage.sinked_max_size_mb", StorageConfig.DEFAULT_SINKED_MAX_SIZE_MB),
                 getInt(props, "pms.storage.sinked_max_count", StorageConfig.DEFAULT_SINKED_MAX_COUNT),
+                getLong(props, "pms.storage.local_sst_max_rows", StorageConfig.DEFAULT_LOCAL_SST_MAX_ROWS),
                 getInt(props, "pms.storage.compact_threshold_mb", StorageConfig.DEFAULT_COMPACT_THRESHOLD_MB),
                 getInt(props, "pms.storage.compact_min_files", StorageConfig.DEFAULT_COMPACT_MIN_FILES)
             ),
