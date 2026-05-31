@@ -6,15 +6,9 @@ public interface WALManager {
 
     long lastSequenceId();
 
-    void appendSinkPrepare(byte[] commitMessage);
+    void replay(ReplayCallback callback);
 
-    void appendSinkSuccess(long snapshotId);
-
-    void appendSinkSuccess(long snapshotId, byte[] metadata);
-
-    void replay(ReplayCallback callback, long highWatermarkSnapshotId);
-
-    void truncate(long safeSnapshotId);
+    void truncate(long safeSequenceId);
 
     void close();
 }

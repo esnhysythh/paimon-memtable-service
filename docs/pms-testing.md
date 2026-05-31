@@ -53,7 +53,7 @@
 | 流控水位线 | Immutable 数量达阈值时触发 OVERLOADED，拒绝生效 |
 | 本地 SST 合并 | 多个小 SST 合并为大 SST，查询结果不变 |
 | 双持状态退化 | 内存不足时 Mem 缓存正确退化，查询结果不变 |
-| WAL 截断 | SINK_SUCCESS 后旧 WAL 文件被正确删除 |
+| WAL 截断 | SinkMeta success 的 `persistedSequenceId` 覆盖旧 WAL 文件时正确删除 |
 
 使用 mock/fake 实现替代 Paimon API：
 
@@ -73,8 +73,8 @@ class FakeSinkManager implements SinkManager {
 | 完整写入路径 | Client 序列化 → RPC → MemTable → SST → Paimon 2PC → 数据可查 |
 | 完整查询路径 | 各层命中 + Paimon 穿透，结果正确 |
 | WAL 崩溃恢复 - 正常 | Kill → 重启 → 数据完整、不重复提交 |
-| WAL 崩溃恢复 - SINK_PREPARE 后 | Kill → 重启 → 使用 WAL 中的 prepared payload、batch 和 fileRefs 重试 commit |
-| WAL 崩溃恢复 - SINK_SUCCESS 后文件名未更新 | Kill → 重启 → 通过 WAL success metadata 推导 sinkedSST，并 best-effort 修正文件名标签 |
+| SinkMeta 崩溃恢复 - prepare 后 | Kill → 重启 → 使用 SinkMeta 中的 prepared payload、batch 和 fileRefs 重试 commit |
+| SinkMeta 崩溃恢复 - success 后文件名未更新 | Kill → 重启 → 通过 SinkMeta success 推导 sinkedSST，并 best-effort 修正文件名标签 |
 | 优雅停机 | 停机 → 所有 in-flight 操作完成 → 重启后数据完整 |
 
 ### 3.3 测试基础设施

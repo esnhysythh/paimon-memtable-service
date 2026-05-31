@@ -27,6 +27,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
 
     private final Path dir;
     private final FlushBoundaryStore flushBoundaryStore;
+    private final SSTMetaStore sstMetaStore;
     private final TreeMap<Long, SSTMeta> metas = new TreeMap<>();
     private final Map<Long, SSTReader> readers = new HashMap<>();
     private final AtomicLong nextFileId = new AtomicLong(1);
@@ -38,38 +39,63 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
         this.dir = Path.of(config.dir());
         this.flushBoundaryStore = new FlushBoundaryStore(dir);
+        this.sstMetaStore = new SSTMetaStore(dir);
     }
 
     public synchronized void init() throws IOException {
         Files.createDirectories(dir);
+        sstMetaStore.init();
         lastFlushedSequenceId = flushBoundaryStore.load();
         long maxFileId = 0;
+        for (Path path : sstMetaStore.listMetaFiles()) {
+            maxFileId = Math.max(maxFileId, SSTMetaStore.fileIdFromMetaPath(path));
+            try {
+                SSTMeta meta = sstMetaStore.load(path);
+                if (!Files.exists(meta.path())) {
+                    throw new IOException(
+                        "SST files are missing after flush boundary was persisted: " + meta.path()
+                    );
+                }
+                SSTMeta actual = SSTReader.readMeta(meta.path(), meta.state());
+                validateMetaMatchesFile(meta, actual);
+                if (meta.maxSequenceId() > lastFlushedSequenceId) {
+                    LOG.warn(
+                        "Ignore orphan SST beyond flush boundary: path={}, maxSequenceId={}, lastFlushedSequenceId={}",
+                        meta.path(),
+                        meta.maxSequenceId(),
+                        lastFlushedSequenceId
+                    );
+                    continue;
+                }
+                metas.put(meta.fileId(), meta);
+                readers.put(meta.fileId(), SSTReader.open(meta));
+            } catch (IOException | RuntimeException e) {
+                if (lastFlushedSequenceId > 0) {
+                    if (e instanceof IOException && e.getMessage() != null
+                        && e.getMessage().contains("SST files are missing after flush boundary was persisted")) {
+                        throw (IOException) e;
+                    }
+                    throw new IOException(
+                        "SST metadata is corrupt after flush boundary was persisted: " + path,
+                        e
+                    );
+                }
+                LOG.warn("Skip corrupted SST metadata during init: {}", path, e);
+            }
+        }
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "sst-*.sst")) {
             for (Path path : stream) {
-                try {
-                    SSTReader reader = SSTReader.open(path, parseState(path));
-                    SSTMeta meta = reader.meta();
-                    maxFileId = Math.max(maxFileId, meta.fileId());
-                    if (meta.maxSequenceId() > lastFlushedSequenceId) {
-                        LOG.warn(
-                            "Ignore orphan SST beyond flush boundary: path={}, maxSequenceId={}, lastFlushedSequenceId={}",
-                            path,
-                            meta.maxSequenceId(),
-                            lastFlushedSequenceId
-                        );
-                        continue;
-                    }
-                    metas.put(meta.fileId(), meta);
-                    readers.put(meta.fileId(), reader);
-                } catch (IOException | RuntimeException e) {
-                    if (lastFlushedSequenceId > 0) {
-                        throw new IOException(
-                            "SST file is corrupt after flush boundary was persisted: " + path,
-                            e
-                        );
-                    }
-                    LOG.warn("Skip corrupted SST file during init: {}", path, e);
+                long fileId = parseFileId(path);
+                maxFileId = Math.max(maxFileId, fileId);
+                if (metas.containsKey(fileId) || Files.exists(sstMetaStore.metaPath(fileId))) {
+                    continue;
                 }
+                if (lastFlushedSequenceId > 0) {
+                    throw new IOException(
+                        "SST metadata file is missing after flush boundary was persisted: " + path
+                    );
+                }
+                LOG.warn("Ignore SST without metadata before flush boundary: {}", path);
             }
         }
         validateFlushBoundaryCoveredBySST();
@@ -129,6 +155,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 SSTFormat.DEFAULT_BLOCK_SIZE,
                 SSTFormat.DEFAULT_RESTART_INTERVAL
             ).write(nextFileId.getAndIncrement(), memTable);
+            sstMetaStore.save(meta);
             metas.put(meta.fileId(), meta);
             readers.put(meta.fileId(), SSTReader.open(meta));
             return meta;
@@ -173,6 +200,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     public synchronized void deleteSST(SSTMeta meta) {
         try {
             Files.deleteIfExists(meta.path());
+            Files.deleteIfExists(sstMetaStore.metaPath(meta.fileId()));
             metas.remove(meta.fileId());
             readers.remove(meta.fileId());
         } catch (IOException e) {
@@ -205,6 +233,11 @@ public class FileLocalStorageManager implements LocalStorageManager {
             }
         }
         SSTMeta updated = meta.withPathAndState(newPath, target);
+        try {
+            sstMetaStore.save(updated);
+        } catch (IOException e) {
+            throw new RuntimeException("persist SST metadata failed: " + sstMetaStore.metaPath(meta.fileId()), e);
+        }
         metas.put(meta.fileId(), updated);
         readers.remove(meta.fileId());
     }
@@ -224,12 +257,28 @@ public class FileLocalStorageManager implements LocalStorageManager {
         return dir.resolve(String.format("sst-%06d.%s.sst", fileId, label));
     }
 
-    private static SSTState parseState(Path path) {
+    private static long parseFileId(Path path) {
         String name = path.getFileName().toString();
-        if (name.endsWith(".sinked.sst")) {
-            return SSTState.SINKED;
+        if (!name.startsWith("sst-") || !name.endsWith(".sst")) {
+            return 0;
         }
-        return SSTState.NEW;
+        String body = name.substring(4, name.length() - 4);
+        int dot = body.indexOf('.');
+        String id = dot >= 0 ? body.substring(0, dot) : body;
+        return Long.parseLong(id);
+    }
+
+    private static void validateMetaMatchesFile(SSTMeta meta, SSTMeta actual) {
+        if (meta.fileId() != actual.fileId()
+            || meta.fileSize() != actual.fileSize()
+            || meta.entryCount() != actual.entryCount()
+            || meta.minSequenceId() != actual.minSequenceId()
+            || meta.maxSequenceId() != actual.maxSequenceId()
+            || meta.createdAtMillis() != actual.createdAtMillis()
+            || !java.util.Objects.equals(meta.minKey(), actual.minKey())
+            || !java.util.Objects.equals(meta.maxKey(), actual.maxKey())) {
+            throw new IllegalArgumentException("SST metadata does not match SST file: " + meta.path());
+        }
     }
 
     private void validateFlushBoundaryCoveredBySST() throws IOException {

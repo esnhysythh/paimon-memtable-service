@@ -7,12 +7,4 @@ public interface ReplayCallback {
     default void onDataRecord(long sequenceId, byte[] key, byte[] value) {
         onDataRecord(key, value);
     }
-
-    void onSinkPrepare(byte[] commitMessage);
-
-    void onSinkSuccess(long snapshotId);
-
-    default void onSinkSuccess(long snapshotId, byte[] metadata) {
-        onSinkSuccess(snapshotId);
-    }
 }

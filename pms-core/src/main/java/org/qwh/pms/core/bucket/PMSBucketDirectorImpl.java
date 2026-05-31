@@ -12,9 +12,9 @@ import org.qwh.pms.core.sink.MockSinkManager;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkCoordinator;
+import org.qwh.pms.core.sink.SinkMetaStore;
 import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.sink.SinkRecoveryState;
-import org.qwh.pms.core.sink.SinkWalReplayTracker;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.core.storage.SSTMeta;
 import org.qwh.pms.core.storage.SSTState;
@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -44,6 +45,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private final MemTableConfig memTableConfig;
     private final WALManagerImpl walManager;
     private final FileLocalStorageManager storageManager;
+    private final SinkMetaStore sinkMetaStore;
     private final SinkCoordinator sinkCoordinator;
 
     private volatile CurMemTable curMemTable;
@@ -71,28 +73,32 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         this.memTableConfig = config.memtable();
         this.walManager = new WALManagerImpl(config);
         this.storageManager = new FileLocalStorageManager(config.storage());
+        this.sinkMetaStore = new SinkMetaStore(Path.of(config.storage().dir()).resolve("sink"));
         SinkManager sinkManager = Objects.requireNonNull(
             sinkManagerFactory.apply(storageManager),
             "sinkManagerFactory must not return null"
         );
-        this.sinkCoordinator = new SinkCoordinator(sinkManager, walManager);
+        this.sinkCoordinator = new SinkCoordinator(sinkManager, sinkMetaStore);
         this.curMemTable = new SkipListCurMemTable(memTableConfig);
     }
 
     public void init() throws IOException {
         storageManager.init();
+        sinkMetaStore.init();
         walManager.init();
         RecoveryState recoveryState = recoverFromWAL();
-        SinkRecoveryState recoveredSink = recoverPreparedSinks(recoveryState.sinkRecoveryState());
+        SinkRecoveryState initialSink = sinkMetaStore.load();
+        SinkRecoveryState recoveredSink = recoverPreparedSinks(initialSink);
         storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds());
+        walManager.truncate(recoveredSink.lastPersistedSequenceId());
         refreshSSTLists();
         lastSinkedSnapshotId = recoveredSink.lastSinkedSnapshotId();
         lastRecoverySummary = new RecoverySummary(
             recoveryState.recoveredDataRecords(),
             recoveryState.skippedFlushedRecords(),
             recoveryState.lastFlushedSequenceId(),
-            recoveryState.pendingPreparedSinkCount(),
-            recoveredSink.sinkedSSTIds().size() - recoveryState.sinkedSSTCount(),
+            initialSink.pendingPrepares().size(),
+            recoveredSink.sinkedSSTIds().size() - initialSink.sinkedSSTIds().size(),
             recoveredSink.sinkedSSTIds().size(),
             lastSinkedSnapshotId,
             newSSTs.size(),
@@ -106,7 +112,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private RecoveryState recoverFromWAL() {
         long lastFlushedSequenceId = storageManager.lastFlushedSequenceId();
         CollectingReplayCallback cb = new CollectingReplayCallback(lastFlushedSequenceId);
-        walManager.replay(cb, 0);
+        walManager.replay(cb);
 
         for (var record : cb.dataRecords) {
             Key key = new Key(record.key);
@@ -121,26 +127,24 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             cb.skippedFlushedRecords,
             lastFlushedSequenceId
         );
-        SinkRecoveryState sinkRecoveryState = cb.sinkReplay.state();
         return new RecoveryState(
             cb.dataRecords.size(),
             cb.skippedFlushedRecords,
-            lastFlushedSequenceId,
-            sinkRecoveryState.pendingPrepares().size(),
-            sinkRecoveryState.sinkedSSTIds().size(),
-            sinkRecoveryState
+            lastFlushedSequenceId
         );
     }
 
     private SinkRecoveryState recoverPreparedSinks(SinkRecoveryState state) {
         Set<Long> sinkedIds = new HashSet<>(state.sinkedSSTIds());
         long lastSnapshotId = state.lastSinkedSnapshotId();
+        long lastPersistedSequenceId = state.lastPersistedSequenceId();
         for (var prepared : state.pendingPrepares()) {
             SinkCommitResult result = sinkCoordinator.recoverPrepared(prepared);
             sinkedIds.addAll(result.sstIds());
             lastSnapshotId = Math.max(lastSnapshotId, result.snapshotId());
+            lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
         }
-        return new SinkRecoveryState(sinkedIds, List.of(), lastSnapshotId);
+        return new SinkRecoveryState(sinkedIds, List.of(), lastSnapshotId, lastPersistedSequenceId);
     }
 
     @Override
@@ -323,6 +327,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         SinkBatch batch = new SinkBatch(nextBatchId(toSink), toSink, minSequenceId(toSink), maxSequenceId(toSink));
         SinkCommitResult result = sinkCoordinator.sink(batch);
         storageManager.markSinked(toSink);
+        walManager.truncate(result.persistedSequenceId());
 
         lifecycleLock.readLock().lock();
         try {
@@ -542,7 +547,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private static class CollectingReplayCallback implements ReplayCallback {
         private final long lastFlushedSequenceId;
         final List<DataRecord> dataRecords = new ArrayList<>();
-        final SinkWalReplayTracker sinkReplay = new SinkWalReplayTracker();
         long skippedFlushedRecords;
 
         CollectingReplayCallback(long lastFlushedSequenceId) {
@@ -563,20 +567,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             dataRecords.add(new DataRecord(sequenceId, key, value));
         }
 
-        @Override
-        public void onSinkPrepare(byte[] commitMessage) {
-            sinkReplay.onSinkPrepare(commitMessage);
-        }
-
-        @Override
-        public void onSinkSuccess(long snapshotId) {
-            sinkReplay.onSinkSuccess(snapshotId, new byte[0]);
-        }
-
-        @Override
-        public void onSinkSuccess(long snapshotId, byte[] metadata) {
-            sinkReplay.onSinkSuccess(snapshotId, metadata);
-        }
     }
 
     private record DataRecord(long sequenceId, byte[] key, byte[] value) {}
@@ -584,10 +574,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private record RecoveryState(
         long recoveredDataRecords,
         long skippedFlushedRecords,
-        long lastFlushedSequenceId,
-        long pendingPreparedSinkCount,
-        long sinkedSSTCount,
-        SinkRecoveryState sinkRecoveryState
+        long lastFlushedSequenceId
     ) {}
 
     private record SequenceStats(long totalBytes, long minSequenceId, long maxSequenceId) {}

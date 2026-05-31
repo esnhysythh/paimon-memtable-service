@@ -70,6 +70,7 @@ final class SSTWriter {
 
             BlockHandle bloomHandle = writeBlock(out, bloom.encode());
             BlockHandle indexHandle = writeIndexBlock(out, indexEntries);
+            long createdAtMillis = System.currentTimeMillis();
             byte[] properties = encodeProperties(
                 entryCount,
                 dataBlockCount,
@@ -77,7 +78,7 @@ final class SSTWriter {
                 maxKey,
                 memTable.minSequenceId(),
                 memTable.maxSequenceId(),
-                System.currentTimeMillis(),
+                createdAtMillis,
                 hasTombstone
             );
             BlockHandle propertiesHandle = writeBlock(out, properties);
@@ -98,7 +99,7 @@ final class SSTWriter {
                 maxKey,
                 memTable.minSequenceId(),
                 memTable.maxSequenceId(),
-                System.currentTimeMillis(),
+                createdAtMillis,
                 SSTState.NEW,
                 0
             );

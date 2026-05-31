@@ -124,28 +124,28 @@ PreparedSinkCommit
 - data file 必须存在。
 - 当前文件大小必须与 prepare 阶段记录一致。
 
-该校验用于发现 prepared data file 在 WAL recovery 或 commit 前被异常删除/修改的情况。当前只校验 file size，尚未引入 checksum。
+该校验用于发现 prepared data file 在 SinkMeta recovery 或 commit 前被异常删除/修改的情况。当前只校验 file size，尚未引入 checksum。
 
-## 6. WAL 与恢复协作
+## 6. SinkMeta 与恢复协作
 
-`pms-sink-paimon` 本身不直接写 WAL。WAL 由 `pms-core` 中的 `SinkCoordinator` 编排：
+`pms-sink-paimon` 本身不直接写 WAL，也不直接写 SinkMeta。prepare/success metadata 由 `pms-core` 中的 `SinkCoordinator` 和 `SinkMetaStore` 编排：
 
 ```text
 SinkCoordinator.sink(batch)
   -> PaimonSinkManager.prepare(batch)
-  -> append SINK_PREPARE
+  -> save prepare metadata
   -> PaimonSinkManager.commit(prepared)
-  -> append SINK_SUCCESS
+  -> save success metadata
 ```
 
 崩溃恢复时：
 
 ```text
-WAL replay
-  -> SinkWalReplayTracker 收集未匹配 SINK_SUCCESS 的 PreparedSinkCommit
+SinkMetaStore load
+  -> 收集未匹配 success 的 PreparedSinkCommit
   -> SinkCoordinator.recoverPrepared(prepared)
   -> PaimonSinkManager.commit(prepared)
-  -> append SINK_SUCCESS
+  -> save success metadata
   -> BucketDirector 将对应 SST 标记为 sinked
 ```
 

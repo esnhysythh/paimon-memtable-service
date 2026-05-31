@@ -1,21 +1,19 @@
 package org.qwh.pms.core.sink;
 
-import org.qwh.pms.core.wal.WALManager;
-
 import java.util.Objects;
 
 public final class SinkCoordinator {
     private final SinkManager sinkManager;
-    private final WALManager walManager;
+    private final SinkMetaStore sinkMetaStore;
 
-    public SinkCoordinator(SinkManager sinkManager, WALManager walManager) {
+    public SinkCoordinator(SinkManager sinkManager, SinkMetaStore sinkMetaStore) {
         this.sinkManager = Objects.requireNonNull(sinkManager, "sinkManager must not be null");
-        this.walManager = Objects.requireNonNull(walManager, "walManager must not be null");
+        this.sinkMetaStore = Objects.requireNonNull(sinkMetaStore, "sinkMetaStore must not be null");
     }
 
     public SinkCommitResult sink(SinkBatch batch) {
         PreparedSinkCommit prepared = sinkManager.prepare(batch);
-        walManager.appendSinkPrepare(SinkWalCodec.encodePrepare(prepared));
+        sinkMetaStore.savePrepare(prepared);
         return commitPrepared(prepared);
     }
 
@@ -25,7 +23,7 @@ public final class SinkCoordinator {
 
     private SinkCommitResult commitPrepared(PreparedSinkCommit prepared) {
         SinkCommitResult result = sinkManager.commit(prepared);
-        walManager.appendSinkSuccess(result.snapshotId(), SinkWalCodec.encodeSuccess(result));
+        sinkMetaStore.saveSuccess(result);
         return result;
     }
 }

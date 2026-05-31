@@ -80,7 +80,7 @@ PMS 中的数据单元经历以下状态流转：
 
 - **freeze**：`curMemTable` 引用用 volatile 修饰，原子切换为新的空 MemTable，原 MemTable 标记为 immutable 并加入 `newImmutableList`。冻结结果必须携带 `minSequenceId/maxSequenceId`，后续 Flush/Sink/WAL 截断以该边界推进。
 - **flush**：SST 文件原子落盘成功后，先推进本地 `lastFlushedSequenceId`，再将对应 ImmutableMemTable 从 `newImmutableList` 移至 `newSSTWithMemList`，同时注册 newSST 的 BloomFilter。若边界推进失败，ImmutableMemTable 仍保留在内存列表中，不进入已 flush 状态。
-- **sink**：`SINK_PREPARE` 先将 batch、SST id 列表、sequence 范围和 prepared commit payload 写入 WAL；Paimon commit 成功后，`SINK_SUCCESS` 将 batch、snapshotId、persistedSequenceId 和 SST id 列表写入 WAL。随后内存中将对应 newSST 批量移至 sinkedSST，并 best-effort rename 文件名用于人工观察。SST 是否 sinked 的可靠判断以 WAL 成功记录为准，不以文件名为准。
+- **sink**：Paimon prepare 成功后，`SinkMetaStore` 先将 batch、SST id 列表、sequence 范围和 prepared commit payload 写入 prepare metadata；Paimon commit 成功后，再将 batch、snapshotId、persistedSequenceId 和 SST id 列表写入 success metadata。随后内存中将对应 newSST 批量移至 sinkedSST，并 best-effort rename 文件名用于人工观察。SST 是否 sinked 的可靠判断以 SinkMeta success 为准，不以文件名为准。
 - **mem退役**：ImmutableMemTable 的引用计数归零后，从对应列表中移除，只保留 SST 引用。
 - **evict**：淘汰最老的 sinkedSST，从列表移除并删除磁盘文件（需确认无查询引用）。
 
@@ -94,7 +94,7 @@ PMS 中的数据单元经历以下状态流转：
 3. sinkedImmutableMemTables (倒序)
 4. newSSTs (BloomFilter 加速)     ── 磁盘读取
 5. sinkedSSTs (BloomFilter 加速)  ── 磁盘读取
-6. Paimon 穿透查询                ── 最慢，基于 Manifest 索引定位
+6. Paimon 穿透查询                ── 最慢，由 pms-server 在本地 miss 后发起
 ```
 
 各层内部读取统一使用 `Value` 语义表达三态：
@@ -106,6 +106,8 @@ PMS 中的数据单元经历以下状态流转：
 | `Value.bytes() == null` | DELETE tombstone 命中 | 停止穿透，返回 `Optional.empty()` |
 
 因此 LocalStorageManager 的 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 穿透中复活。
+
+V1 实现决策：`pms-core` 的 `lookup(key)` 只负责本地层三态判断，不直接依赖 Paimon API；`pms-server` 调用 `lookup(key)` 后，若本地返回 PUT 或 tombstone 则停止，只有本地完全 miss 时才通过 Paimon `ReadBuilder` 主键等值过滤执行穿透点查。这样既保持 core 的 byte-oriented 边界，也保证 tombstone 能阻断 Paimon 旧值复活。
 
 ### 4.1 Range / Prefix Scan
 
@@ -150,7 +152,7 @@ interface PMSBucketDirector {
     void freezeCurMemTable();
     void flushImmutableMemTable();
     void sinkToPaimon();             // 当前为 MockSinkManager，真实 Paimon sink 后续替换
-    void evictOldestSinkedSST();     // TODO: 待淘汰策略实现
+    Optional<SSTMeta> evictOldestSinkedSST();
 
     // ── 本地 SST 合并 ──
     void compactLocalSSTs();         // TODO: 待 SST compact 实现
@@ -190,17 +192,19 @@ record BucketStateSnapshot(
     long lastFlushedSequenceId,
     int newSSTCount,
     long newSSTTotalBytes,
+    long newSSTTotalRows,
     long newSSTMinSequenceId,
     long newSSTMaxSequenceId,
     int sinkedSSTCount,
     long sinkedSSTTotalBytes,
+    long sinkedSSTTotalRows,
     int withMemCount,                   // TODO: 待双持状态完整实现后补充
     long withMemTotalBytes,             // TODO: 待双持状态完整实现后补充
     long lastSinkedSnapshotId
 ) {}
 ```
 
-> 当前实现包含 MemTable 统计、轻量 sequence 边界、`lastFlushedSequenceId`、newSST/sinkedSST 统计和 lastSinkedSnapshotId；双持状态统计待后续补充。
+> 当前实现包含 MemTable 统计、轻量 sequence 边界、`lastFlushedSequenceId`、newSST/sinkedSST 文件数、字节数、物理 entry 数和 lastSinkedSnapshotId；双持状态统计待后续补充。
 
 ## 6. 冻结与刷盘策略
 
@@ -273,14 +277,14 @@ PMSBucketDirector / future SinkCoordinator        SinkManager
      |<-------------------------------------------------|
      |    PreparedSinkCommit                            |
      |                                                  |
-     | 3. WALManager append SINK_PREPARE(payload)       |
+     | 3. SinkMetaStore save prepare metadata           |
      |                                                  |
      | 4. commit(prepared)                              |
      |------------------------------------------------->|
      |<-------------------------------------------------|
      |    SinkCommitResult                              |
      |                                                  |
-     | 5. WALManager append SINK_SUCCESS(metadata)      |
+     | 5. SinkMetaStore save success metadata           |
      |                                                  |
      | 6. move newSST -> sinkedSST                      |
      |    best-effort rename file label                 |
@@ -288,12 +292,12 @@ PMSBucketDirector / future SinkCoordinator        SinkManager
 
 ### 7.2.1 SST 状态恢复与文件名标签
 
-SST 的可靠状态不单独写 manifest，也不写入 SST footer。启动时：
+SST 的可靠状态不写入 SST footer。启动时：
 
 ```text
 1. 扫描 storage 目录得到全部 SST
-2. replay WAL 中的 SINK_PREPARE / SINK_SUCCESS
-3. 由成功的 SINK_SUCCESS 中的 sstIds 推导 sinkedSST 集合
+2. 扫描 SinkMeta prepare/success
+3. 由 success metadata 中的 sstIds 推导 sinkedSST 集合
 4. allSST - sinkedSST = newSST
 5. best-effort 修正文件名标签
 ```
@@ -305,12 +309,12 @@ sst-000001.new.sst
 sst-000001.sinked.sst
 ```
 
-如果文件名和 WAL 推导状态不一致，以 WAL 为准并尝试 rename 修正。rename 失败只记录 warning，不影响正确性。
+如果文件名和 SinkMeta 推导状态不一致，以 SinkMeta 为准并尝试 rename 修正。rename 失败只记录 warning，不影响正确性。
 
 ### 7.3 Sink 失败处理
 
 - **prepare 失败**：重试最多 3 次。仍失败则标记 Sink 异常，上报告警，不继续 commit。
-- **commit 失败**：依赖 WAL 中的 `SINK_PREPARE` 记录，重启后重试 commit（参见 [pms-core.md](pms-core.md) § 5.4）。
+- **commit 失败**：依赖 SinkMeta prepare 记录，重启后重试 commit（参见 [pms-recovery-metadata.md](pms-recovery-metadata.md)）。
 - Sink 失败期间，新的 Freeze 和 Flush 仍可正常进行，写入路径不受影响。只是 newSST 会堆积，可能导致水位上升至 OVERLOADED。
 
 ## 8. 淘汰策略
@@ -327,7 +331,8 @@ sst-000001.sinked.sst
 - **只淘汰最老**：保证 PMS 缓存中永远是最新数据，规避幽灵数据问题。
 - 淘汰前确认：无查询引用该 SST（引用计数机制同 ImmutableMemTable）。
 - 淘汰时：删除磁盘 SST 文件，从列表移除。
-- 触发条件：sinkedSST 总大小超过 `PMSConfig.storageSinkedMaxSizeMb`，或文件数超过 `PMSConfig.storageSinkedMaxCount`。
+- 触发条件由 `pms-server` 根据本地 SST 总大小、总文件数或总物理 entry 数判断；core 只提供"退役最老 sinkedSST"的原子能力。
+- 物理 entry 数使用 `SSTMeta.entryCount` 求和，包含 tombstone 和跨 SST 的旧版本；不能用 `sequenceId` 范围推导。
 
 ### 8.3 SST 合并策略
 

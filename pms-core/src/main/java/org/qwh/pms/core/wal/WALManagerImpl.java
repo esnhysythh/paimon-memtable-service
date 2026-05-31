@@ -23,11 +23,6 @@ public class WALManagerImpl implements WALManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(WALManagerImpl.class);
 
-    // PMS application-layer record types
-    static final byte TYPE_DATA = 0x00;
-    static final byte TYPE_SINK_PREPARE = 0x01;
-    static final byte TYPE_SINK_SUCCESS = 0x02;
-
     // valueLen = -1 signals Delete (no value bytes follow)
     static final int VALUE_LEN_DELETE = -1;
 
@@ -70,10 +65,9 @@ public class WALManagerImpl implements WALManager {
             }
         }
 
-        // Read maxSnapshotId and maxSequenceId from each existing file.
+        // Read maxSequenceId from each existing file.
         for (WalFileInfo info : walFiles.values()) {
             WalFileScan scan = scanWalFile(info.file);
-            info.maxSnapshotId = scan.maxSnapshotId;
             info.minSequenceId = scan.minSequenceId;
             info.maxSequenceId = scan.maxSequenceId;
             lastSequenceId = Math.max(lastSequenceId, scan.maxSequenceId);
@@ -91,10 +85,9 @@ public class WALManagerImpl implements WALManager {
 
         long sequenceId = nextSequenceId++;
 
-        // Serialize: type(1) + sequenceId(8) + keyLen(4) + key + valueLen(4) + [value]
-        int payloadSize = 1 + 8 + 4 + key.length + 4 + (value != null ? value.length : 0);
+        // Serialize: sequenceId(8) + keyLen(4) + key + valueLen(4) + [value]
+        int payloadSize = 8 + 4 + key.length + 4 + (value != null ? value.length : 0);
         DynamicSliceOutput output = new DynamicSliceOutput(payloadSize);
-        output.writeByte(TYPE_DATA);
         output.writeLong(sequenceId);
         output.writeInt(key.length);
         writeBytes(output, key);
@@ -113,6 +106,7 @@ public class WALManagerImpl implements WALManager {
         if (currentInfo != null) {
             currentInfo.observeSequence(sequenceId);
         }
+        maybeRollToNewFile();
         return sequenceId;
     }
 
@@ -121,81 +115,19 @@ public class WALManagerImpl implements WALManager {
         return lastSequenceId;
     }
 
-    @Override
-    public synchronized void appendSinkPrepare(byte[] commitMessage) {
-        ensureNotClosed();
-
-        int payloadSize = 1 + 4 + commitMessage.length;
-        DynamicSliceOutput output = new DynamicSliceOutput(payloadSize);
-        output.writeByte(TYPE_SINK_PREPARE);
-        output.writeInt(commitMessage.length);
-        writeBytes(output, commitMessage);
-
-        addRecord(output.slice(), true);
-    }
-
-    @Override
-    public synchronized void appendSinkSuccess(long snapshotId) {
-        appendSinkSuccess(snapshotId, new byte[0]);
-    }
-
-    @Override
-    public synchronized void appendSinkSuccess(long snapshotId, byte[] metadata) {
-        ensureNotClosed();
-        if (metadata == null) {
-            metadata = new byte[0];
-        }
-
-        int payloadSize = 1 + 8 + 4 + metadata.length;
-        DynamicSliceOutput output = new DynamicSliceOutput(payloadSize);
-        output.writeByte(TYPE_SINK_SUCCESS);
-        output.writeLong(snapshotId);
-        output.writeInt(metadata.length);
-        writeBytes(output, metadata);
-
-        long fileNumber = currentWriter.getFileNumber();
-        addRecord(output.slice(), true);
-
-        // Update maxSnapshotId for current file
-        WalFileInfo currentInfo = walFiles.get(fileNumber);
-        if (currentInfo != null) {
-            currentInfo.maxSnapshotId = Math.max(currentInfo.maxSnapshotId, snapshotId);
-        }
-    }
-
     /**
      * Replay WAL records to the given callback.
      *
-     * @param callback receives DATA, SINK_PREPARE, and SINK_SUCCESS records in order
-     * @param highWatermarkSnapshotId controls which DATA records are skipped:
-     *   &lt;= 0 or {@code Long.MAX_VALUE} — replay all DATA records (no filtering);
-     *   positive value — skip DATA records before the first SINK_SUCCESS whose
-     *   snapshotId &gt;= this value (those records are already committed to Paimon).
-     *   Control records (SINK_PREPARE / SINK_SUCCESS) are always replayed regardless
-     *   of the watermark, so the caller can track the full snapshot timeline.
+     * @param callback receives DATA records in order
      */
     @Override
-    public void replay(ReplayCallback callback, long highWatermarkSnapshotId) {
+    public void replay(ReplayCallback callback) {
         List<WalFileInfo> filesToReplay;
         synchronized (this) {
             filesToReplay = new ArrayList<>(walFiles.values());
         }
 
-        // Whether we've encountered a SINK_SUCCESS with snapshotId >= highWatermarkSnapshotId.
-        // Before this point, DATA records are from already-committed snapshots and can be skipped.
-        // Control records (SINK_PREPARE/SINK_SUCCESS) are always replayed so the caller can
-        // track the full snapshot timeline.
-        // highWatermarkSnapshotId = Long.MAX_VALUE means "nothing is committed yet, replay all".
-        boolean pastHighWatermark = highWatermarkSnapshotId <= 0 || highWatermarkSnapshotId == Long.MAX_VALUE;
-
         for (WalFileInfo info : filesToReplay) {
-            // Skip entire files whose maxSnapshotId is strictly before the watermark.
-            // A file with maxSnapshotId == highWatermarkSnapshotId can still contain
-            // uncommitted DATA records after that SINK_SUCCESS, so it must be scanned.
-            if (!pastHighWatermark && info.maxSnapshotId > 0 && info.maxSnapshotId < highWatermarkSnapshotId) {
-                continue;
-            }
-
             if (!info.file.exists()) {
                 LOG.warn("WAL file missing during replay: {}", info.file);
                 continue;
@@ -223,71 +155,30 @@ public class WALManagerImpl implements WALManager {
 
                 Slice record;
                 while ((record = reader.readRecord()) != null) {
-                    byte type = record.getByte(0);
-                    switch (type) {
-                        case TYPE_DATA -> {
-                            if (!pastHighWatermark) {
-                                // Data before highWatermark is already committed to Paimon — skip
-                                continue;
-                            }
-                            SliceInput input = record.input();
-                            requireBytes(input, 1 + 8 + 4, "DATA header");
-                            input.readByte(); // skip type
-                            long sequenceId = input.readLong();
-                            if (sequenceId <= 0) {
-                                throw corruptRecord("Invalid sequenceId: " + sequenceId);
-                            }
-                            int keyLen = readNonNegativeLength(input, "keyLen");
-                            requireBytes(input, keyLen + 4, "DATA key/value header");
-                            byte[] key = new byte[keyLen];
-                            input.readBytes(key);
-                            int valueLen = input.readInt();
-                            byte[] value;
-                            if (valueLen == VALUE_LEN_DELETE) {
-                                value = null;
-                            } else {
-                                if (valueLen < 0) {
-                                    throw corruptRecord("Invalid valueLen: " + valueLen);
-                                }
-                                requireBytes(input, valueLen, "DATA value");
-                                value = new byte[valueLen];
-                                input.readBytes(value);
-                            }
-                            requireFullyConsumed(input, "DATA");
-                            callback.onDataRecord(sequenceId, key, value);
-                        }
-                        case TYPE_SINK_PREPARE -> {
-                            SliceInput input = record.input();
-                            requireBytes(input, 1 + 4, "SINK_PREPARE header");
-                            input.readByte(); // skip type
-                            int msgLen = readNonNegativeLength(input, "commitMessageLen");
-                            requireBytes(input, msgLen, "SINK_PREPARE message");
-                            byte[] commitMessage = new byte[msgLen];
-                            input.readBytes(commitMessage);
-                            requireFullyConsumed(input, "SINK_PREPARE");
-                            callback.onSinkPrepare(commitMessage);
-                        }
-                        case TYPE_SINK_SUCCESS -> {
-                            SliceInput input = record.input();
-                            requireBytes(input, 1 + 8, "SINK_SUCCESS payload");
-                            input.readByte(); // skip type
-                            long snapshotId = input.readLong();
-                            byte[] metadata = new byte[0];
-                            if (input.available() > 0) {
-                                requireBytes(input, 4, "SINK_SUCCESS metadata length");
-                                int metadataLen = readNonNegativeLength(input, "metadataLen");
-                                requireBytes(input, metadataLen, "SINK_SUCCESS metadata");
-                                metadata = new byte[metadataLen];
-                                input.readBytes(metadata);
-                            }
-                            requireFullyConsumed(input, "SINK_SUCCESS");
-                            callback.onSinkSuccess(snapshotId, metadata);
-                            if (snapshotId >= highWatermarkSnapshotId) {
-                                pastHighWatermark = true;
-                            }
-                        }
-                        default -> LOG.warn("Unknown PMS record type {} during replay", type);
+                    SliceInput input = record.input();
+                    requireBytes(input, 8 + 4, "DATA header");
+                    long sequenceId = input.readLong();
+                    if (sequenceId <= 0) {
+                        throw corruptRecord("Invalid sequenceId: " + sequenceId);
                     }
+                    int keyLen = readNonNegativeLength(input, "keyLen");
+                    requireBytes(input, keyLen + 4, "DATA key/value header");
+                    byte[] key = new byte[keyLen];
+                    input.readBytes(key);
+                    int valueLen = input.readInt();
+                    byte[] value;
+                    if (valueLen == VALUE_LEN_DELETE) {
+                        value = null;
+                    } else {
+                        if (valueLen < 0) {
+                            throw corruptRecord("Invalid valueLen: " + valueLen);
+                        }
+                        requireBytes(input, valueLen, "DATA value");
+                        value = new byte[valueLen];
+                        input.readBytes(value);
+                    }
+                    requireFullyConsumed(input, "DATA");
+                    callback.onDataRecord(sequenceId, key, value);
                 }
             } catch (IOException e) {
                 LOG.error("Error reading WAL file during replay: {}", info.file, e);
@@ -300,7 +191,7 @@ public class WALManagerImpl implements WALManager {
     }
 
     @Override
-    public synchronized void truncate(long safeSnapshotId) {
+    public synchronized void truncate(long safeSequenceId) {
         List<Long> toDelete = new ArrayList<>();
         for (var entry : walFiles.entrySet()) {
             long fileNum = entry.getKey();
@@ -309,8 +200,8 @@ public class WALManagerImpl implements WALManager {
             if (currentWriter != null && fileNum == currentWriter.getFileNumber()) {
                 continue;
             }
-            // Delete if maxSnapshotId <= safeSnapshotId
-            if (info.maxSnapshotId > 0 && info.maxSnapshotId <= safeSnapshotId) {
+            // Delete if the file's data records are fully persisted to Paimon.
+            if (info.maxSequenceId > 0 && info.maxSequenceId <= safeSequenceId) {
                 toDelete.add(fileNum);
             }
         }
@@ -320,7 +211,7 @@ public class WALManagerImpl implements WALManager {
             if (info != null) {
                 try {
                     new LogWriterDeleter(info.file).delete();
-                    LOG.info("Truncated WAL file {} (snapshotId <= {})", info.file.getName(), safeSnapshotId);
+                    LOG.info("Truncated WAL file {} (maxSequenceId <= {})", info.file.getName(), safeSequenceId);
                 } catch (IOException e) {
                     LOG.warn("Failed to delete WAL file {}: {}", info.file, e.getMessage());
                 }
@@ -348,13 +239,19 @@ public class WALManagerImpl implements WALManager {
         try {
             currentWriter.addRecord(payload, force);
             currentFileBytes += estimateRecordSize(payload.length());
-
-            // Roll to new file if size exceeds limit
-            if (currentFileBytes >= maxFileSizeBytes) {
-                rollToNewFile();
-            }
         } catch (IOException e) {
             throw new RuntimeException("WAL write failed", e);
+        }
+    }
+
+    private void maybeRollToNewFile() {
+        if (currentFileBytes < maxFileSizeBytes) {
+            return;
+        }
+        try {
+            rollToNewFile();
+        } catch (IOException e) {
+            throw new RuntimeException("WAL roll failed", e);
         }
     }
 
@@ -366,14 +263,14 @@ public class WALManagerImpl implements WALManager {
         long fileNum = nextFileNumber++;
         File file = walDir.resolve(String.format("wal-%06d.log", fileNum)).toFile();
 
-        // Write file header: magic(4) + maxSnapshotId(8) + lastSequenceId(8) = 20 bytes
+        // Write file header: magic(4) + reserved(8) + lastSequenceId(8) = 20 bytes
         // Magic: "PMS\0"
         DynamicSliceOutput headerOutput = new DynamicSliceOutput(20);
         headerOutput.writeByte('P');
         headerOutput.writeByte('M');
         headerOutput.writeByte('S');
         headerOutput.writeByte(0);
-        headerOutput.writeLong(0); // maxSnapshotId = 0 initially
+        headerOutput.writeLong(0); // reserved for future WAL metadata
         headerOutput.writeLong(lastSequenceId);
 
         currentWriter = Logs.createLogWriter(file, fileNum, walConfig);
@@ -396,32 +293,22 @@ public class WALManagerImpl implements WALManager {
             if (headerRecord == null || headerRecord.length() < 20) {
                 return WalFileScan.EMPTY;
             }
-            // Read header's initial maxSnapshotId
-            long maxSnapshotId = headerRecord.getLong(4);
             long headerLastSequenceId = headerRecord.getLong(12);
             long minSequenceId = Long.MAX_VALUE;
             long maxSequenceId = headerLastSequenceId;
 
-            // Scan all records to find the true maxSnapshotId from SINK_SUCCESS entries.
-            // The header only stores the initial value (0); actual snapshotIds come from
-            // SINK_SUCCESS records written during the file's lifetime, which are not
-            // persisted back to the header.
             Slice record;
             while ((record = reader.readRecord()) != null) {
-                if (record.length() < 1) continue;
-                byte type = record.getByte(0);
-                if (type == TYPE_SINK_SUCCESS && record.length() >= 9) {
-                    long snapshotId = record.getLong(1);
-                    maxSnapshotId = Math.max(maxSnapshotId, snapshotId);
-                } else if (type == TYPE_DATA && record.length() >= 9) {
-                    long sequenceId = record.getLong(1);
-                    if (sequenceId > 0) {
-                        minSequenceId = Math.min(minSequenceId, sequenceId);
-                        maxSequenceId = Math.max(maxSequenceId, sequenceId);
-                    }
+                if (record.length() < 8) {
+                    continue;
+                }
+                long sequenceId = record.getLong(0);
+                if (sequenceId > 0) {
+                    minSequenceId = Math.min(minSequenceId, sequenceId);
+                    maxSequenceId = Math.max(maxSequenceId, sequenceId);
                 }
             }
-            return new WalFileScan(maxSnapshotId, minSequenceId == Long.MAX_VALUE ? 0 : minSequenceId, maxSequenceId);
+            return new WalFileScan(minSequenceId == Long.MAX_VALUE ? 0 : minSequenceId, maxSequenceId);
         } catch (IOException e) {
             LOG.warn("Failed to scan WAL file metadata: {}", file, e);
             return WalFileScan.EMPTY;
@@ -499,14 +386,12 @@ public class WALManagerImpl implements WALManager {
     private static class WalFileInfo {
         final long fileNumber;
         final File file;
-        long maxSnapshotId;
         long minSequenceId;
         long maxSequenceId;
 
         WalFileInfo(long fileNumber, File file) {
             this.fileNumber = fileNumber;
             this.file = file;
-            this.maxSnapshotId = 0;
             this.minSequenceId = 0;
             this.maxSequenceId = 0;
         }
@@ -522,7 +407,7 @@ public class WALManagerImpl implements WALManager {
         }
     }
 
-    private record WalFileScan(long maxSnapshotId, long minSequenceId, long maxSequenceId) {
-        static final WalFileScan EMPTY = new WalFileScan(0, 0, 0);
+    private record WalFileScan(long minSequenceId, long maxSequenceId) {
+        static final WalFileScan EMPTY = new WalFileScan(0, 0);
     }
 }

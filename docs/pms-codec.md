@@ -15,7 +15,7 @@ pms-core  -> byte[] key/value 生命周期核心，不依赖 pms-codec
 
 `pms-codec` 不反向依赖 `pms-core`。接口返回 `byte[]`，不返回 `Key` 或 `Value`，由上层组合模块调用 `PMSBucketDirector.put(byte[] key, byte[] value)` 或 `PMSBucketDirector.delete(byte[] key)`。
 
-`pms-core` 拥有 sink 状态机和 `SinkManager` SPI：它负责选择 `SinkBatch`、写入 `SINK_PREPARE/SINK_SUCCESS` WAL 记录、推进 SST sinked 状态和 `persistedSequenceId` 边界；真实 Paimon 写入逻辑由上层模块注入 `SinkManager` 实现。这样 `pms-core` 可以追踪“是否 sink 成功”，但不依赖 Paimon sink 的具体实现。
+`pms-core` 拥有 sink 状态机和 `SinkManager` SPI：它负责选择 `SinkBatch`、通过 `SinkMetaStore` 写入 prepare/success metadata、推进 SST sinked 状态和 `persistedSequenceId` 边界；真实 Paimon 写入逻辑由上层模块注入 `SinkManager` 实现。这样 `pms-core` 可以追踪“是否 sink 成功”，但不依赖 Paimon sink 的具体实现。
 
 ## 3. 核心语义
 
