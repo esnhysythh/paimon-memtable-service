@@ -150,6 +150,10 @@ class ConfigManager {
 | `pms.flowcontrol.overloaded_pending_sst_count` | 16 | `flowcontrolOverloadedPendingSstCount` |
 | `pms.paimon.table_path` | - | `paimonTablePath` |
 | `pms.paimon.warehouse` | - | `paimonWarehouse` |
+| `pms.paimon.cache_enabled` | true | `PaimonConfig.cacheEnabled`，透传为 Paimon `cache-enabled` |
+| `pms.paimon.manifest_cache_small_file_memory` | 128mb | `PaimonConfig.manifestCacheSmallFileMemory`，透传为 Paimon `cache.manifest.small-file-memory` |
+| `pms.paimon.manifest_cache_small_file_threshold` | 1mb | `PaimonConfig.manifestCacheSmallFileThreshold`，透传为 Paimon `cache.manifest.small-file-threshold` |
+| `pms.paimon.manifest_cache_max_memory` | - | `PaimonConfig.manifestCacheMaxMemory`，非空时透传为 Paimon `cache.manifest.max-memory` |
 
 ### 2.4 BackgroundTaskScheduler
 

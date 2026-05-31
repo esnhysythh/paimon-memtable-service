@@ -48,7 +48,19 @@ public record PMSConfig(
             ),
             new PaimonConfig(
                 getString(props, "pms.paimon.table_path", null),
-                getString(props, "pms.paimon.warehouse", null)
+                getString(props, "pms.paimon.warehouse", null),
+                getBoolean(props, "pms.paimon.cache_enabled", PaimonConfig.DEFAULT_CACHE_ENABLED),
+                getString(
+                    props,
+                    "pms.paimon.manifest_cache_small_file_memory",
+                    PaimonConfig.DEFAULT_MANIFEST_CACHE_SMALL_FILE_MEMORY
+                ),
+                getString(
+                    props,
+                    "pms.paimon.manifest_cache_small_file_threshold",
+                    PaimonConfig.DEFAULT_MANIFEST_CACHE_SMALL_FILE_THRESHOLD
+                ),
+                getString(props, "pms.paimon.manifest_cache_max_memory", null)
             )
         );
     }

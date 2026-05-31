@@ -398,6 +398,9 @@ class PmsServerEndToEndTest {
         assertEquals("server_pk", config.table());
         assertEquals(tempDir.resolve("wal").toString(), config.coreConfig().wal().dir());
         assertEquals(tempDir.resolve("storage").toString(), config.coreConfig().storage().dir());
+        assertTrue(config.coreConfig().paimon().cacheEnabled());
+        assertEquals("128mb", config.coreConfig().paimon().manifestCacheSmallFileMemory());
+        assertEquals("1mb", config.coreConfig().paimon().manifestCacheSmallFileThreshold());
         assertFalse(config.scheduler().enabled());
         assertEquals(0, config.scheduler().flushIntervalMs());
         assertEquals(30000, config.scheduler().sinkIntervalMs());
