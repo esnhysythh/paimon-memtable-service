@@ -41,6 +41,15 @@ class PMSConfigTest {
 
         // Paimon required field
         assertEquals("/tmp/table", config.paimon().tablePath());
+        assertTrue(config.paimon().cacheEnabled());
+        assertEquals(
+            PaimonConfig.DEFAULT_MANIFEST_CACHE_SMALL_FILE_MEMORY,
+            config.paimon().manifestCacheSmallFileMemory()
+        );
+        assertEquals(
+            PaimonConfig.DEFAULT_MANIFEST_CACHE_SMALL_FILE_THRESHOLD,
+            config.paimon().manifestCacheSmallFileThreshold()
+        );
     }
 
     @Test
@@ -56,6 +65,10 @@ class PMSConfigTest {
         props.setProperty("pms.storage.local_sst_max_rows", "1000");
         props.setProperty("pms.sink.interval_ms", "60000");
         props.setProperty("pms.flowcontrol.overloaded_immutable_count", "8");
+        props.setProperty("pms.paimon.cache_enabled", "false");
+        props.setProperty("pms.paimon.manifest_cache_small_file_memory", "64mb");
+        props.setProperty("pms.paimon.manifest_cache_small_file_threshold", "512kb");
+        props.setProperty("pms.paimon.manifest_cache_max_memory", "256mb");
 
         PMSConfig config = PMSConfig.from(props);
 
@@ -67,6 +80,10 @@ class PMSConfigTest {
         assertTrue(config.wal().useMmap());
         assertEquals(60000, config.sink().intervalMs());
         assertEquals(8, config.flowcontrol().overloadedImmutableCount());
+        assertFalse(config.paimon().cacheEnabled());
+        assertEquals("64mb", config.paimon().manifestCacheSmallFileMemory());
+        assertEquals("512kb", config.paimon().manifestCacheSmallFileThreshold());
+        assertEquals("256mb", config.paimon().manifestCacheMaxMemory());
     }
 
     @Test

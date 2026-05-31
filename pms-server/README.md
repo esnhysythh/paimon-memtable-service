@@ -56,6 +56,10 @@ directories and the target Paimon table.
 | `pms.paimon.warehouse` | required | Paimon warehouse path. |
 | `pms.paimon.database` | required | Paimon database. |
 | `pms.paimon.table` | required | Paimon table. |
+| `pms.paimon.cache_enabled` | `true` | Enables Paimon catalog caches, including manifest cache. |
+| `pms.paimon.manifest_cache_small_file_memory` | `128mb` | Paimon manifest small-file cache memory. |
+| `pms.paimon.manifest_cache_small_file_threshold` | `1mb` | Maximum manifest file size treated as small-file cache candidate. |
+| `pms.paimon.manifest_cache_max_memory` | unset | Optional Paimon manifest max cache memory; when larger than small-file memory, Paimon may cache all manifest files up to this budget. |
 | `pms.memtable.max_entries` | `1000000` | Current memtable entry threshold. |
 | `pms.memtable.max_size_mb` | `256` | Current memtable size threshold. |
 | `pms.sink.interval_ms` | `30000` | Core sink interval default and scheduler sink fallback. |

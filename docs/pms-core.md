@@ -28,7 +28,14 @@ record StorageConfig(String dir, long sinkedMaxSizeMb, int sinkedMaxCount,
 record SinkConfig(int intervalMs, int maxPendingSsts) { ... }  // 默认 30000 / 8
 record FlowControlConfig(int overloadedImmutableCount,
                          int overloadedPendingSstCount) { ... }  // 默认 4 / 16
-record PaimonConfig(String tablePath, String warehouse) { ... }  // 必填 tablePath
+record PaimonConfig(
+    String tablePath,
+    String warehouse,
+    boolean cacheEnabled,
+    String manifestCacheSmallFileMemory,
+    String manifestCacheSmallFileThreshold,
+    String manifestCacheMaxMemory
+) { ... }  // 必填 tablePath
 
 // 顶层组合
 record PMSConfig(
@@ -64,6 +71,10 @@ record PMSConfig(
 | `pms.flowcontrol.overloaded_pending_sst_count` | FlowControlConfig | overloadedPendingSstCount | 16 |
 | `pms.paimon.table_path` | PaimonConfig | tablePath | 必填 |
 | `pms.paimon.warehouse` | PaimonConfig | warehouse | — |
+| `pms.paimon.cache_enabled` | PaimonConfig | cacheEnabled | true |
+| `pms.paimon.manifest_cache_small_file_memory` | PaimonConfig | manifestCacheSmallFileMemory | 128mb |
+| `pms.paimon.manifest_cache_small_file_threshold` | PaimonConfig | manifestCacheSmallFileThreshold | 1mb |
+| `pms.paimon.manifest_cache_max_memory` | PaimonConfig | manifestCacheMaxMemory | — |
 
 ### 2.3 组件构造方式
 
@@ -323,10 +334,10 @@ interface SinkManager {
 - 触发时机：Paimon L0 文件数超过阈值时，由 `BackgroundTaskScheduler` 触发。
 - Compaction 是异步操作，不阻塞 Sink 路径。
 
-**Paimon Manifest 索引**：
-- 维护 Paimon 最新 Snapshot 的元信息索引，用于加速穿透查询。
-- V1 采用全量加载策略。后续按需引入分区分级加载优化。
-- TODO: Manifest 索引的具体结构、加载时机、内存占用量化设计待补充。
+**Paimon Manifest 缓存**：
+- V1 不在 PMS 内部自建 Manifest 索引；穿透查询继续通过 `pms-server` 的 Paimon `ReadBuilder` 路径执行。
+- PMS 启动加载 Paimon catalog 时显式透传 Paimon 内建 manifest cache 配置，复用 Paimon `ManifestEntryCache` 对 manifest 元信息的缓存与 partition/bucket 分段过滤能力。
+- 该决策保持 `pms-core` byte-oriented，不引入 Paimon API 依赖；后续若 `ReadBuilder` 点查仍不能满足性能目标，再评估基于 Paimon `LocalTableQuery` 的 bucket 级点查视图。
 
 ### 3.5 PMSBucketDirector
 
