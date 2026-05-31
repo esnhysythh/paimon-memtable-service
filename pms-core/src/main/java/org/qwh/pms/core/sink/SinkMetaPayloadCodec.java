@@ -9,12 +9,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
-public final class SinkWalCodec {
+public final class SinkMetaPayloadCodec {
     private static final int PREPARE_MAGIC = 0x50535052; // PSPR
     private static final int SUCCESS_MAGIC = 0x50535343; // PSSC
     private static final int VERSION = 1;
 
-    private SinkWalCodec() {}
+    private SinkMetaPayloadCodec() {}
 
     public static byte[] encodePrepare(PreparedSinkCommit prepared) {
         try {

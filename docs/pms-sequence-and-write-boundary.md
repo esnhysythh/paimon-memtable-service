@@ -222,13 +222,13 @@ restart:
 
 若 SST 已落盘但边界文件尚未写入就崩溃，重启会重放更多 WAL 记录。这是安全的，代价只是恢复后 curMemTable 中临时包含已 flush 数据的重复表达。若边界文件已经写入，则对应 SST 成为恢复正确性的组成部分；启动时如果发现已持久化 flush 边界但 SST 损坏，应失败而不是静默跳过，以避免边界跳过 WAL 后丢失数据。
 
-因此 Sink 控制记录需要包含类似：
+Sink 成功元信息需要包含类似：
 
 ```text
-SINK_SUCCESS(snapshotId, metadata(batchId, persistedSequenceId, sstIds))
+SinkSuccessMeta(snapshotId, batchId, persistedSequenceId, sstIds)
 ```
 
-当前实现已在 `SINK_PREPARE` payload 中记录本次 sink 覆盖的 `sstIds` 与 `minSequenceId/maxSequenceId`，并在 `SINK_SUCCESS` metadata 中确认 `persistedSequenceId` 与 `sstIds`。SST 是否 sinked 由成功记录推导，不单独写 SST state manifest。
+当前实现中，Sink prepare/success 不再写入 WAL，而是写入独立 `SinkMeta` 文件。prepare meta 记录本次 sink 覆盖的 `sstIds`、`minSequenceId/maxSequenceId`、prepared commit payload 与外部 file refs；success meta 确认 `persistedSequenceId` 与 `sstIds`。SST 是否 sinked 由 success meta 推导，不再依赖 WAL 控制记录。详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
 
 安全截断条件应变为：
 
@@ -236,7 +236,7 @@ SINK_SUCCESS(snapshotId, metadata(batchId, persistedSequenceId, sstIds))
 walFile.maxSequenceId <= persistedSequenceId
 ```
 
-`snapshotId` 只能证明 Paimon 外部提交存在，不能单独表达 PMS 内部覆盖边界。当前 `maxSnapshotId <= safeSnapshotId` 的截断方式只是临时策略。
+`snapshotId` 只能证明 Paimon 外部提交存在，不能单独表达 PMS 内部覆盖边界；因此 WAL 文件删除应以 PMS 内部 `persistedSequenceId` 判断。
 
 ## 7. WAL 写入性能与业界优化
 
@@ -271,6 +271,6 @@ PMS 当前阶段接受短提交锁，是为了保证边界正确性。它不应�
 后续 TODO：
 
 - 移除或改造 `CurMemTable.delete(Key)`，避免无 sequence tombstone。
-- 将 WAL truncate 改为基于 `persistedSequenceId`。
+- 为 WAL truncate 增加定期补偿式后台调度，避免只依赖 sink success 后的即时触发。
 - 引入 WriteCoordinator，为 writer queue / group commit 预留扩展点。
 - 若未来需要 MVCC，将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。

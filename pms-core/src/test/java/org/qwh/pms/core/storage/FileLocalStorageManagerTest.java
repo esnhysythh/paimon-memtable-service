@@ -148,6 +148,23 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void flushWritesHumanReadableSstMetadata() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+
+        Path metaPath = tempDir.resolve("sst-000001.meta.json");
+        String content = Files.readString(metaPath);
+
+        assertTrue(Files.exists(metaPath));
+        assertTrue(content.contains("\"fileId\": " + meta.fileId()));
+        assertTrue(content.contains("\"sstFile\": \"sst-000001.new.sst\""));
+        assertTrue(content.contains("\"state\": \"NEW\""));
+        assertTrue(content.contains("\"minSequenceId\": 1"));
+        assertTrue(content.contains("\"maxSequenceId\": 1"));
+        assertTrue(content.contains("\"metaCrc32\""));
+    }
+
+    @Test
     void initReloadsExistingSstMetadata() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
@@ -218,6 +235,23 @@ class FileLocalStorageManagerTest {
             file.seek(0);
             file.writeByte('X');
         }
+
+        FileLocalStorageManager reloaded = new FileLocalStorageManager(
+            new StorageConfig(tempDir.toString(), 0, 0, 0, 0)
+        );
+
+        assertThrows(IOException.class, reloaded::init);
+    }
+
+    @Test
+    void corruptSstMetadataFailsReloadAfterFlushBoundaryWasPersisted() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        storage.persistFlushedSequenceId(meta.maxSequenceId());
+
+        Path metaPath = tempDir.resolve("sst-000001.meta.json");
+        String content = Files.readString(metaPath).replace("\"maxSequenceId\": 1", "\"maxSequenceId\": 2");
+        Files.writeString(metaPath, content);
 
         FileLocalStorageManager reloaded = new FileLocalStorageManager(
             new StorageConfig(tempDir.toString(), 0, 0, 0, 0)

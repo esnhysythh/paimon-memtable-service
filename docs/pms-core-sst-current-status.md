@@ -21,11 +21,12 @@
 
 - BucketDirector 查询路径已包含 `curMemTable -> immutableMemTables -> newSSTs -> sinkedSSTs`。
 - Flush 成功后会推进 `lastFlushedSequenceId`。
+- Flush 成功后会写独立 `sst-*.meta.json`，记录 SST 文件名、sequence 边界、key 边界、entryCount、状态和校验字段。
 - `lastFlushedSequenceId` 持久化在 storage 目录下的 `flush-boundary.meta`。
 - 重启恢复时，WAL 中 `sequenceId <= lastFlushedSequenceId` 的 DATA 记录不再回放到 curMemTable，而由 SST 承载。
 - 启动扫描 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效 SST；`maxSequenceId` 超过边界的 SST 视为 orphan，由 WAL replay 恢复对应数据，避免重复数据源。
 - 如果 flush boundary 已经持久化，但启动时发现相关 SST 损坏，当前策略是启动失败，避免 WAL 被跳过后数据丢失。
-- SST 文件和 `flush-boundary.meta` 写入都采用 temp file + force/fsync + atomic rename + directory force 的持久化顺序。
+- SST 文件、`sst-*.meta.json` 和 `flush-boundary.meta` 写入都采用 temp file + force/fsync + atomic rename + directory force 的持久化顺序。
 
 ### 2.3 Sink 边界与 mock 实现
 
@@ -43,19 +44,20 @@ interface SinkManager {
 - `SinkBatch`：记录本次 sink 覆盖的 SST 列表、batchId 和 sequence 范围。
 - `PreparedSinkCommit`：记录 prepare 阶段产物，包括 sstIds、sequence 范围、payload、fileRefs 和行数统计。
 - `SinkCommitResult`：记录 commit 成功后的 batchId、snapshotId、persistedSequenceId 和 sstIds。
-- `SinkWalCodec`：负责将 prepare/success 信息编码进 WAL payload。
+- `SinkMetaStore`：负责将 prepare/success 信息写入独立可读 metadata，并在恢复时加载未完成 prepared commit。
+- `SinkMetaPayloadCodec`：作为 `SinkMetaStore` 内部二进制 payload 编码工具复用，便于 prepare/success round-trip。
 - `MockSinkManager`：当前只用于打通 PMS 内部状态流转，不真实写 Paimon。
 
 ### 2.4 SST sinked 状态来源
 
-SST 的可靠状态来源是 WAL，而不是文件名、manifest 或 SST footer。
+SST 的可靠 sinked 状态来源是 SinkMeta success，而不是文件名或 SST footer。
 
 恢复时：
 
 ```text
-1. 扫描 storage 目录得到全部 SST
-2. replay WAL 中的 SINK_PREPARE / SINK_SUCCESS
-3. 从成功的 SINK_SUCCESS metadata 中读取 sstIds
+1. 扫描 storage 目录的 `sst-*.meta.json` 并校验对应 SST 文件
+2. 扫描 SinkMeta prepare/success
+3. 从 success metadata 中读取 sstIds
 4. sstIds 中的 SST 视为 sinkedSST
 5. 其余 SST 视为 newSST
 6. best-effort 修正 SST 文件名标签
@@ -68,12 +70,13 @@ sst-000001.new.sst
 sst-000001.sinked.sst
 ```
 
-如果文件名和 WAL 推导状态不一致，以 WAL 为准；rename 失败只记录 warning，不影响正确性。
+如果文件名和 SinkMeta 推导状态不一致，以 SinkMeta 为准；rename 失败只记录 warning，不影响正确性。
 
 ## 3. 当前 mock 与未完成边界
 
 ### 3.1 已有 mock
 
+- 恢复元信息已整理为 WAL 只记录数据变更，SSTMeta/SinkMeta 独立记录 flush/sink 进度；详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
 - `MockSinkManager` 不写 Paimon，只生成 fake prepared payload 和递增 snapshotId。
 - `PreparedSinkCommit.payload` 当前可承载 mock payload；未来应承载 Paimon `CommitMessage` 序列化结果。
 - `SinkFileRef` 已作为对接 Paimon prepare 阶段文件引用的结构预留。
@@ -83,10 +86,10 @@ sst-000001.sinked.sst
 - 多 SST 按 key streaming merge 已在 `pms-sink-paimon` 初步落地。
 - RowCodec 已在 `pms-codec` 落地，并已由 `pms-sink-paimon` 在 sink 路径使用。
 - `InternalRow -> byte[]`、`byte[] -> InternalRow`、`InternalRow -> Key` 已具备基础实现。
-- 真实 Paimon sink 已初步接入，支持 prepare/commit、WAL payload round-trip、重复 commit 幂等、nullable 非主键场景下的 tombstone delete、多 SST streaming merge 后写入 Paimon、分区表 + 复合主键 delete、prepared file ref 校验失败拒绝 commit，以及非法表能力拒绝；非主键 `NOT NULL` 场景下，Paimon 高层 `TableWrite` 当前会先做整行 nullability 校验，因此 key-only DELETE row 会被拒绝。
-- `SinkCoordinator` 已抽出，负责 prepare/WAL/commit/WAL 编排；BucketDirector 仍负责选择待 sink SST、推进本地 SST 状态和刷新内存视图。WAL replay 已能识别没有匹配 `SINK_SUCCESS` 的 prepared commit，并在重启初始化时重试 commit。
+- 真实 Paimon sink 已初步接入，支持 prepare/commit、SinkMeta payload round-trip、重复 commit 幂等、nullable 非主键场景下的 tombstone delete、多 SST streaming merge 后写入 Paimon、分区表 + 复合主键 delete、prepared file ref 校验失败拒绝 commit，以及非法表能力拒绝；非主键 `NOT NULL` 场景下，Paimon 高层 `TableWrite` 当前会先做整行 nullability 校验，因此 key-only DELETE row 会被拒绝。
+- `SinkCoordinator` 已抽出，负责 prepare/SinkMeta/commit/SinkMeta 编排；BucketDirector 仍负责选择待 sink SST、推进本地 SST 状态和刷新内存视图。`SinkMetaStore` 已能识别没有匹配 success 的 prepared commit，并在重启初始化时重试 commit。
 - 本地 SST compact、sinkedSST evict、双持 Mem 缓存退化仍未实现。
-- WAL truncate 仍未切换到 `persistedSequenceId` 主导。
+- WAL truncate 已切换到 sequence 维度接口；定期调度与最新 `persistedSequenceId` 的完整串联仍需在 server/runtime 层补齐。
 
 ## 4. 后续 RowCodec 对接要求
 

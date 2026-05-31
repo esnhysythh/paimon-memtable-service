@@ -196,7 +196,11 @@ class PmsServerEndToEndTest {
 
         PmsServerRuntime runtime = new PmsServerRuntime(new ConfigManager().from(baseProperties()));
         Exception error = assertThrows(Exception.class, runtime::start);
-        assertTrue(causalMessages(error).contains("SST file is corrupt after flush boundary was persisted"));
+        String messages = causalMessages(error);
+        assertTrue(
+            messages.contains("SST metadata is corrupt after flush boundary was persisted")
+                || messages.contains("SST file is corrupt after flush boundary was persisted")
+        );
         assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
     }
 

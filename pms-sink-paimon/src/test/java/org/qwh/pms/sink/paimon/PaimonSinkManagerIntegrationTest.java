@@ -30,7 +30,7 @@ import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
-import org.qwh.pms.core.sink.SinkWalCodec;
+import org.qwh.pms.core.sink.SinkMetaPayloadCodec;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.core.storage.LocalStorageManager;
 import org.qwh.pms.core.storage.SSTEntryIterator;
@@ -71,7 +71,7 @@ class PaimonSinkManagerIntegrationTest {
             assertFalse(preparedFirst.fileRefs().isEmpty());
 
             PreparedSinkCommit replayedFirst =
-                SinkWalCodec.decodePrepare(SinkWalCodec.encodePrepare(preparedFirst));
+                SinkMetaPayloadCodec.decodePrepare(SinkMetaPayloadCodec.encodePrepare(preparedFirst));
             SinkCommitResult firstResult = sinkManager.commit(replayedFirst);
             assertEquals(first.maxSequenceId(), firstResult.persistedSequenceId());
             assertEquals(Map.of(1, "old-a", 2, "old-b"), readRows(testTable.table()));
@@ -86,7 +86,7 @@ class PaimonSinkManagerIntegrationTest {
             ));
             PreparedSinkCommit preparedSecond = prepare(sinkManager, "batch-002", second);
             SinkCommitResult secondResult = sinkManager.commit(
-                SinkWalCodec.decodePrepare(SinkWalCodec.encodePrepare(preparedSecond))
+                SinkMetaPayloadCodec.decodePrepare(SinkMetaPayloadCodec.encodePrepare(preparedSecond))
             );
 
             assertTrue(secondResult.snapshotId() > firstResult.snapshotId());
@@ -507,7 +507,7 @@ class PaimonSinkManagerIntegrationTest {
         }
 
         @Override
-        public void evictOldest() {
+        public Optional<SSTMeta> evictOldestSinkedSST() {
             throw new UnsupportedOperationException();
         }
     }

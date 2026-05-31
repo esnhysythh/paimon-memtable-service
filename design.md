@@ -14,7 +14,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 1. 数据通过 RPC 写入 `curMemTable`（基于 SkipList）。
 2. Bucket 内部分配单调递增的 `sequenceId`，WAL 与 MemTable 同时记录该值。V1 使用轻量级 sequence：只确定写入边界，不提供 MVCC 快照读。
 3. `curMemTable` 满后或达到时间阈值，冻结为 `ImmutableMemTable`，冻结结果携带 `minSequenceId/maxSequenceId`，异步刷盘生成 SST。
-4. 触发 Sink 流程时，选择待 sink 的 `newSST` 形成 `SinkBatch`，后续通过有序 iterator 与 RowCodec 对接 Paimon 2PC。`SINK_PREPARE/SINK_SUCCESS` 写入 WAL，成功记录中的 `sstIds/persistedSequenceId` 是判断 SST 是否已 sink 和未来 WAL 截断的可靠依据；Paimon snapshotId 只表示外部提交结果。
+4. 触发 Sink 流程时，选择待 sink 的 `newSST` 形成 `SinkBatch`，后续通过有序 iterator 与 RowCodec 对接 Paimon 2PC。Sink prepare/success 写入独立 `SinkMeta`，其中的 `sstIds/persistedSequenceId` 是判断 SST 是否已 sink 和未来 WAL 截断的可靠依据；Paimon snapshotId 只表示外部提交结果。
 
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
@@ -32,7 +32,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 | 机制 | 说明 | 详细文档 |
 |------|------|---------|
-| WAL 与崩溃恢复 | V1 采用单盘 WAL，每条记录带 CRC32 校验和 Magic Number。WAL 包含数据写入记录及 Sink 状态机记录，支持崩溃后恢复。 | [pms-core.md](docs/pms-core.md) § 5 |
+| WAL 与崩溃恢复 | V1 采用单盘 WAL，每条记录带 CRC32 校验和 Magic Number。WAL 只记录数据变更；Flush/Sink 使用独立可读 metadata 记录恢复边界与 Paimon prepare/commit 进度。 | [pms-core.md](docs/pms-core.md) § 5 / [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) |
 | 轻量级 Sequence | 每条写入分配单调递增 sequenceId，作为 freeze/flush/sink/WAL 截断的内部边界坐标。V1 不做 MVCC 多版本。 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) |
 | 本地 SST 格式 | 参考 LevelDB/RocksDB Block Based Table，保留 Data Block/Index/Footer 结构，不照搬 MVCC InternalKey；SST 查询使用 `Optional<Value>` 表达 miss/put/delete 三态。 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) |
 | SST 当前状态 | 汇总当前 SST/MockSink/WAL 恢复边界状态，并列出后续 RowCodec 与 Paimon sink 对接要求。 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) |
@@ -51,8 +51,8 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 - `config`: 配置契约层，定义 `PMSConfig` Record，启动时一次性注入。
 - `memtable-engine`: 管理 SkipList、内存状态机、引用计数。
 - `local-storage`: 本地行存 SST 的写入/读取/归并/BloomFilter，SST 文件带 Footer CRC 校验。
-- `wal-engine`: V1 单盘 WAL 的写入、索引与重放。
-- `sink`: 定义 `SinkManager` SPI、`SinkBatch`、`PreparedSinkCommit`、`SinkCommitResult` 和 WAL 编码；当前提供 `MockSinkManager`，后续真实 Paimon sink 由上层注入实现。
+- `wal-engine`: V1 单盘 DATA WAL 的写入、索引与重放。
+- `sink`: 定义 `SinkManager` SPI、`SinkBatch`、`PreparedSinkCommit`、`SinkCommitResult` 和 `SinkMetaStore`；当前提供 `MockSinkManager`，真实 Paimon sink 由上层注入实现。
 - `bucket-director`: 总协调器，管理状态机流转、查询穿透、后台任务协调。详见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 - `statistic`: 可观测性基础设施。TODO: 详细设计待核心组件稳定后再补充。
 - 详见 [pms-core.md](docs/pms-core.md)。
@@ -70,7 +70,7 @@ Paimon 行格式与 PMS KV bytes 的适配层，依赖 Paimon 类型系统，但
 - 实现 `pms-core` 定义的 `SinkManager` SPI，由 `pms-server` 注入 `PMSBucketDirectorImpl`。
 - 读取 `pms-core` 暴露的 SST ordered iterator。
 - 使用 `pms-codec` 将 value bytes 解码为 Paimon `InternalRow`。
-- 调用 Paimon 2PC API 完成 prepare / commit，并把 `persistedSequenceId`、`sstIds` 等结果写回 WAL 成功记录。
+- 调用 Paimon 2PC API 完成 prepare / commit，并把 `persistedSequenceId`、`sstIds` 等结果交由 `pms-core` 写入 `SinkMeta`。
 - 该模块依赖 `pms-core`、`pms-codec` 和 Paimon。
 
 ### 4.4 pms-server
@@ -112,6 +112,7 @@ flink-connector -> pms-client
 | [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) | 状态机协调器 |
 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) | 本地 SST 文件格式、LevelDB 对照、查询三态语义 |
 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) | SST 当前实现状态、mock 边界与后续 codec 交接说明 |
+| [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) | WAL 只记录数据、SSTMeta/SinkMeta 独立记录恢复边界的设计 |
 | [pms-codec.md](docs/pms-codec.md) | Paimon 行编码、主键编码、RowKind 与 tombstone 边界 |
 | [pms-sink-paimon.md](docs/pms-sink-paimon.md) | 真实 Paimon sink、prepare/commit、delete 语义与恢复协作 |
 | [pms-row-codec-format.md](docs/pms-row-codec-format.md) | PMS row value byte layout、字段查找、列值编码规则 |

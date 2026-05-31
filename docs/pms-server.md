@@ -25,6 +25,13 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 - 返回行按 PMS primary key encoded bytes 升序排列。
 - 本地多层数据按 sequence 选择最新版本；最新版本为 tombstone 的 key 不返回，避免旧层数据复活。
 
+**点查 Paimon 穿透语义**：
+
+- `pms-server` 先将主键编码为 PMS key，并调用 `PMSBucketDirector.lookup()` 获取本地三态结果。
+- 本地 PUT 命中时直接解码返回；本地 tombstone 命中时直接返回 not found，禁止继续穿透 Paimon。
+- 只有本地 memTable 与本地 SST 全部 miss 时，才使用 Paimon `ReadBuilder` 构造所有主键字段的等值 predicate，并以 `limit=1` 查询 Paimon。
+- 该实现决策是为了保持 `pms-core` 不依赖 Paimon，同时让后续 sinkedSST 淘汰后仍能从 Paimon 补读已持久化数据。
+
 **写入响应状态**：
 
 | status | 含义 | Client 行为 |
@@ -43,14 +50,15 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 启动时执行逻辑：
 
 ```
-1. 加载 Paimon 表，获取当前最新 Snapshot ID
-2. 初始化 WALManager，扫描 WAL 文件
-3. 判断对齐情况（详见 [pms-core.md](pms-core.md) § 5.4）：
-   - 若 Paimon 有更新（不应发生，因为独占），报警
-   - 若本地有 SINK_PREPARE 但无 SINK_SUCCESS：
-     使用 WAL 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。当前 MockSinkManager 只用于打通 PMS 内部状态流转，不执行真实 Paimon 恢复。
-   - 若只有 DATA_RECORD：结合本地 `lastFlushedSequenceId` 恢复边界，只重放尚未被 SST 承载的 DATA 记录
-4. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程
+1. 加载 Paimon 表与本地 SST/flush boundary
+2. 初始化 WALManager，扫描 DATA WAL 文件并恢复 sequence 水位
+3. 重放 DATA_RECORD：结合本地 `lastFlushedSequenceId` 恢复边界，只重放尚未被 SST 承载的 DATA 记录
+4. 初始化 SinkMetaStore，扫描 prepare/success metadata：
+   - 若本地有 prepare 但无 success：
+     使用 SinkMeta 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。
+   - 若存在 success：
+     通过 success.sstIds 推导 sinkedSST，并 best-effort 修正文件名标签。
+5. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程
 ```
 
 **启动顺序**：
@@ -59,10 +67,13 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 ConfigManager.load()
     │
     ▼
-WALManager.initialize()
+StorageManager.initialize()
     │
     ▼
-RecoveryManager.recover()
+SinkMetaStore.initialize()
+    │
+    ▼
+WALManager.initialize()
     │
     ▼
 PMSBucketDirector.initialize()
@@ -128,8 +139,9 @@ class ConfigManager {
 | `pms.wal.dir` | - | `walDir` |
 | `pms.wal.file_size_mb` | 256 | `walFileSizeMb` |
 | `pms.storage.dir` | - | `storageDir` |
-| `pms.storage.sinked_max_size_mb` | 10240 | `storageSinkedMaxSizeMb` |
-| `pms.storage.sinked_max_count` | 100 | `storageSinkedMaxCount` |
+| `pms.storage.sinked_max_size_mb` | 10240 | `StorageConfig.sinkedMaxSizeMb` |
+| `pms.storage.sinked_max_count` | 100 | `StorageConfig.sinkedMaxCount` |
+| `pms.storage.local_sst_max_rows` | 0（禁用） | `StorageConfig.localSstMaxRows` |
 | `pms.storage.compact_threshold_mb` | 32 | `storageCompactThresholdMb` |
 | `pms.storage.compact_min_files` | 4 | `storageCompactMinFiles` |
 | `pms.sink.interval_ms` | 30000 | `sinkIntervalMs` |
@@ -152,7 +164,7 @@ class ConfigManager {
 | Sink Paimon | 30s | 检查 newSST 数量，触发 `sinkToPaimon()` |
 | Paimon Compaction | 60s | 检查 Paimon L0 文件数，触发 `compact()` |
 | 本地 SST 合并 | 300s | 检查小文件数量，触发 `compactLocalSSTs()` |
-| sinkedSST 淘汰 | 60s | 检查 sinkedSST 数量/大小，触发 `evictOldestSinkedSST()` |
+| sinkedSST 淘汰 | Sink 后 | 根据本地 SST 总大小、总文件数或总物理 entry 数检查阈值，循环触发 `evictOldestSinkedSST()`；只删除已 sinked 的最老 SST |
 | WAL 截断 | 300s | 检查可安全截断的 WAL 文件，执行 `truncate()` |
 | 水位线检查 | 0.5s | 评估当前水位线，调整后台任务优先级 |
 
