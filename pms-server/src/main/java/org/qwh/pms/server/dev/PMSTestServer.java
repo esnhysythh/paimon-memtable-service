@@ -13,6 +13,7 @@ import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.qwh.pms.server.ConfigManager;
+import org.qwh.pms.server.PmsLocalLookupResult;
 import org.qwh.pms.server.PmsServerConfig;
 import org.qwh.pms.server.PmsServerRuntime;
 
@@ -148,8 +149,12 @@ public final class PMSTestServer implements AutoCloseable {
         return runtime().get(primaryKey);
     }
 
-    public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefix) {
-        return runtime().prefixScan(primaryKeyPrefix);
+    public PmsLocalLookupResult getLocal(Map<String, Object> primaryKey) {
+        return runtime().getLocal(primaryKey);
+    }
+
+    public List<Map<String, Object>> prefixLocal(Map<String, Object> primaryKeyPrefix) {
+        return runtime().prefixLocal(primaryKeyPrefix);
     }
 
     public void flush() {

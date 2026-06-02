@@ -14,8 +14,19 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 | 服务 | 请求 | 响应 | 调用核心接口 |
 |------|------|------|-------------|
 | `write` | `WriteRequest(key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
-| `get` | `GetRequest(key)` | `GetResponse(status, value?)` | `PMSBucketDirector.get()` |
-| `prefix` | `PrefixRequest(primaryKeyPrefix)` | `PrefixResponse(status, rows)` | `PMSBucketDirector.prefixScan()` |
+| `get` | `GetRequest(key)` | `GetResponse(status, found, row?)` | `PMSBucketDirector.lookup()` + Paimon `ReadBuilder` fallback |
+| `getLocal` | `GetRequest(key)` | `GetLocalResponse(status, result, row?)` | `PMSBucketDirector.lookup()` |
+| `prefix` | `PrefixRequest(primaryKeyPrefix)` | `NOT_SUPPORTED` | V1 暂不支持完整表 prefix 查询 |
+| `prefixLocal` | `PrefixRequest(primaryKeyPrefix)` | `PrefixResponse(status, rows)` | `PMSBucketDirector.prefixScan()` |
+
+**点查接口语义**：
+
+- `get` 是默认完整表点查。`pms-server` 先查询 PMS 本地层，本地完全 miss 后再穿透查询 Paimon。
+- `getLocal` 只查询 PMS 本地层，不穿透 Paimon。响应中的 `result` 必须区分：
+  - `HIT`：本地命中 PUT，返回 `row`。
+  - `DELETED`：本地命中 tombstone，不返回 `row`，调用方不得继续把它当成普通 miss 后查 Paimon。
+  - `MISS`：PMS 本地完全未命中，调用方可自行决定是否查 Paimon。
+- 本地 tombstone 必须阻断 Paimon fallback，避免已删除旧值从 Paimon 复活。
 
 **主键前缀查询语义**：
 
@@ -24,6 +35,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 - 至少提供第一个主键字段。
 - 返回行按 PMS primary key encoded bytes 升序排列。
 - 本地多层数据按 sequence 选择最新版本；最新版本为 tombstone 的 key 不返回，避免旧层数据复活。
+- V1 仅支持 `prefixLocal`。`prefix` 作为完整表 prefix 查询接口名预留，当前直接返回 `NOT_SUPPORTED`；未来实现时必须合并 PMS 本地层与 Paimon 结果，并用 PMS 本地 tombstone 覆盖 Paimon 旧值。
 
 **点查 Paimon 穿透语义**：
 

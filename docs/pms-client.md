@@ -32,11 +32,17 @@ class PMSClient implements AutoCloseable {
     // 查询
     Optional<RowData> get(byte[] primaryKey);
     Optional<byte[]> getRaw(byte[] primaryKey);
+    LocalLookupResult getLocal(byte[] primaryKey);
 
     // 关闭
     void close();
 }
 ```
+
+`get` 表示完整表点查，允许 PMS Server 在本地 miss 后穿透查询 Paimon。`getLocal`
+只查询 PMS 本地层，返回值必须区分 `HIT`、`DELETED` 和 `MISS`，避免调用方在本地 tombstone
+场景下继续查 Paimon 导致旧值复活。V1 的 prefix 查询只提供 local 语义；完整表 prefix 查询接口
+预留但暂不支持。
 
 **WriteStatus**：
 

@@ -70,11 +70,28 @@ public final class PmsHttpServer implements AutoCloseable {
             response.put("row", row.orElse(null));
             return ok(response);
         }));
-        server.createContext("/prefix", exchange -> handle(exchange, "POST", () -> {
+        server.createContext("/getLocal", exchange -> handle(exchange, "POST", () -> {
+            PmsLocalLookupResult result = runtime.getLocal(requestObject(exchange));
             Map<String, Object> response = new LinkedHashMap<>();
-            List<Map<String, Object>> rows = runtime.prefixScan(requestObject(exchange));
+            response.put("status", "OK");
+            response.put("result", result.type().name());
+            response.put("found", result.found());
+            response.put("source", "PMS_LOCAL");
+            response.put("row", result.row());
+            return ok(response);
+        }));
+        server.createContext("/prefix", exchange -> handle(exchange, "POST", () -> {
+            requestObject(exchange);
+            throw new PmsNotSupportedException(
+                "Full prefix lookup is not supported yet; use /prefixLocal for PMS-local prefix lookup"
+            );
+        }));
+        server.createContext("/prefixLocal", exchange -> handle(exchange, "POST", () -> {
+            Map<String, Object> response = new LinkedHashMap<>();
+            List<Map<String, Object>> rows = runtime.prefixLocal(requestObject(exchange));
             response.put("status", "OK");
             response.put("count", rows.size());
+            response.put("source", "PMS_LOCAL");
             response.put("rows", rows);
             return ok(response);
         }));
@@ -111,6 +128,9 @@ public final class PmsHttpServer implements AutoCloseable {
         } catch (PmsServiceUnavailableException e) {
             LOG.warn("PMS HTTP service unavailable: method={}, path={}, message={}", exchange.getRequestMethod(), exchange.getRequestURI(), e.getMessage());
             send(exchange, new Response(503, Map.of("status", "UNAVAILABLE", "message", e.getMessage())));
+        } catch (PmsNotSupportedException e) {
+            LOG.warn("Unsupported PMS HTTP request: method={}, path={}, message={}", exchange.getRequestMethod(), exchange.getRequestURI(), e.getMessage());
+            send(exchange, new Response(501, Map.of("status", "NOT_SUPPORTED", "message", e.getMessage())));
         } catch (IllegalArgumentException | UnsupportedOperationException e) {
             LOG.warn("Bad PMS HTTP request: method={}, path={}, message={}", exchange.getRequestMethod(), exchange.getRequestURI(), e.getMessage());
             send(exchange, new Response(400, Map.of("status", "BAD_REQUEST", "message", e.getMessage())));
