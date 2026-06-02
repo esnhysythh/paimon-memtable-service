@@ -228,7 +228,7 @@ Sink 成功元信息需要包含类似：
 SinkSuccessMeta(snapshotId, batchId, persistedSequenceId, sstIds)
 ```
 
-当前实现中，Sink prepare/success 不再写入 WAL，而是写入独立 `SinkMeta` 文件。prepare meta 记录本次 sink 覆盖的 `sstIds`、`minSequenceId/maxSequenceId`、prepared commit payload 与外部 file refs；success meta 确认 `persistedSequenceId` 与 `sstIds`。SST 是否 sinked 由 success meta 推导，不再依赖 WAL 控制记录。详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
+当前实现中，Sink prepare/success 不再写入 WAL，而是写入独立 `SinkMeta` 文件。prepare meta 记录本次 sink 覆盖的 `sstIds`、`minSequenceId/maxSequenceId`、prepared commit payload 与外部 file refs；success meta 确认 `persistedSequenceId` 与 `sstIds`。SST 是否 sinked 由 success meta 中的 `sstIds` 与 `persistedSequenceId` 推导，不再依赖 WAL 控制记录。详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
 
 安全截断条件应变为：
 

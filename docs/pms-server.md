@@ -57,7 +57,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
    - 若本地有 prepare 但无 success：
      使用 SinkMeta 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。
    - 若存在 success：
-     通过 success.sstIds 推导 sinkedSST，并 best-effort 修正文件名标签。
+     通过 success.sstIds 与 persistedSequenceId 推导 sinkedSST，并 best-effort 修正文件名标签。
 5. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程
 ```
 
@@ -169,6 +169,8 @@ class ConfigManager {
 | Paimon Compaction | 60s | 检查 Paimon L0 文件数，触发 `compact()` |
 | 本地 SST 合并 | 300s | 检查小文件数量，触发 `compactLocalSSTs()` |
 | sinkedSST 淘汰 | Sink 后 | 根据本地 SST 总大小、总文件数或总物理 entry 数检查阈值，循环触发 `evictOldestSinkedSST()`；只删除已 sinked 的最老 SST |
+
+本地 SST 合并当前是 standalone compact，不与 Paimon sink merge 融合。sink、local compact 和 sinkedSST evict 在 core 内串行化，避免 compact 修改正在 sink 的 new run；sink+compact 融合优化暂缓，需等独立恢复状态机设计清楚后再实现。
 | WAL 截断 | 300s | 检查可安全截断的 WAL 文件，执行 `truncate()` |
 | 水位线检查 | 0.5s | 评估当前水位线，调整后台任务优先级 |
 

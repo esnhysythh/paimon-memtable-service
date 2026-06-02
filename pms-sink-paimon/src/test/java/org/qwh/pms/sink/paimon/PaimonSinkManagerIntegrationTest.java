@@ -406,11 +406,13 @@ class PaimonSinkManagerIntegrationTest {
         return rows;
     }
 
-    private static SSTMeta fakeMeta(long fileId, long sequenceId) {
-        Key key = new Key(new byte[] {(byte) fileId});
+    private static SSTMeta fakeMeta(long runId, long sequenceId) {
+        Key key = new Key(new byte[] {(byte) runId});
         return new SSTMeta(
-            fileId,
-            java.nio.file.Path.of("fake-" + fileId + ".sst"),
+            runId,
+            runId,
+            runId,
+            java.nio.file.Path.of("fake-" + runId + ".sst"),
             1,
             1,
             key,
@@ -488,7 +490,7 @@ class PaimonSinkManagerIntegrationTest {
             if (opened.size() == 1) {
                 return firstIterator;
             }
-            throw new IllegalStateException("open failed for " + meta.fileId());
+            throw new IllegalStateException("open failed for " + meta.runId());
         }
 
         @Override

@@ -204,8 +204,8 @@ public final class PmsTableService implements AutoCloseable {
             }
             evictedCount++;
             LOG.info(
-                "Evicted sinked SST by retention: fileId={}, fileSize={}, entryCount={}",
-                evicted.get().fileId(),
+                "Evicted sinked SST by retention: runId={}, fileSize={}, entryCount={}",
+                evicted.get().runId(),
                 evicted.get().fileSize(),
                 evicted.get().entryCount()
             );

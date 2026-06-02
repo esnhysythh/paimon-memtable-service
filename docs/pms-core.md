@@ -205,9 +205,9 @@ interface LocalStorageManager {
 }
 ```
 
-**SSTMeta** 至少包含文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、createdAtMillis、状态和引用计数。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
+**SSTMeta** 至少包含 `runId`、`minFlushId/maxFlushId`、文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、createdAtMillis、状态和引用计数。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
 
-SST 文件名使用 `sst-%06d.new.sst` / `sst-%06d.sinked.sst` 作为可观察标签。文件名不是可靠状态来源；启动恢复时以 SinkMeta success 信息推导真实状态，并 best-effort 修正文件名标签。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
+SST 文件名使用 `sst-%06d-%06d.new.sst` / `sst-%06d-%06d.sinked.sst` 表达 `minFlushId/maxFlushId` 可观察标签。文件名不是可靠状态来源；启动恢复时以 SinkMeta success 信息和 `persistedSequenceId` 推导真实状态，并 best-effort 修正文件名标签。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
 
 **BloomFilter**：
 - 每个 SST 文件包含基于主键的 BloomFilter。
@@ -426,9 +426,9 @@ class WriteAdmissionController {
 
 ### 5.1 核心原则
 
-- **短写入临界区**：WAL 写入、sequence 分配和 MemTable 可见顺序必须保持一致；flush/sink/compaction 等慢路径不得持有写入临界区。
+- **写入顺序临界区**：WAL 写入、sequence 分配和 MemTable 可见顺序必须保持一致。当前 V1 为保证本地 SST 列表切换简单，local compact 会在本地 SST 维护路径中串行化 sink/compact/evict，并短期阻塞写入状态更新；后续可通过 SST 引用计数和 manifest 切换缩短该临界区。
 - **Volatile 引用切换**：状态变更通过 volatile 引用的原子替换实现，而非就地修改。
-- **文件延迟删除**：被淘汰的 SST 文件不立即删除，确认无查询引用后才删除。
+- **文件删除边界**：compact 输入 SST 数据文件第一阶段不立即删除，只删除旧 meta 并在恢复时作为 covered orphan 忽略；sinkedSST evict 当前直接删除最老 sinked 文件，后续应补充 SST 引用计数或延迟删除队列。
 - **初期简化**：查询时直接读 volatile 引用遍历，不做快照拷贝。引用计数仅在 Evict 删除文件时检查。
 
 ### 5.2 关键场景的并发控制
@@ -451,8 +451,8 @@ class WriteAdmissionController {
 - 归并完成后，BucketDirector 原子替换列表（newSST → sinkedSST）。
 
 **Evict 删除磁盘文件**：
-- 淘汰 sinkedSST 时，确认文件不被任何查询正在读取。
-- V1 简化方案：Evict 时检查 `refCount()`，如果 > 0 则跳过本次删除（下次 Evict 检查时再试）。
+- 淘汰 sinkedSST 时，目标语义是确认文件不被任何查询正在读取。
+- 当前 V1 尚未实现 SST `refCount()` 检查，evict 会直接删除最老 sinked 文件；这一点应在后续与 SST 延迟删除机制一起补齐。
 
 ### 5.3 内存可见性总结
 

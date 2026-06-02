@@ -2,6 +2,7 @@ package org.qwh.pms.core.bucket;
 
 import org.qwh.pms.core.config.MemTableConfig;
 import org.qwh.pms.core.config.PMSConfig;
+import org.qwh.pms.core.config.StorageConfig;
 import org.qwh.pms.core.memtable.CurMemTable;
 import org.qwh.pms.core.memtable.ImmutableMemTable;
 import org.qwh.pms.core.memtable.SkipListCurMemTable;
@@ -43,6 +44,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private static final Logger LOG = LoggerFactory.getLogger(PMSBucketDirectorImpl.class);
 
     private final MemTableConfig memTableConfig;
+    private final StorageConfig storageConfig;
     private final WALManagerImpl walManager;
     private final FileLocalStorageManager storageManager;
     private final SinkMetaStore sinkMetaStore;
@@ -57,6 +59,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
     private final Object writeMutex = new Object();
+    private final Object sstMaintenanceMutex = new Object();
     private volatile boolean closed = false;
 
     public PMSBucketDirectorImpl(PMSConfig config) {
@@ -71,6 +74,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         Objects.requireNonNull(config, "config must not be null");
         Objects.requireNonNull(sinkManagerFactory, "sinkManagerFactory must not be null");
         this.memTableConfig = config.memtable();
+        this.storageConfig = config.storage();
         this.walManager = new WALManagerImpl(config);
         this.storageManager = new FileLocalStorageManager(config.storage());
         this.sinkMetaStore = new SinkMetaStore(Path.of(config.storage().dir()).resolve("sink"));
@@ -89,7 +93,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         RecoveryState recoveryState = recoverFromWAL();
         SinkRecoveryState initialSink = sinkMetaStore.load();
         SinkRecoveryState recoveredSink = recoverPreparedSinks(initialSink);
-        storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds());
+        storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds(), recoveredSink.lastPersistedSequenceId());
         walManager.truncate(recoveredSink.lastPersistedSequenceId());
         refreshSSTLists();
         lastSinkedSnapshotId = recoveredSink.lastSinkedSnapshotId();
@@ -310,64 +314,95 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public void sinkToPaimon() {
-        List<SSTMeta> toSink;
-        lifecycleLock.readLock().lock();
-        try {
-            ensureNotClosed();
-            synchronized (writeMutex) {
-                if (newSSTs.isEmpty()) {
-                    return;
+        synchronized (sstMaintenanceMutex) {
+            List<SSTMeta> toSink;
+            lifecycleLock.readLock().lock();
+            try {
+                ensureNotClosed();
+                synchronized (writeMutex) {
+                    if (newSSTs.isEmpty()) {
+                        return;
+                    }
+                    toSink = List.copyOf(newSSTs);
                 }
-                toSink = List.copyOf(newSSTs);
+            } finally {
+                lifecycleLock.readLock().unlock();
             }
-        } finally {
-            lifecycleLock.readLock().unlock();
-        }
 
-        SinkBatch batch = new SinkBatch(nextBatchId(toSink), toSink, minSequenceId(toSink), maxSequenceId(toSink));
-        SinkCommitResult result = sinkCoordinator.sink(batch);
-        storageManager.markSinked(toSink);
-        walManager.truncate(result.persistedSequenceId());
+            SinkBatch batch = new SinkBatch(nextBatchId(toSink), toSink, minSequenceId(toSink), maxSequenceId(toSink));
+            SinkCommitResult result = sinkCoordinator.sink(batch);
+            storageManager.markSinked(toSink);
+            walManager.truncate(result.persistedSequenceId());
 
-        lifecycleLock.readLock().lock();
-        try {
-            ensureNotClosed();
-            synchronized (writeMutex) {
-                Set<Long> sinkedIds = new HashSet<>(result.sstIds());
-                newSSTs = newSSTs.stream()
-                    .filter(meta -> !sinkedIds.contains(meta.fileId()))
-                    .toList();
-                sinkedSSTs = storageManager.metas(SSTState.SINKED);
-                lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
-                LOG.debug("Sink: newSST count={}, sinkedSST count={}", newSSTs.size(), sinkedSSTs.size());
+            lifecycleLock.readLock().lock();
+            try {
+                ensureNotClosed();
+                synchronized (writeMutex) {
+                    Set<Long> sinkedIds = new HashSet<>(result.sstIds());
+                    newSSTs = newSSTs.stream()
+                        .filter(meta -> !sinkedIds.contains(meta.runId()))
+                        .toList();
+                    sinkedSSTs = storageManager.metas(SSTState.SINKED);
+                    lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
+                    LOG.debug("Sink: newSST count={}, sinkedSST count={}", newSSTs.size(), sinkedSSTs.size());
+                }
+            } finally {
+                lifecycleLock.readLock().unlock();
             }
-        } finally {
-            lifecycleLock.readLock().unlock();
         }
     }
 
     @Override
     public Optional<SSTMeta> evictOldestSinkedSST() {
-        lifecycleLock.readLock().lock();
-        try {
-            ensureNotClosed();
-            synchronized (writeMutex) {
-                Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
-                if (evicted.isPresent()) {
-                    long evictedFileId = evicted.get().fileId();
-                    sinkedSSTs = sinkedSSTs.stream()
-                        .filter(meta -> meta.fileId() != evictedFileId)
-                        .toList();
-                    LOG.debug(
-                        "Evicted sinked SST: fileId={}, remainingSinkedSSTCount={}",
-                        evictedFileId,
-                        sinkedSSTs.size()
-                    );
+        synchronized (sstMaintenanceMutex) {
+            lifecycleLock.readLock().lock();
+            try {
+                ensureNotClosed();
+                synchronized (writeMutex) {
+                    if (sinkedSSTs.size() > storageConfig.sinkedMaxCount()) {
+                        Optional<SSTMeta> compacted = compactOneGroupLocked(SSTState.SINKED);
+                        if (compacted.isPresent() && sinkedSSTs.size() <= storageConfig.sinkedMaxCount()) {
+                            LOG.debug(
+                                "Skip sinked SST eviction after compaction: compactedRun={}, remainingSinkedSSTCount={}",
+                                compacted.get().runId(),
+                                sinkedSSTs.size()
+                            );
+                            return Optional.empty();
+                        }
+                    }
+                    Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
+                    if (evicted.isPresent()) {
+                        long evictedRunId = evicted.get().runId();
+                        sinkedSSTs = sinkedSSTs.stream()
+                            .filter(meta -> meta.runId() != evictedRunId)
+                            .toList();
+                        LOG.debug(
+                            "Evicted sinked SST: runId={}, remainingSinkedSSTCount={}",
+                            evictedRunId,
+                            sinkedSSTs.size()
+                        );
+                    }
+                    return evicted;
                 }
-                return evicted;
+            } finally {
+                lifecycleLock.readLock().unlock();
             }
-        } finally {
-            lifecycleLock.readLock().unlock();
+        }
+    }
+
+    @Override
+    public void compactLocalSSTs() {
+        synchronized (sstMaintenanceMutex) {
+            lifecycleLock.readLock().lock();
+            try {
+                ensureNotClosed();
+                synchronized (writeMutex) {
+                    compactOneGroupLocked(SSTState.NEW);
+                    compactOneGroupLocked(SSTState.SINKED);
+                }
+            } finally {
+                lifecycleLock.readLock().unlock();
+            }
         }
     }
 
@@ -479,6 +514,55 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private void refreshSSTLists() {
         newSSTs = storageManager.metas(SSTState.NEW);
         sinkedSSTs = storageManager.metas(SSTState.SINKED);
+    }
+
+    private Optional<SSTMeta> compactOneGroupLocked(SSTState state) {
+        List<SSTMeta> source = state == SSTState.NEW ? newSSTs : sinkedSSTs;
+        Optional<List<SSTMeta>> group = selectCompactionGroup(source);
+        if (group.isEmpty()) {
+            return Optional.empty();
+        }
+        SSTMeta compacted = storageManager.compactSSTs(group.get());
+        refreshSSTLists();
+        LOG.debug(
+            "Compacted local SSTs: state={}, inputCount={}, outputRunId={}, flushRange=[{},{}]",
+            state,
+            group.get().size(),
+            compacted.runId(),
+            compacted.minFlushId(),
+            compacted.maxFlushId()
+        );
+        return Optional.of(compacted);
+    }
+
+    private Optional<List<SSTMeta>> selectCompactionGroup(List<SSTMeta> ssts) {
+        if (ssts.size() < storageConfig.compactMinFiles()) {
+            return Optional.empty();
+        }
+        long maxGroupBytes = storageConfig.compactThresholdMb() * 1024L * 1024L;
+        List<SSTMeta> group = new ArrayList<>();
+        long groupBytes = 0;
+        long previousMaxFlushId = -1;
+        for (SSTMeta sst : ssts) {
+            boolean continuous = group.isEmpty() || previousMaxFlushId + 1 == sst.minFlushId();
+            boolean fits = sst.fileSize() <= maxGroupBytes && groupBytes + sst.fileSize() <= maxGroupBytes;
+            if (!continuous || !fits) {
+                if (group.size() >= storageConfig.compactMinFiles()) {
+                    return Optional.of(List.copyOf(group));
+                }
+                group.clear();
+                groupBytes = 0;
+                previousMaxFlushId = -1;
+            }
+            if (sst.fileSize() <= maxGroupBytes) {
+                group.add(sst);
+                groupBytes += sst.fileSize();
+                previousMaxFlushId = sst.maxFlushId();
+            }
+        }
+        return group.size() >= storageConfig.compactMinFiles()
+            ? Optional.of(List.copyOf(group))
+            : Optional.empty();
     }
 
     private void maybeFreezeLocked() {

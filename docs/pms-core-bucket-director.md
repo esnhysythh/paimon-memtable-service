@@ -82,7 +82,7 @@ PMS 中的数据单元经历以下状态流转：
 - **flush**：SST 文件原子落盘成功后，先推进本地 `lastFlushedSequenceId`，再将对应 ImmutableMemTable 从 `newImmutableList` 移至 `newSSTWithMemList`，同时注册 newSST 的 BloomFilter。若边界推进失败，ImmutableMemTable 仍保留在内存列表中，不进入已 flush 状态。
 - **sink**：Paimon prepare 成功后，`SinkMetaStore` 先将 batch、SST id 列表、sequence 范围和 prepared commit payload 写入 prepare metadata；Paimon commit 成功后，再将 batch、snapshotId、persistedSequenceId 和 SST id 列表写入 success metadata。随后内存中将对应 newSST 批量移至 sinkedSST，并 best-effort rename 文件名用于人工观察。SST 是否 sinked 的可靠判断以 SinkMeta success 为准，不以文件名为准。
 - **mem退役**：ImmutableMemTable 的引用计数归零后，从对应列表中移除，只保留 SST 引用。
-- **evict**：淘汰最老的 sinkedSST，从列表移除并删除磁盘文件（需确认无查询引用）。
+- **evict**：淘汰最老的 sinkedSST，从列表移除并删除磁盘文件。当前 V1 尚未实现 SST 引用计数，后续需要补齐无查询引用确认或延迟删除队列。
 
 ## 4. 查询穿透
 
@@ -155,7 +155,7 @@ interface PMSBucketDirector {
     Optional<SSTMeta> evictOldestSinkedSST();
 
     // ── 本地 SST 合并 ──
-    void compactLocalSSTs();         // TODO: 待 SST compact 实现
+    void compactLocalSSTs();
 
     // ── Mem 缓存退化 ──
     void degradeMemCache();          // TODO: 待双持状态完整实现
@@ -297,16 +297,16 @@ SST 的可靠状态不写入 SST footer。启动时：
 ```text
 1. 扫描 storage 目录得到全部 SST
 2. 扫描 SinkMeta prepare/success
-3. 由 success metadata 中的 sstIds 推导 sinkedSST 集合
-4. allSST - sinkedSST = newSST
+3. 由 success metadata 中的 sstIds 与 persistedSequenceId 推导 sinkedSST 集合
+4. 其余 SST = newSST
 5. best-effort 修正文件名标签
 ```
 
 文件名只用于人工观察：
 
 ```text
-sst-000001.new.sst
-sst-000001.sinked.sst
+sst-000001-000001.new.sst
+sst-000001-000001.sinked.sst
 ```
 
 如果文件名和 SinkMeta 推导状态不一致，以 SinkMeta 为准并尝试 rename 修正。rename 失败只记录 warning，不影响正确性。
@@ -329,8 +329,8 @@ sst-000001.sinked.sst
 ### 8.2 sinkedSST 淘汰
 
 - **只淘汰最老**：保证 PMS 缓存中永远是最新数据，规避幽灵数据问题。
-- 淘汰前确认：无查询引用该 SST（引用计数机制同 ImmutableMemTable）。
-- 淘汰时：删除磁盘 SST 文件，从列表移除。
+- 目标语义：淘汰前确认无查询引用该 SST（引用计数机制同 ImmutableMemTable）。
+- 当前 V1：直接删除磁盘 SST 文件并从列表移除；SST 引用计数或延迟删除队列留待后续补齐。
 - 触发条件由 `pms-server` 根据本地 SST 总大小、总文件数或总物理 entry 数判断；core 只提供"退役最老 sinkedSST"的原子能力。
 - 物理 entry 数使用 `SSTMeta.entryCount` 求和，包含 tombstone 和跨 SST 的旧版本；不能用 `sequenceId` 范围推导。
 
@@ -354,7 +354,7 @@ sst-000001.sinked.sst
 
 1. **SST 侧**：多路归并，按主键序，同一 Key 保留层级更高（更新）的值。
 2. **Mem 侧**：将多个 ImmutableMemTable 的 SkipList 做归并迭代，同一 Key 保留层级更高的值，构建一个新的 SkipList 作为合并后的 Mem 缓存。
-3. 合并完成后，旧的 SST 文件和旧 ImmutableMemTable 被替换。旧 SST 文件延迟删除（确认无查询引用），旧 Mem 引用计数归零后释放。
+3. 合并完成后，旧的 SST meta 和旧 ImmutableMemTable 被替换。当前 V1 standalone compact 会保留旧 SST 数据文件作为 covered orphan，避免并发查询读到已删除文件；后续通过 SST 引用计数或延迟删除队列清理。
 
 #### 8.3.3 合并期间内存约束
 

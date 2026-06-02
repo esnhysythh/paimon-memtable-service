@@ -28,8 +28,9 @@ public interface PMSBucketDirector {
 
     Optional<SSTMeta> evictOldestSinkedSST();
 
-    // TODO: 待 Compaction 模块实现后补充以下方法
-    // void compactLocalSSTs();
+    void compactLocalSSTs();
+
+    // TODO: 待 Mem 缓存退化模块实现后补充以下方法
     // void degradeMemCache();
 
     BucketStateSnapshot stateSnapshot();
