@@ -19,7 +19,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
 ### 2.2 查询路径
-点查请求按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → Paimon 穿透`。本地 SST 带有 BloomFilter 加速；V1 当前在 `pms-server` 层通过 Paimon `ReadBuilder` 主键等值过滤完成 Paimon 穿透，以保持 `pms-core` byte-oriented 且不依赖 Paimon API。Paimon 穿透路径的 Manifest 元信息缓存复用 Paimon 内建 manifest cache，由 PMS 启动时显式透传 catalog cache 配置。
+点查请求分为默认完整表点查和 PMS-local 点查。默认 `get` 按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → Paimon 穿透`。`getLocal` 只查询 PMS 内部层，并返回 HIT / DELETED / MISS 三态；其中 DELETED 必须阻断调用方继续把它当作 Paimon fallback miss。本地 SST 带有 BloomFilter 加速；V1 当前在 `pms-server` 层通过 Paimon `ReadBuilder` 主键等值过滤完成 Paimon 穿透，以保持 `pms-core` byte-oriented 且不依赖 Paimon API。Paimon 穿透路径的 Manifest 元信息缓存复用 Paimon 内建 manifest cache，由 PMS 启动时显式透传 catalog cache 配置。
 
 > **后续演进:** 若 `ReadBuilder` 点查路径仍不能满足性能目标，再评估基于 Paimon `LocalTableQuery` 的 bucket 级点查视图，用于替换/优化 V1 的穿透路径。
 

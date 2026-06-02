@@ -111,8 +111,16 @@ public final class PmsServerRuntime implements AutoCloseable {
         return service().get(primaryKeyValues);
     }
 
+    public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
+        return service().getLocal(primaryKeyValues);
+    }
+
     public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
         return service().prefixScan(primaryKeyPrefixValues);
+    }
+
+    public List<Map<String, Object>> prefixLocal(Map<String, Object> primaryKeyPrefixValues) {
+        return service().prefixLocal(primaryKeyPrefixValues);
     }
 
     public void flush() {

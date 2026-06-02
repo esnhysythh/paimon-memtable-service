@@ -10,6 +10,7 @@ import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.server.dev.PMSTestServer;
+import org.qwh.pms.server.PmsLocalLookupResult.Type;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
 
 import java.nio.file.Path;
@@ -261,7 +262,47 @@ class PmsServerEndToEndTest {
             reader.delete(Map.of("id", 1));
 
             assertFalse(reader.get(Map.of("id", 1)).isPresent());
+            assertEquals(Type.DELETED, reader.getLocal(Map.of("id", 1)).type());
             assertEquals(Map.of(1, "paimon-a"), reader.readIntStringRows());
+        }
+    }
+
+    @Test
+    void getLocalOnlyReadsPmsLocalLayersAndExposesTombstones() throws Exception {
+        Path warehouse = tempDir.resolve("warehouse");
+
+        PmsServerConfig writerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("writer"), warehouse)
+        );
+        try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
+            writer.write(Map.of("id", 1, "marker", "paimon-a"));
+            writer.flush();
+            writer.sink();
+            assertEquals(Map.of(1, "paimon-a"), writer.readIntStringRows());
+        }
+
+        PmsServerConfig readerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("reader"), warehouse)
+        );
+        try (PMSTestServer reader = PMSTestServer.create(readerConfig, schema()).start()) {
+            assertEquals(
+                Map.of("id", 1, "marker", "paimon-a"),
+                reader.get(Map.of("id", 1)).orElseThrow()
+            );
+            assertEquals(Type.MISS, reader.getLocal(Map.of("id", 1)).type());
+
+            reader.write(Map.of("id", 2, "marker", "local-a"));
+            var hit = reader.getLocal(Map.of("id", 2));
+            assertEquals(Type.HIT, hit.type());
+            assertEquals(Map.of("id", 2, "marker", "local-a"), hit.row());
+
+            reader.delete(Map.of("id", 1));
+            assertEquals(Type.DELETED, reader.getLocal(Map.of("id", 1)).type());
+
+            Map<String, Object> missResponse = reader.postJson("/getLocal", "{\"id\":3}");
+            assertEquals("MISS", missResponse.get("result"));
+            assertEquals(false, missResponse.get("found"));
+            assertEquals("PMS_LOCAL", missResponse.get("source"));
         }
     }
 
@@ -308,7 +349,7 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void prefixScanReturnsLatestRowsAcrossLocalLayersAndFiltersTombstones() throws Exception {
+    void prefixLocalReturnsLatestRowsAcrossLocalLayersAndFiltersTombstones() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, compositePkSchema()).start()) {
             server.write(Map.of("id", 1, "sub_id", 1, "marker", "old-1"));
             server.write(Map.of("id", 1, "sub_id", 2, "marker", "old-2"));
@@ -322,7 +363,7 @@ class PmsServerEndToEndTest {
 
             server.write(Map.of("id", 1, "sub_id", 3, "marker", "cur-3"));
 
-            List<Map<String, Object>> rows = server.prefixScan(Map.of("id", 1));
+            List<Map<String, Object>> rows = server.prefixLocal(Map.of("id", 1));
 
             assertEquals(
                 List.of(
@@ -332,12 +373,17 @@ class PmsServerEndToEndTest {
                 rows
             );
 
-            Map<String, Object> response = server.postJson("/prefix", "{\"id\":1}");
+            Map<String, Object> response = server.postJson("/prefixLocal", "{\"id\":1}");
             assertEquals(2L, number(response, "count"));
+            assertEquals("PMS_LOCAL", response.get("source"));
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> httpRows = (List<Map<String, Object>>) response.get("rows");
             assertEquals(rows, httpRows);
-            assertEquals(400, server.postResult("/prefix", "{\"sub_id\":1}").statusCode());
+            var unsupportedPrefixResult = server.postResult("/prefix", "{\"id\":1}");
+            Map<String, Object> unsupportedPrefix = unsupportedPrefixResult.jsonObject();
+            assertEquals("NOT_SUPPORTED", unsupportedPrefix.get("status"));
+            assertEquals(501, unsupportedPrefixResult.statusCode());
+            assertEquals(400, server.postResult("/prefixLocal", "{\"sub_id\":1}").statusCode());
         }
     }
 

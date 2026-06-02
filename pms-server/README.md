@@ -26,10 +26,16 @@ Manual HTTP endpoints:
 ```bash
 curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/write -d '{"id":1,"marker":"a"}'
 curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/get -d '{"id":1}'
+curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/getLocal -d '{"id":1}'
+curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/prefixLocal -d '{"id":1}'
 curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/flush -d '{}'
 curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/sink -d '{}'
 curl http://127.0.0.1:19090/state
 ```
+
+`/get` is the default full point lookup and may fall through to Paimon after a PMS-local miss.
+`/getLocal` only reads PMS-local layers and returns `result=HIT|DELETED|MISS`.
+`/prefixLocal` only reads PMS-local layers. `/prefix` is reserved for future full prefix lookup and returns `NOT_SUPPORTED` in V1.
 
 ## Configuration
 

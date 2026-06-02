@@ -107,24 +107,34 @@ public final class PmsTableService implements AutoCloseable {
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
         GenericRow keyTuple = rowMapper.keyTuple(primaryKeyValues, primaryKeys);
         byte[] key = keyCodec.encodeKeyTuple(keyTuple);
-        Optional<Value> local = director.lookup(key);
-        if (local.isPresent()) {
-            Value value = local.get();
-            if (value.isTombstone()) {
-                return Optional.empty();
-            }
-            return Optional.of(rowMapper.toJsonObject(valueCodec.decode(table.rowType(), value.bytes())));
+        PmsLocalLookupResult local = getLocal(key);
+        if (local.type() == PmsLocalLookupResult.Type.HIT) {
+            return Optional.of(local.row());
+        }
+        if (local.type() == PmsLocalLookupResult.Type.DELETED) {
+            return Optional.empty();
         }
         return lookupPaimon(keyTuple);
     }
 
-    public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
+    public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
+        GenericRow keyTuple = rowMapper.keyTuple(primaryKeyValues, primaryKeys);
+        return getLocal(keyCodec.encodeKeyTuple(keyTuple));
+    }
+
+    public List<Map<String, Object>> prefixLocal(Map<String, Object> primaryKeyPrefixValues) {
         byte[] prefix = keyCodec.encodePrefixTuple(rowMapper.keyPrefixTuple(primaryKeyPrefixValues, primaryKeys));
         List<Map<String, Object>> rows = new ArrayList<>();
         for (var entry : director.prefixScan(prefix)) {
             rows.add(rowMapper.toJsonObject(valueCodec.decode(table.rowType(), entry.value().bytes())));
         }
         return rows;
+    }
+
+    public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
+        throw new PmsNotSupportedException(
+            "Full prefix lookup is not supported yet; use prefixLocal for PMS-local prefix lookup"
+        );
     }
 
     public void flush() {
@@ -184,6 +194,18 @@ public final class PmsTableService implements AutoCloseable {
         } catch (IOException e) {
             throw new RuntimeException("Paimon point lookup failed for primary keys " + primaryKeys, e);
         }
+    }
+
+    private PmsLocalLookupResult getLocal(byte[] key) {
+        Optional<Value> local = director.lookup(key);
+        if (local.isEmpty()) {
+            return PmsLocalLookupResult.miss();
+        }
+        Value value = local.get();
+        if (value.isTombstone()) {
+            return PmsLocalLookupResult.deleted();
+        }
+        return PmsLocalLookupResult.hit(rowMapper.toJsonObject(valueCodec.decode(table.rowType(), value.bytes())));
     }
 
     private Predicate primaryKeyPredicate(GenericRow keyTuple) {
