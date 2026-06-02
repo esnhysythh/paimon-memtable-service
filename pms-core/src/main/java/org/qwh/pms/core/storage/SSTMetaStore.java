@@ -41,23 +41,28 @@ final class SSTMetaStore {
                 files.add(path);
             }
         }
-        files.sort(Comparator.comparingLong(SSTMetaStore::fileIdFromMetaPath));
+        files.sort(Comparator.comparingLong((Path path) -> flushRangeFromMetaPath(path)[0])
+            .thenComparingLong(path -> flushRangeFromMetaPath(path)[1]));
         return files;
     }
 
     void save(SSTMeta meta) throws IOException {
         String body = toJson(meta);
-        writeAtomically(metaPath(meta.fileId()), withChecksum(body));
+        writeAtomically(metaPath(meta), withChecksum(body));
     }
 
     SSTMeta load(Path path) throws IOException {
         String content = Files.readString(path, StandardCharsets.UTF_8);
         verifyChecksum(path, content);
         requireVersion(content);
-        long fileId = readLongField(content, "fileId");
-        Path sstPath = existingSstPath(fileId, readStringField(content, "sstFile"));
+        long runId = readLongField(content, "runId");
+        long minFlushId = readLongField(content, "minFlushId");
+        long maxFlushId = readLongField(content, "maxFlushId");
+        Path sstPath = existingSstPath(minFlushId, maxFlushId, readStringField(content, "sstFile"));
         return new SSTMeta(
-            fileId,
+            runId,
+            minFlushId,
+            maxFlushId,
             sstPath,
             readLongField(content, "fileSize"),
             readLongField(content, "entryCount"),
@@ -71,30 +76,39 @@ final class SSTMetaStore {
         );
     }
 
-    Path metaPath(long fileId) {
-        return dir.resolve(String.format("sst-%06d%s", fileId, SUFFIX));
+    Path metaPath(SSTMeta meta) {
+        return metaPath(meta.minFlushId(), meta.maxFlushId());
     }
 
-    static long fileIdFromMetaPath(Path path) {
+    Path metaPath(long minFlushId, long maxFlushId) {
+        return dir.resolve(String.format("sst-%06d-%06d%s", minFlushId, maxFlushId, SUFFIX));
+    }
+
+    static long[] flushRangeFromMetaPath(Path path) {
         String name = path.getFileName().toString();
         if (!name.startsWith("sst-") || !name.endsWith(SUFFIX)) {
-            return 0;
+            return new long[] {0, 0};
         }
-        String id = name.substring(4, name.length() - SUFFIX.length());
-        return Long.parseLong(id);
+        String range = name.substring(4, name.length() - SUFFIX.length());
+        String[] parts = range.split("-");
+        if (parts.length >= 2) {
+            return new long[] {Long.parseLong(parts[0]), Long.parseLong(parts[1])};
+        }
+        long id = Long.parseLong(range);
+        return new long[] {id, id};
     }
 
-    private Path existingSstPath(long fileId, String recordedFile) {
+    private Path existingSstPath(long minFlushId, long maxFlushId, String recordedFile) {
         Path recordedName = Path.of(recordedFile).getFileName();
         Path recorded = dir.resolve(recordedName == null ? recordedFile : recordedName.toString());
         if (Files.exists(recorded)) {
             return recorded;
         }
-        Path newPath = dir.resolve(String.format("sst-%06d.new.sst", fileId));
+        Path newPath = SSTWriter.pathFor(dir, minFlushId, maxFlushId, SSTState.NEW);
         if (Files.exists(newPath)) {
             return newPath;
         }
-        Path sinkedPath = dir.resolve(String.format("sst-%06d.sinked.sst", fileId));
+        Path sinkedPath = SSTWriter.pathFor(dir, minFlushId, maxFlushId, SSTState.SINKED);
         if (Files.exists(sinkedPath)) {
             return sinkedPath;
         }
@@ -116,7 +130,9 @@ final class SSTMetaStore {
         StringBuilder out = new StringBuilder();
         out.append("{\n");
         field(out, "version", VERSION, true);
-        field(out, "fileId", meta.fileId(), true);
+        field(out, "runId", meta.runId(), true);
+        field(out, "minFlushId", meta.minFlushId(), true);
+        field(out, "maxFlushId", meta.maxFlushId(), true);
         field(out, "sstFile", meta.path().getFileName().toString(), true);
         field(out, "state", meta.state().name(), true);
         field(out, "fileSize", meta.fileSize(), true);

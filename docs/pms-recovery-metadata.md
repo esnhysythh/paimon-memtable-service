@@ -104,10 +104,10 @@ SSTMeta 负责回答：
 
 ```text
 storage/
-  sst-000001.new.sst
-  sst-000001.meta.json
-  sst-000002.sinked.sst
-  sst-000002.meta.json
+  sst-000001-000001.new.sst
+  sst-000001-000001.meta.json
+  sst-000002-000004.sinked.sst
+  sst-000002-000004.meta.json
   flush-boundary.meta
 ```
 
@@ -124,8 +124,10 @@ storage/
 ```json
 {
   "version": 1,
-  "fileId": 1,
-  "sstFile": "sst-000001.new.sst",
+  "runId": 1,
+  "minFlushId": 1,
+  "maxFlushId": 1,
+  "sstFile": "sst-000001-000001.new.sst",
   "state": "NEW",
   "fileSize": 12345,
   "entryCount": 1000,
@@ -142,7 +144,8 @@ storage/
 字段说明：
 
 - `state` 初期包含 `NEW` / `SINKED`。
-- `sstFile` 是当前 SST 文件名；恢复时如果文件名标签与 meta 暂时不一致，会按 `fileId` 查找实际存在的 `.new.sst` / `.sinked.sst`，随后由 SinkMeta success 修正。
+- `runId` 是物理唯一标识，只用于 reader cache、删除和排障；逻辑新旧顺序由 `minFlushId/maxFlushId` 表达。
+- `sstFile` 是当前 SST 文件名；恢复时如果文件名标签与 meta 暂时不一致，会按 `minFlushId/maxFlushId` 查找实际存在的 `.new.sst` / `.sinked.sst`，随后由 SinkMeta success 修正。
 - `minKeyBase64/maxKeyBase64` 保持 JSON 可读结构，同时避免二进制 key 破坏文本格式。
 - SST 数据文件完整性仍由 SST footer 中的 full-file CRC 校验；启动时还会对比 `.meta.json` 与 SST properties 中的关键字段。
 - `metaCrc32` 覆盖 metadata 中除自身外的稳定字段，用于发现半写或人工误改。
@@ -152,13 +155,13 @@ storage/
 Flush 必须保持以下顺序：
 
 ```text
-1. 写 sst-000001.new.sst.tmp
+1. 写 sst-000001-000001.new.sst.tmp
 2. force SST 文件内容
-3. atomic rename -> sst-000001.new.sst
+3. atomic rename -> sst-000001-000001.new.sst
 4. force storage directory
-5. 写 sst-000001.meta.json.tmp
+5. 写 sst-000001-000001.meta.json.tmp
 6. force meta 文件内容
-7. atomic rename -> sst-000001.meta.json
+7. atomic rename -> sst-000001-000001.meta.json
 8. force storage directory
 9. 推进 flush-boundary.meta(lastFlushedSequenceId = maxSequenceId)
 ```
@@ -267,7 +270,7 @@ sink/
 
 - `persistedSequenceId` 是 WAL 安全截断的主边界。
 - `snapshotId` 表示 Paimon 外部提交结果，只能作为排障和外部一致性校验信息，不能单独决定 WAL 截断。
-- `sstIds` 是恢复时判断 SST 是否已经 sinked 的可靠来源之一；后续也可以同步回 SSTMeta 的 `state=SINKED`。
+- `sstIds` 是恢复时判断 SST 是否已经 sinked 的来源之一；本地 compact 后的新 runId 可能不在历史 sstIds 中，因此恢复还会使用 `persistedSequenceId` 将已覆盖 sequence 范围内的 SST 判为 sinked。
 
 ### 5.5 Sink 持久化顺序
 
@@ -316,14 +319,14 @@ Sink 必须保持以下顺序：
 4. 初始化 sink metadata
    - 扫描 batch-*.prepare.json
    - 扫描 batch-*.success.json
-   - success 中的 sstIds 视为已 sinked
+   - success 中的 sstIds 和 persistedSequenceId 用于推导已 sinked SST
 
 5. 恢复未完成 sink
    - 对 prepare 存在但 success 不存在的 batch，使用原始 prepared payload 重试 commit
    - commit 成功后写 success metadata
 
 6. 修正本地 SST 状态
-   - 根据 success.sstIds 将 SSTMeta state 更新为 SINKED
+   - 根据 success.sstIds 和 persistedSequenceId 将 SSTMeta state 更新为 SINKED
    - 文件名标签只做 best-effort 修正
 
 7. 启动服务和后台任务
@@ -354,7 +357,7 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 | flush boundary 已推进、SST/SSTMeta 缺失 | boundary 指向缺失数据 | 启动失败，避免丢数据 |
 | Paimon prepare 成功、prepare meta 未写 | Paimon 可能有临时 data files | 不恢复 commit，后续重新 sink；可能遗留外部垃圾 |
 | prepare meta 已写、success meta 未写 | 可恢复 prepared commit | 重试 commit，成功后写 success |
-| success meta 已写、SSTMeta 未标记 SINKED | commit 已确认 | 根据 success.sstIds 修正 SSTMeta |
+| success meta 已写、SSTMeta 未标记 SINKED | commit 已确认 | 根据 success.sstIds 和 persistedSequenceId 修正 SSTMeta |
 | success meta 已写、WAL 未截断 | 数据可能重复存在于 WAL/SST/Paimon | 通过 flush boundary 和 sink meta 跳过/截断，不丢数据 |
 
 ## 9. 当前实现状态

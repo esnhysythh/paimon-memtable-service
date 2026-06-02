@@ -29,30 +29,50 @@ final class SSTWriter {
         this.restartInterval = restartInterval;
     }
 
-    SSTMeta write(long fileId, ImmutableMemTable memTable) throws IOException {
+    SSTMeta write(long runId, long flushId, ImmutableMemTable memTable) throws IOException {
+        return write(
+            runId,
+            flushId,
+            flushId,
+            SSTState.NEW,
+            memTable.iterator(),
+            Math.max(1, memTable.estimatedEntryCount()),
+            memTable.minSequenceId(),
+            memTable.maxSequenceId()
+        );
+    }
+
+    SSTMeta write(long runId, long minFlushId, long maxFlushId, SSTState state, Iterator<Entry> entries,
+                  long expectedEntryCount, long expectedMinSequenceId, long expectedMaxSequenceId)
+            throws IOException {
         Files.createDirectories(dir);
-        Path tmp = dir.resolve(String.format("sst-%06d.new.sst.tmp", fileId));
-        Path target = dir.resolve(String.format("sst-%06d.new.sst", fileId));
+        Path target = pathFor(minFlushId, maxFlushId, state);
+        Path tmp = target.resolveSibling(target.getFileName() + ".tmp-" + runId);
         Files.deleteIfExists(tmp);
 
         List<BlockReaders.IndexEntry> indexEntries = new ArrayList<>();
-        BloomFilter bloom = BloomFilter.create(Math.max(1, memTable.estimatedEntryCount()), SSTFormat.DEFAULT_BLOOM_FPP);
+        BloomFilter bloom = BloomFilter.create((int) Math.min(Integer.MAX_VALUE, Math.max(1, expectedEntryCount)),
+            SSTFormat.DEFAULT_BLOOM_FPP);
         DataBlockBuilder blockBuilder = new DataBlockBuilder(restartInterval);
         Key minKey = null;
         Key maxKey = null;
         boolean hasTombstone = false;
         long entryCount = 0;
         long dataBlockCount = 0;
+        long minSequenceId = 0;
+        long maxSequenceId = 0;
 
         try (CountingCrcOutputStream out = new CountingCrcOutputStream(new FileOutputStream(tmp.toFile()))) {
-            Iterator<Entry> iterator = memTable.iterator();
-            while (iterator.hasNext()) {
-                Entry entry = iterator.next();
+            while (entries.hasNext()) {
+                Entry entry = entries.next();
                 if (minKey == null) {
                     minKey = entry.key();
                 }
                 maxKey = entry.key();
                 hasTombstone |= entry.value().isTombstone();
+                long sequenceId = entry.value().sequenceId();
+                minSequenceId = minSequenceId == 0 ? sequenceId : Math.min(minSequenceId, sequenceId);
+                maxSequenceId = Math.max(maxSequenceId, sequenceId);
                 blockBuilder.add(entry);
                 bloom = bloom.add(entry.key());
                 entryCount++;
@@ -76,8 +96,8 @@ final class SSTWriter {
                 dataBlockCount,
                 minKey,
                 maxKey,
-                memTable.minSequenceId(),
-                memTable.maxSequenceId(),
+                entryCount == 0 ? expectedMinSequenceId : minSequenceId,
+                entryCount == 0 ? expectedMaxSequenceId : maxSequenceId,
                 createdAtMillis,
                 hasTombstone
             );
@@ -91,22 +111,33 @@ final class SSTWriter {
             Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             StorageFiles.forceDirectory(dir);
             return new SSTMeta(
-                fileId,
+                runId,
+                minFlushId,
+                maxFlushId,
                 target,
                 fileSize,
                 entryCount,
                 minKey,
                 maxKey,
-                memTable.minSequenceId(),
-                memTable.maxSequenceId(),
+                entryCount == 0 ? expectedMinSequenceId : minSequenceId,
+                entryCount == 0 ? expectedMaxSequenceId : maxSequenceId,
                 createdAtMillis,
-                SSTState.NEW,
+                state,
                 0
             );
         } catch (IOException | RuntimeException e) {
             Files.deleteIfExists(tmp);
             throw e;
         }
+    }
+
+    static Path pathFor(Path dir, long minFlushId, long maxFlushId, SSTState state) {
+        String label = state == SSTState.SINKED ? "sinked" : "new";
+        return dir.resolve(String.format("sst-%06d-%06d.%s.sst", minFlushId, maxFlushId, label));
+    }
+
+    private Path pathFor(long minFlushId, long maxFlushId, SSTState state) {
+        return pathFor(dir, minFlushId, maxFlushId, state);
     }
 
     private static void writeDataBlock(CountingCrcOutputStream out, DataBlockBuilder blockBuilder,

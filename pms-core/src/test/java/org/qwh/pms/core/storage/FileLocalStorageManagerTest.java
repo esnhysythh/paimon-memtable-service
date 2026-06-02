@@ -152,12 +152,14 @@ class FileLocalStorageManagerTest {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
 
-        Path metaPath = tempDir.resolve("sst-000001.meta.json");
+        Path metaPath = tempDir.resolve("sst-000001-000001.meta.json");
         String content = Files.readString(metaPath);
 
         assertTrue(Files.exists(metaPath));
-        assertTrue(content.contains("\"fileId\": " + meta.fileId()));
-        assertTrue(content.contains("\"sstFile\": \"sst-000001.new.sst\""));
+        assertTrue(content.contains("\"runId\": " + meta.runId()));
+        assertTrue(content.contains("\"minFlushId\": 1"));
+        assertTrue(content.contains("\"maxFlushId\": 1"));
+        assertTrue(content.contains("\"sstFile\": \"sst-000001-000001.new.sst\""));
         assertTrue(content.contains("\"state\": \"NEW\""));
         assertTrue(content.contains("\"minSequenceId\": 1"));
         assertTrue(content.contains("\"maxSequenceId\": 1"));
@@ -175,7 +177,7 @@ class FileLocalStorageManagerTest {
         assertEquals(1, reloaded.metas().size());
         assertEquals(1L, reloaded.lastFlushedSequenceId());
         SSTMeta loaded = reloaded.metas().get(0);
-        assertEquals(meta.fileId(), loaded.fileId());
+        assertEquals(meta.runId(), loaded.runId());
         assertEquals(meta.entryCount(), loaded.entryCount());
         assertArrayEquals("v1".getBytes(), reloaded.get(loaded, new Key("k1".getBytes())).orElseThrow().bytes());
     }
@@ -222,7 +224,7 @@ class FileLocalStorageManagerTest {
         assertTrue(Files.exists(orphan.path()));
         assertTrue(reloaded.metas().isEmpty());
         SSTMeta next = reloaded.flushToSST(immutable("k2", "v2".getBytes(), 2L));
-        assertEquals(orphan.fileId() + 1, next.fileId());
+        assertEquals(orphan.runId() + 1, next.runId());
     }
 
     @Test
@@ -249,7 +251,7 @@ class FileLocalStorageManagerTest {
         SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
         storage.persistFlushedSequenceId(meta.maxSequenceId());
 
-        Path metaPath = tempDir.resolve("sst-000001.meta.json");
+        Path metaPath = tempDir.resolve("sst-000001-000001.meta.json");
         String content = Files.readString(metaPath).replace("\"maxSequenceId\": 1", "\"maxSequenceId\": 2");
         Files.writeString(metaPath, content);
 
@@ -285,5 +287,73 @@ class FileLocalStorageManagerTest {
 
         FileLocalStorageManager reloaded = storage();
         assertEquals(10L, reloaded.lastFlushedSequenceId());
+    }
+
+    @Test
+    void compactSSTsMergesContinuousFlushRangesAndKeepsLatestSequence() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable(
+            "a", "old-a".getBytes(), 1L,
+            "b", "old-b".getBytes(), 2L
+        ));
+        SSTMeta second = storage.flushToSST(immutable(
+            "a", "new-a".getBytes(), 3L,
+            "c", null, 4L
+        ));
+
+        SSTMeta compacted = storage.compactSSTs(List.of(first, second));
+
+        assertEquals(1L, compacted.minFlushId());
+        assertEquals(2L, compacted.maxFlushId());
+        assertEquals(3L, compacted.entryCount());
+        assertTrue(Files.exists(tempDir.resolve("sst-000001-000002.new.sst")));
+        assertTrue(Files.exists(first.path()));
+        assertTrue(Files.exists(second.path()));
+        assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+        assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
+        assertArrayEquals("new-a".getBytes(), storage.get(compacted, new Key("a".getBytes())).orElseThrow().bytes());
+        assertArrayEquals("old-b".getBytes(), storage.get(compacted, new Key("b".getBytes())).orElseThrow().bytes());
+        assertTrue(storage.get(compacted, new Key("c".getBytes())).orElseThrow().isTombstone());
+
+        storage.persistFlushedSequenceId(compacted.maxSequenceId());
+        FileLocalStorageManager reloaded = storage();
+        assertEquals(List.of(compacted.runId()), reloaded.metas().stream().map(SSTMeta::runId).toList());
+    }
+
+    @Test
+    void initPrefersCompactedMetaWhenInputMetasRemainAfterCrash() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable("a", "old-a".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("a", "new-a".getBytes(), 2L));
+        storage.persistFlushedSequenceId(second.maxSequenceId());
+
+        SSTMeta compacted = storage.compactSSTs(List.of(first, second));
+        SSTMetaStore metaStore = new SSTMetaStore(tempDir);
+        metaStore.init();
+        metaStore.save(first);
+        metaStore.save(second);
+
+        FileLocalStorageManager reloaded = storage();
+
+        assertEquals(1, reloaded.metas().size());
+        assertEquals(compacted.runId(), reloaded.metas().get(0).runId());
+        assertEquals(1L, reloaded.metas().get(0).minFlushId());
+        assertEquals(2L, reloaded.metas().get(0).maxFlushId());
+    }
+
+    @Test
+    void compactRejectsNonContinuousFlushRanges() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable("a", "a".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("b", "b".getBytes(), 2L));
+        SSTMeta third = storage.flushToSST(immutable("c", "c".getBytes(), 3L));
+
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> storage.compactSSTs(List.of(first, third))
+        );
+
+        assertTrue(error.getMessage().contains("continuous"));
+        assertTrue(Files.exists(second.path()));
     }
 }

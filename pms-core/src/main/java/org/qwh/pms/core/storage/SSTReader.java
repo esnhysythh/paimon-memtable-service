@@ -142,9 +142,11 @@ final class SSTReader {
         long minSequenceId = StorageCoding.readLongLE(tail, 0);
         long maxSequenceId = StorageCoding.readLongLE(tail, 8);
         long createdAtMillis = StorageCoding.readLongLE(tail, 16);
-        long fileId = parseFileId(path);
+        long[] flushRange = parseFlushRange(path);
         return new SSTMeta(
-            fileId,
+            flushRange[0],
+            flushRange[0],
+            flushRange[1],
             path,
             Files.size(path),
             entryCount,
@@ -156,6 +158,22 @@ final class SSTReader {
             state,
             0
         );
+    }
+
+    private static long[] parseFlushRange(Path path) {
+        String name = path.getFileName().toString();
+        if (!name.startsWith("sst-") || !name.endsWith(".sst")) {
+            return new long[] {1, 1};
+        }
+        String body = name.substring(4, name.length() - 4);
+        int dot = body.indexOf('.');
+        String range = dot >= 0 ? body.substring(0, dot) : body;
+        String[] parts = range.split("-");
+        if (parts.length >= 2) {
+            return new long[] {Long.parseLong(parts[0]), Long.parseLong(parts[1])};
+        }
+        long id = Long.parseLong(range);
+        return new long[] {id, id};
     }
 
     private static Key readKey(ByteArrayInputStream in, long entryCount) {
@@ -228,17 +246,6 @@ final class SSTReader {
         if ((int) crc.getValue() != expected) {
             throw new IllegalArgumentException("SST full-file CRC mismatch: " + path);
         }
-    }
-
-    private static long parseFileId(Path path) {
-        String name = path.getFileName().toString();
-        if (!name.startsWith("sst-") || !name.endsWith(".sst")) {
-            return Math.max(1, Math.abs(name.hashCode()));
-        }
-        String body = name.substring(4, name.length() - 4);
-        int dot = body.indexOf('.');
-        String id = dot >= 0 ? body.substring(0, dot) : body;
-        return Long.parseLong(id);
     }
 
     private record Footer(BlockHandle bloomHandle, BlockHandle indexHandle, BlockHandle propertiesHandle,

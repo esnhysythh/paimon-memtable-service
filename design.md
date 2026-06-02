@@ -14,7 +14,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 1. 数据通过 RPC 写入 `curMemTable`（基于 SkipList）。
 2. Bucket 内部分配单调递增的 `sequenceId`，WAL 与 MemTable 同时记录该值。V1 使用轻量级 sequence：只确定写入边界，不提供 MVCC 快照读。
 3. `curMemTable` 满后或达到时间阈值，冻结为 `ImmutableMemTable`，冻结结果携带 `minSequenceId/maxSequenceId`，异步刷盘生成 SST。
-4. 触发 Sink 流程时，选择待 sink 的 `newSST` 形成 `SinkBatch`，后续通过有序 iterator 与 RowCodec 对接 Paimon 2PC。Sink prepare/success 写入独立 `SinkMeta`，其中的 `sstIds/persistedSequenceId` 是判断 SST 是否已 sink 和未来 WAL 截断的可靠依据；Paimon snapshotId 只表示外部提交结果。
+4. 触发 Sink 流程时，选择待 sink 的 `newSST` 形成 `SinkBatch`，后续通过有序 iterator 与 RowCodec 对接 Paimon 2PC。Sink prepare/success 写入独立 `SinkMeta`，其中的 `sstIds/persistedSequenceId` 用于恢复 SST sinked 状态和未来 WAL 截断；Paimon snapshotId 只表示外部提交结果。
 
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
@@ -26,7 +26,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 ### 2.3 缓存与淘汰
 - **内存淘汰**：ImmutableMemTable 维护引用计数，归零后退役释放内存。带 Mem 缓存的双持状态（newSSTWithMem / sinkedSSTWithMem）可在内存不足时退化为不带 Mem 的状态。
 - **本地 SST 淘汰**：按本地 SST 总大小、总文件数或总物理 entry 数触发；实际只对已 Sink 的 `sinkedSST` 采用"只淘汰最老"策略，规避幽灵数据问题。
-- **小文件合并**：对较小/零碎的 SST（含带 Mem 缓存的 SSTWithMem）进行多路归并合并，减少文件数量，提升查询效率。详见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) § 8.3。
+- **小文件合并**：对较小/零碎的 SST（含带 Mem 缓存的 SSTWithMem）进行多路归并合并，减少文件数量，提升查询效率。本地 SST 不按传统 LSM level 理解，而按连续 `flushId` 范围组织为 local run；详见 [pms-core-local-run-compaction.md](docs/pms-core-local-run-compaction.md)。
 
 ## 3. 关键机制
 
@@ -70,7 +70,7 @@ Paimon 行格式与 PMS KV bytes 的适配层，依赖 Paimon 类型系统，但
 - 实现 `pms-core` 定义的 `SinkManager` SPI，由 `pms-server` 注入 `PMSBucketDirectorImpl`。
 - 读取 `pms-core` 暴露的 SST ordered iterator。
 - 使用 `pms-codec` 将 value bytes 解码为 Paimon `InternalRow`。
-- 调用 Paimon 2PC API 完成 prepare / commit，并把 `persistedSequenceId`、`sstIds` 等结果交由 `pms-core` 写入 `SinkMeta`。
+- 调用 Paimon 2PC API 完成 prepare / commit，并把 `persistedSequenceId`、`sstIds` 等结果交由 `pms-core` 写入 `SinkMeta`；本地 SST 逻辑顺序由 `flushId` range 表达。
 - 该模块依赖 `pms-core`、`pms-codec` 和 Paimon。
 
 ### 4.4 pms-server
@@ -111,6 +111,7 @@ flink-connector -> pms-client
 | [pms-core.md](docs/pms-core.md) | 核心引擎组件、接口定义、流控、并发模型、数据完整性 |
 | [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) | 状态机协调器 |
 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) | 本地 SST 文件格式、LevelDB 对照、查询三态语义 |
+| [pms-core-local-run-compaction.md](docs/pms-core-local-run-compaction.md) | 基于 flushId range 的 local run、SST 命名、compact/sink/evict 边界设计 |
 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) | SST 当前实现状态、mock 边界与后续 codec 交接说明 |
 | [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) | WAL 只记录数据、SSTMeta/SinkMeta 独立记录恢复边界的设计 |
 | [pms-codec.md](docs/pms-codec.md) | Paimon 行编码、主键编码、RowKind 与 tombstone 边界 |

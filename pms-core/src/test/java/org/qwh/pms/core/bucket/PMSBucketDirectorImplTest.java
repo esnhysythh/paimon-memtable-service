@@ -29,10 +29,19 @@ class PMSBucketDirectorImplTest {
     Path tempDir;
 
     private PMSConfig config(int memtableMaxEntries, int memtableMaxSizeMb) {
+        return config(memtableMaxEntries, memtableMaxSizeMb, 100, 32, 4);
+    }
+
+    private PMSConfig config(
+            int memtableMaxEntries,
+            int memtableMaxSizeMb,
+            int sinkedMaxCount,
+            int compactThresholdMb,
+            int compactMinFiles) {
         return new PMSConfig(
             new MemTableConfig(memtableMaxEntries, memtableMaxSizeMb),
             new WalConfig(tempDir.resolve("wal").toString(), 256, false),
-            new StorageConfig(tempDir.resolve("storage").toString(), 0, 0, 0, 0),
+            new StorageConfig(tempDir.resolve("storage").toString(), 0, sinkedMaxCount, 0, compactThresholdMb, compactMinFiles),
             new SinkConfig(0, 0),
             new FlowControlConfig(0, 0),
             new PaimonConfig("dummy", null)
@@ -249,6 +258,7 @@ class PMSBucketDirectorImplTest {
         assertThrows(IllegalStateException.class, () -> dir.get("k".getBytes()));
         assertThrows(IllegalStateException.class, dir::freezeCurMemTable);
         assertThrows(IllegalStateException.class, dir::sinkToPaimon);
+        assertThrows(IllegalStateException.class, dir::compactLocalSSTs);
         assertThrows(IllegalStateException.class, dir::stateSnapshot);
         dir.close();
     }
@@ -382,6 +392,32 @@ class PMSBucketDirectorImplTest {
         }
     }
 
+    @Test
+    void compactLocalSSTsMergesNewRunsWithoutChangingLookupOrder() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256, 100, 32, 2));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "old".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.put("k1".getBytes(), "new".getBytes());
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            dir.compactLocalSSTs();
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(1, snap.newSSTCount());
+            assertEquals(2L, snap.newSSTTotalRows());
+            assertArrayEquals("new".getBytes(), dir.get("k1".getBytes()).orElse(null));
+            assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElse(null));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.new.sst")));
+        } finally {
+            dir.close();
+        }
+    }
+
     // ── Sink boundary ──
 
     @Test
@@ -393,8 +429,8 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            Path newFile = tempDir.resolve("storage").resolve("sst-000001.new.sst");
-            Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+            Path newFile = tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
+            Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
             assertTrue(Files.exists(newFile));
 
             dir.sinkToPaimon();
@@ -433,6 +469,70 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void compactedSinkedRunRecoversAsSinkedAfterRestart() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256, 100, 32, 2);
+
+        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        dir1.init();
+        try {
+            dir1.put("k1".getBytes(), "v1".getBytes());
+            dir1.freezeCurMemTable();
+            dir1.flushImmutableMemTable();
+            dir1.put("k2".getBytes(), "v2".getBytes());
+            dir1.freezeCurMemTable();
+            dir1.flushImmutableMemTable();
+            dir1.sinkToPaimon();
+
+            dir1.compactLocalSSTs();
+
+            BucketStateSnapshot compacted = dir1.stateSnapshot();
+            assertEquals(0, compacted.newSSTCount());
+            assertEquals(1, compacted.sinkedSSTCount());
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sinked.sst")));
+        } finally {
+            dir1.close();
+        }
+
+        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        dir2.init();
+        try {
+            BucketStateSnapshot recovered = dir2.stateSnapshot();
+            assertEquals(0, recovered.newSSTCount());
+            assertEquals(1, recovered.sinkedSSTCount());
+            assertArrayEquals("v1".getBytes(), dir2.get("k1".getBytes()).orElse(null));
+            assertArrayEquals("v2".getBytes(), dir2.get("k2".getBytes()).orElse(null));
+        } finally {
+            dir2.close();
+        }
+    }
+
+    @Test
+    void evictCompactsFirstWhenOnlySinkedCountExceedsLimit() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256, 1, 32, 2));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.sinkToPaimon();
+
+            Optional<SSTMeta> evicted = dir.evictOldestSinkedSST();
+
+            assertTrue(evicted.isEmpty());
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(1, snap.sinkedSSTCount());
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
+            assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElse(null));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sinked.sst")));
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
     void evictOldestSinkedSSTDeletesOnlyOldestSinkedFile() throws IOException {
         PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
         dir.init();
@@ -455,9 +555,9 @@ class PMSBucketDirectorImplTest {
             assertEquals(2, before.sinkedSSTCount());
             assertEquals(2L, before.sinkedSSTTotalRows());
 
-            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
-            Path newerSinked = tempDir.resolve("storage").resolve("sst-000002.sinked.sst");
-            Path unsinked = tempDir.resolve("storage").resolve("sst-000003.new.sst");
+            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
+            Path newerSinked = tempDir.resolve("storage").resolve("sst-000002-000002.sinked.sst");
+            Path unsinked = tempDir.resolve("storage").resolve("sst-000003-000003.new.sst");
             assertTrue(Files.exists(oldestSinked));
             assertTrue(Files.exists(newerSinked));
             assertTrue(Files.exists(unsinked));
@@ -465,7 +565,7 @@ class PMSBucketDirectorImplTest {
             Optional<SSTMeta> evicted = dir.evictOldestSinkedSST();
 
             assertTrue(evicted.isPresent());
-            assertEquals(1L, evicted.get().fileId());
+            assertEquals(1L, evicted.get().runId());
             assertFalse(Files.exists(oldestSinked));
             assertTrue(Files.exists(newerSinked));
             assertTrue(Files.exists(unsinked));
@@ -495,8 +595,8 @@ class PMSBucketDirectorImplTest {
         dir1.sinkToPaimon();
         dir1.close();
 
-        Path newFile = tempDir.resolve("storage").resolve("sst-000001.new.sst");
-        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+        Path newFile = tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
+        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
         Files.move(sinkedFile, newFile, StandardCopyOption.REPLACE_EXISTING);
 
         PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
@@ -534,8 +634,8 @@ class PMSBucketDirectorImplTest {
             dir1.close();
         }
 
-        Path newFile = tempDir.resolve("storage").resolve("sst-000001.new.sst");
-        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001.sinked.sst");
+        Path newFile = tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
+        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
         assertTrue(Files.exists(newFile));
         assertFalse(Files.exists(sinkedFile));
 
@@ -758,7 +858,7 @@ class PMSBucketDirectorImplTest {
             prepareCalls++;
             preparedBatchId = batch.batchId();
             preparedMaxSequenceId = batch.maxSequenceId();
-            List<Long> sstIds = batch.ssts().stream().map(SSTMeta::fileId).toList();
+            List<Long> sstIds = batch.ssts().stream().map(SSTMeta::runId).toList();
             long inputRecordCount = batch.ssts().stream().mapToLong(SSTMeta::entryCount).sum();
             return new PreparedSinkCommit(
                 batch.batchId(),

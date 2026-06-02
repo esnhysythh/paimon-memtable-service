@@ -163,7 +163,7 @@ public final class PaimonFlusher {
     }
 
     private static List<Long> sstIds(List<SSTMeta> ssts) {
-        return ssts.stream().map(SSTMeta::fileId).toList();
+        return ssts.stream().map(SSTMeta::runId).toList();
     }
 
     private static long inputRecordCount(List<SSTMeta> ssts) {

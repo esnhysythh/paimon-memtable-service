@@ -173,7 +173,9 @@ checksumType         byte     // V1 = FULL_FILE_CRC32; 后续可增加 BLOCK_TRA
 
 ```java
 record SSTMeta(
-    long fileId,
+    long runId,
+    long minFlushId,
+    long maxFlushId,
     Path path,
     long fileSize,
     long entryCount,
@@ -187,7 +189,7 @@ record SSTMeta(
 ) {}
 ```
 
-`SSTState` 初期可包含 `NEW` 和 `SINKED`；带 Mem 缓存的状态由 BucketDirector 的状态条目表达，而不是写进 SST 文件。SST 文件名可带 `.new` / `.sinked` 标签用于人工观察，但可靠状态来源是 WAL 中的 sink success payload，而不是文件名或 Footer。
+`SSTState` 初期可包含 `NEW` 和 `SINKED`；带 Mem 缓存的状态由 BucketDirector 的状态条目表达，而不是写进 SST 文件。SST 文件名可带 `flushId` range 和 `.new` / `.sinked` 标签用于人工观察，但可靠状态来源是 metadata 和 SinkMeta，而不是文件名或 Footer。
 
 ## 10. Footer 格式
 

@@ -5,7 +5,9 @@ import org.qwh.pms.core.memtable.model.Key;
 import java.nio.file.Path;
 
 public record SSTMeta(
-    long fileId,
+    long runId,
+    long minFlushId,
+    long maxFlushId,
     Path path,
     long fileSize,
     long entryCount,
@@ -18,8 +20,11 @@ public record SSTMeta(
     long refCount
 ) {
     public SSTMeta {
-        if (fileId <= 0) {
-            throw new IllegalArgumentException("fileId must be positive");
+        if (runId <= 0) {
+            throw new IllegalArgumentException("runId must be positive");
+        }
+        if (minFlushId <= 0 || maxFlushId <= 0 || minFlushId > maxFlushId) {
+            throw new IllegalArgumentException("invalid flush bounds");
         }
         if (path == null) {
             throw new NullPointerException("path must not be null");
@@ -45,7 +50,9 @@ public record SSTMeta(
 
     public SSTMeta withPathAndState(Path path, SSTState state) {
         return new SSTMeta(
-            fileId,
+            runId,
+            minFlushId,
+            maxFlushId,
             path,
             fileSize,
             entryCount,

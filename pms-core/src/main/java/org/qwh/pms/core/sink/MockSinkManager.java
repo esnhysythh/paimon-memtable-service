@@ -11,7 +11,7 @@ public class MockSinkManager implements SinkManager {
 
     @Override
     public PreparedSinkCommit prepare(SinkBatch batch) {
-        List<Long> sstIds = batch.ssts().stream().map(SSTMeta::fileId).toList();
+        List<Long> sstIds = batch.ssts().stream().map(SSTMeta::runId).toList();
         long inputRecordCount = batch.ssts().stream().mapToLong(SSTMeta::entryCount).sum();
         byte[] payload = ("mock-paimon-commit:" + batch.batchId()).getBytes(StandardCharsets.UTF_8);
         return new PreparedSinkCommit(
