@@ -44,20 +44,24 @@ final class BlockReaders {
             int valueLen = StorageCoding.readIntLE(header, 8);
             byte[] keyBytes = reconstructKey(previousKey, shared, readBytes(in, unshared));
             Key key = new Key(keyBytes);
+            int cmp = key.compareTo(target);
             if (valueLen == SSTFormat.VALUE_LEN_DELETE) {
-                if (key.compareTo(target) == 0) {
+                if (cmp == 0) {
                     return Optional.of(Value.tombstone(sequenceId));
                 }
             } else {
                 if (valueLen < 0) {
                     throw new IllegalArgumentException("invalid valueLen: " + valueLen);
                 }
-                byte[] value = readBytes(in, valueLen);
-                if (key.compareTo(target) == 0) {
+                if (cmp == 0) {
+                    byte[] value = readBytes(in, valueLen);
                     return Optional.of(new Value(value, sequenceId));
                 }
+                if (cmp < 0) {
+                    skipBytes(in, valueLen);
+                }
             }
-            if (key.compareTo(target) > 0) {
+            if (cmp > 0) {
                 return Optional.empty();
             }
             previousKey = keyBytes;
@@ -134,6 +138,16 @@ final class BlockReaders {
             throw new IllegalArgumentException("truncated block entry");
         }
         return data;
+    }
+
+    private static void skipBytes(ByteArrayInputStream in, int length) {
+        if (length < 0 || in.available() < length) {
+            throw new IllegalArgumentException("truncated block entry");
+        }
+        long skipped = in.skip(length);
+        if (skipped != length) {
+            throw new IllegalArgumentException("truncated block entry");
+        }
     }
 
     record IndexEntry(Key key, BlockHandle handle) {}

@@ -3,12 +3,16 @@ package org.qwh.pms.core.storage;
 import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.memtable.model.Entry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
@@ -16,51 +20,76 @@ import java.util.List;
 import java.util.Optional;
 import java.util.zip.CRC32;
 
-final class SSTReader {
+final class SSTReader implements AutoCloseable {
+    private static final Logger LOG = LoggerFactory.getLogger(SSTReader.class);
+
     private final SSTMeta meta;
     private final BlockHandle bloomHandle;
     private final BlockHandle indexHandle;
     private final BlockHandle propertiesHandle;
     private final BloomFilter bloomFilter;
     private final List<BlockReaders.IndexEntry> indexEntries;
+    private final FileChannel channel;
 
     private SSTReader(SSTMeta meta, BlockHandle bloomHandle, BlockHandle indexHandle, BlockHandle propertiesHandle,
-                      BloomFilter bloomFilter, List<BlockReaders.IndexEntry> indexEntries) {
+                      BloomFilter bloomFilter, List<BlockReaders.IndexEntry> indexEntries, FileChannel channel) {
         this.meta = meta;
         this.bloomHandle = bloomHandle;
         this.indexHandle = indexHandle;
         this.propertiesHandle = propertiesHandle;
         this.bloomFilter = bloomFilter;
         this.indexEntries = indexEntries;
+        this.channel = channel;
     }
 
     static SSTReader open(SSTMeta meta) throws IOException {
-        Footer footer = readFooter(meta.path());
-        verifyFullFileCrc(meta.path(), footer.expectedCrc32);
-        return openVerified(meta, footer);
+        FileChannel channel = FileChannel.open(meta.path(), StandardOpenOption.READ);
+        boolean success = false;
+        try {
+            Footer footer = readFooter(meta.path(), channel);
+            verifyFullFileCrc(meta.path(), channel, footer.expectedCrc32);
+            SSTReader reader = openVerified(meta, footer, channel);
+            success = true;
+            return reader;
+        } finally {
+            if (!success) {
+                channel.close();
+            }
+        }
     }
 
     static SSTReader open(Path path, SSTState state) throws IOException {
-        Footer footer = readFooter(path);
-        verifyFullFileCrc(path, footer.expectedCrc32);
-        SSTMeta meta = readMeta(path, state, footer);
-        return openVerified(meta, footer);
+        FileChannel channel = FileChannel.open(path, StandardOpenOption.READ);
+        boolean success = false;
+        try {
+            Footer footer = readFooter(path, channel);
+            verifyFullFileCrc(path, channel, footer.expectedCrc32);
+            SSTMeta meta = readMeta(path, state, footer, channel);
+            SSTReader reader = openVerified(meta, footer, channel);
+            success = true;
+            return reader;
+        } finally {
+            if (!success) {
+                channel.close();
+            }
+        }
     }
 
     SSTMeta meta() {
         return meta;
     }
 
-    private static SSTReader openVerified(SSTMeta meta, Footer footer) throws IOException {
-        byte[] bloomBlock = readBlock(meta.path(), footer.bloomHandle);
-        byte[] indexBlock = readBlock(meta.path(), footer.indexHandle);
+    private static SSTReader openVerified(SSTMeta meta, Footer footer, FileChannel channel) throws IOException {
+        byte[] bloomBlock = readBlock(meta.path(), channel, footer.bloomHandle);
+        byte[] indexBlock = readBlock(meta.path(), channel, footer.indexHandle);
         return new SSTReader(
             meta,
             footer.bloomHandle,
             footer.indexHandle,
             footer.propertiesHandle,
             BloomFilter.decode(bloomBlock),
-            BlockReaders.readIndexBlock(indexBlock)
+            BlockReaders.readIndexBlock(indexBlock),
+            channel
         );
     }
 
@@ -78,7 +107,7 @@ final class SSTReader {
         if (handle == null) {
             return Optional.empty();
         }
-        return BlockReaders.findInDataBlock(readBlock(meta.path(), handle), key);
+        return BlockReaders.findInDataBlock(readBlock(meta.path(), channel, handle), key);
     }
 
     SSTEntryIterator iterator() {
@@ -118,13 +147,15 @@ final class SSTReader {
     }
 
     static SSTMeta readMeta(Path path, SSTState state) throws IOException {
-        Footer footer = readFooter(path);
-        verifyFullFileCrc(path, footer.expectedCrc32);
-        return readMeta(path, state, footer);
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            Footer footer = readFooter(path, channel);
+            verifyFullFileCrc(path, channel, footer.expectedCrc32);
+            return readMeta(path, state, footer, channel);
+        }
     }
 
-    private static SSTMeta readMeta(Path path, SSTState state, Footer footer) throws IOException {
-        byte[] properties = readBlock(path, footer.propertiesHandle);
+    private static SSTMeta readMeta(Path path, SSTState state, Footer footer, FileChannel channel) throws IOException {
+        byte[] properties = readBlock(path, channel, footer.propertiesHandle);
         ByteArrayInputStream in = new ByteArrayInputStream(properties);
         byte[] header = StorageCoding.readExact(in, 4 + 8 + 4);
         int version = StorageCoding.readIntLE(header, 0);
@@ -186,65 +217,87 @@ final class SSTReader {
         return entryCount == 0 ? null : new Key(bytes);
     }
 
-    private static Footer readFooter(Path path) throws IOException {
-        long size = Files.size(path);
+    private static Footer readFooter(Path path, FileChannel channel) throws IOException {
+        long size = channel.size();
         if (size < SSTFormat.FOOTER_SIZE) {
             throw new IllegalArgumentException("SST file is too small: " + path);
         }
-        try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "r")) {
-            file.seek(size - SSTFormat.FOOTER_SIZE);
-            byte[] footer = new byte[SSTFormat.FOOTER_SIZE];
-            file.readFully(footer);
-            byte[] magic = Arrays.copyOfRange(footer, 0, SSTFormat.MAGIC.length);
-            if (!Arrays.equals(magic, SSTFormat.MAGIC)) {
-                throw new IllegalArgumentException("bad SST magic: " + path);
-            }
-            int version = StorageCoding.readIntLE(footer, 8);
-            if (version != SSTFormat.VERSION) {
-                throw new IllegalArgumentException("Unsupported SST version: " + version);
-            }
-            int offset = 12;
-            BlockHandle bloomHandle = StorageCoding.decodeHandle(footer, offset);
-            offset += BlockHandle.MAX_ENCODED_LENGTH;
-            BlockHandle indexHandle = StorageCoding.decodeHandle(footer, offset);
-            offset += BlockHandle.MAX_ENCODED_LENGTH;
-            BlockHandle propertiesHandle = StorageCoding.decodeHandle(footer, offset);
-            offset += BlockHandle.MAX_ENCODED_LENGTH;
-            int crc32 = StorageCoding.readIntLE(footer, offset);
-            return new Footer(bloomHandle, indexHandle, propertiesHandle, crc32);
+        byte[] footer = readFully(path, channel, size - SSTFormat.FOOTER_SIZE, SSTFormat.FOOTER_SIZE);
+        byte[] magic = Arrays.copyOfRange(footer, 0, SSTFormat.MAGIC.length);
+        if (!Arrays.equals(magic, SSTFormat.MAGIC)) {
+            throw new IllegalArgumentException("bad SST magic: " + path);
         }
+        int version = StorageCoding.readIntLE(footer, 8);
+        if (version != SSTFormat.VERSION) {
+            throw new IllegalArgumentException("Unsupported SST version: " + version);
+        }
+        int offset = 12;
+        BlockHandle bloomHandle = StorageCoding.decodeHandle(footer, offset);
+        offset += BlockHandle.MAX_ENCODED_LENGTH;
+        BlockHandle indexHandle = StorageCoding.decodeHandle(footer, offset);
+        offset += BlockHandle.MAX_ENCODED_LENGTH;
+        BlockHandle propertiesHandle = StorageCoding.decodeHandle(footer, offset);
+        offset += BlockHandle.MAX_ENCODED_LENGTH;
+        int crc32 = StorageCoding.readIntLE(footer, offset);
+        return new Footer(bloomHandle, indexHandle, propertiesHandle, crc32);
     }
 
-    private static byte[] readBlock(Path path, BlockHandle handle) throws IOException {
+    private static byte[] readBlock(Path path, FileChannel channel, BlockHandle handle) throws IOException {
         if (handle.size() > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("block too large: " + handle.size());
         }
-        try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "r")) {
-            file.seek(handle.offset());
-            byte[] data = new byte[(int) handle.size()];
-            file.readFully(data);
-            return data;
-        }
+        return readFully(path, channel, handle.offset(), (int) handle.size());
     }
 
-    private static void verifyFullFileCrc(Path path, int expected) throws IOException {
-        long size = Files.size(path);
+    private static byte[] readFully(Path path, FileChannel channel, long position, int size) throws IOException {
+        byte[] data = new byte[size];
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        long offset = position;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, offset);
+            if (read < 0) {
+                throw new IOException("unexpected EOF while reading SST: " + path);
+            }
+            if (read == 0) {
+                throw new IOException("zero-byte read while reading SST: " + path);
+            }
+            offset += read;
+        }
+        return data;
+    }
+
+    private static void verifyFullFileCrc(Path path, FileChannel channel, int expected) throws IOException {
+        long size = channel.size();
         long dataLength = size - SSTFormat.FOOTER_SIZE;
         CRC32 crc = new CRC32();
-        try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "r")) {
-            byte[] buffer = new byte[8192];
-            long remaining = dataLength;
-            while (remaining > 0) {
-                int read = file.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-                if (read < 0) {
-                    throw new IOException("unexpected EOF while verifying SST CRC");
-                }
-                crc.update(buffer, 0, read);
-                remaining -= read;
+        ByteBuffer buffer = ByteBuffer.allocate(8192);
+        long position = 0;
+        long remaining = dataLength;
+        while (remaining > 0) {
+            buffer.clear();
+            buffer.limit((int) Math.min(buffer.capacity(), remaining));
+            int read = channel.read(buffer, position);
+            if (read < 0) {
+                throw new IOException("unexpected EOF while verifying SST CRC");
             }
+            if (read == 0) {
+                throw new IOException("zero-byte read while verifying SST CRC");
+            }
+            crc.update(buffer.array(), 0, read);
+            position += read;
+            remaining -= read;
         }
         if ((int) crc.getValue() != expected) {
             throw new IllegalArgumentException("SST full-file CRC mismatch: " + path);
+        }
+    }
+
+    @Override
+    public void close() {
+        try {
+            channel.close();
+        } catch (IOException e) {
+            LOG.warn("close SST reader channel failed: {}", meta.path(), e);
         }
     }
 
@@ -309,7 +362,7 @@ final class SSTReader {
             while (!current.hasNext() && blockIndex < indexEntries.size()) {
                 BlockHandle handle = indexEntries.get(blockIndex++).handle();
                 try {
-                    current = BlockReaders.readDataBlockEntries(readBlock(meta.path(), handle)).iterator();
+                    current = BlockReaders.readDataBlockEntries(readBlock(meta.path(), channel, handle)).iterator();
                 } catch (IOException e) {
                     throw new RuntimeException("SST iteration failed: " + meta.path(), e);
                 }

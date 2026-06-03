@@ -459,6 +459,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             if (closed) return;
             closed = true;
             walManager.close();
+            storageManager.close();
         } finally {
             lifecycleLock.writeLock().unlock();
         }

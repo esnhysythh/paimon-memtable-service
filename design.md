@@ -120,6 +120,7 @@ flink-connector -> pms-client
 | [pms-primary-key-codec.md](docs/pms-primary-key-codec.md) | PMS primary key ordered byte layout、TiDB mem-comparable 对照、前缀扫描规则 |
 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) | Sequence、写入边界、锁粒度与 WAL 优化设计说明 |
 | [pms-core-statistic.md](docs/pms-core-statistic.md) | 可观测性基础设施（待详细设计） |
+| [pms-benchmark.md](docs/pms-benchmark.md) | PMS benchmark 分层、pms-core db_bench-like 基准设计 |
 | [pms-server.md](docs/pms-server.md) | 服务端外壳 |
 | [pms-client.md](docs/pms-client.md) | 客户端 SDK |
 | [flink-connector-pms.md](docs/flink-connector-pms.md) | Flink Connector |
