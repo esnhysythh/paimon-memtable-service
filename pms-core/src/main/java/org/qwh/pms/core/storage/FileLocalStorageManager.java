@@ -32,7 +32,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     private final FlushBoundaryStore flushBoundaryStore;
     private final SSTMetaStore sstMetaStore;
     private final ConcurrentSkipListMap<Long, SSTMeta> metas = new ConcurrentSkipListMap<>();
-    private final ConcurrentHashMap<Long, ReaderHolder> readers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, SSTReaderRef> readers = new ConcurrentHashMap<>();
     private final AtomicLong nextRunId = new AtomicLong(1);
     private final AtomicLong nextFlushId = new AtomicLong(1);
     private long lastFlushedSequenceId;
@@ -91,7 +91,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
         for (SSTMeta meta : reconcileVisibleMetas(recoveredMetas)) {
             putVisibleMeta(meta);
-            readers.put(meta.runId(), new ReaderHolder(SSTReader.open(meta)));
+            readers.put(meta.runId(), new SSTReaderRef(SSTReader.open(meta)));
         }
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "sst-*.sst")) {
             for (Path path : stream) {
@@ -129,7 +129,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     public synchronized void close() {
-        for (ReaderHolder holder : readers.values()) {
+        for (SSTReaderRef holder : readers.values()) {
             holder.retire(null);
         }
         readers.clear();
@@ -196,7 +196,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
             ).write(nextRunId.getAndIncrement(), flushId, memTable);
             sstMetaStore.save(meta);
             putVisibleMeta(meta);
-            readers.put(meta.runId(), new ReaderHolder(SSTReader.open(meta)));
+            readers.put(meta.runId(), new SSTReaderRef(SSTReader.open(meta)));
             return meta;
         } catch (IOException e) {
             throw new RuntimeException("flush to SST failed", e);
@@ -205,7 +205,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
 
     @Override
     public Optional<Value> get(SSTMeta meta, Key key) {
-        try (ReaderLease lease = acquireReader(meta)) {
+        try (SSTReaderLease lease = acquireReader(meta)) {
             return lease.reader().get(key);
         } catch (IOException e) {
             throw new RuntimeException("SST read failed: " + meta.path(), e);
@@ -215,7 +215,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     @Override
     public SSTEntryIterator openIterator(SSTMeta meta) {
         try {
-            ReaderLease lease = acquireReader(meta);
+            SSTReaderLease lease = acquireReader(meta);
             return new LeasedSSTEntryIterator(lease.reader().iterator(), lease);
         } catch (IOException e) {
             throw new RuntimeException("SST iterator open failed: " + meta.path(), e);
@@ -225,7 +225,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     @Override
     public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
         try {
-            ReaderLease lease = acquireReader(meta);
+            SSTReaderLease lease = acquireReader(meta);
             return new LeasedSSTEntryIterator(lease.reader().iterator(startInclusive, endExclusive), lease);
         } catch (IOException e) {
             throw new RuntimeException("SST range iterator open failed: " + meta.path(), e);
@@ -274,7 +274,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
                     retireReader(input.runId(), () -> deleteSSTDataFileQuietly(input));
                 }
                 putVisibleMeta(output);
-                readers.put(output.runId(), new ReaderHolder(SSTReader.open(output)));
+                readers.put(output.runId(), new SSTReaderRef(SSTReader.open(output)));
                 for (SSTMeta input : inputs) {
                     deleteSSTMetadata(input);
                 }
@@ -353,12 +353,12 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
     }
 
-    private ReaderLease acquireReader(SSTMeta meta) throws IOException {
+    private SSTReaderLease acquireReader(SSTMeta meta) throws IOException {
         while (true) {
             SSTMeta effectiveMeta = metas.getOrDefault(meta.runId(), meta);
-            ReaderHolder holder = readers.get(effectiveMeta.runId());
+            SSTReaderRef holder = readers.get(effectiveMeta.runId());
             if (holder != null && holder.matches(effectiveMeta)) {
-                ReaderLease lease = holder.acquire();
+                SSTReaderLease lease = holder.acquire();
                 if (lease != null) {
                     return lease;
                 }
@@ -367,14 +367,14 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 effectiveMeta = metas.getOrDefault(meta.runId(), meta);
                 holder = readers.get(effectiveMeta.runId());
                 if (holder != null && holder.matches(effectiveMeta)) {
-                    ReaderLease lease = holder.acquire();
+                    SSTReaderLease lease = holder.acquire();
                     if (lease != null) {
                         return lease;
                     }
                 }
-                holder = new ReaderHolder(SSTReader.open(effectiveMeta));
+                holder = new SSTReaderRef(SSTReader.open(effectiveMeta));
                 readers.put(effectiveMeta.runId(), holder);
-                ReaderLease lease = holder.acquire();
+                SSTReaderLease lease = holder.acquire();
                 if (lease == null) {
                     throw new IOException("SST reader retired before acquire: " + effectiveMeta.path());
                 }
@@ -384,7 +384,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     private void retireReader(long runId, Runnable cleanup) {
-        ReaderHolder holder = readers.remove(runId);
+        SSTReaderRef holder = readers.remove(runId);
         if (holder != null) {
             holder.retire(cleanup);
         } else if (cleanup != null) {
@@ -392,26 +392,30 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
     }
 
-    private static final class ReaderHolder {
+    private static final class SSTReaderRef {
         private final SSTReader reader;
         private int leases;
         private boolean retired;
         private Runnable cleanup;
 
-        private ReaderHolder(SSTReader reader) {
+        private SSTReaderRef(SSTReader reader) {
             this.reader = reader;
+        }
+
+        private SSTReader reader() {
+            return reader;
         }
 
         private boolean matches(SSTMeta meta) {
             return reader.meta().path().equals(meta.path());
         }
 
-        private synchronized ReaderLease acquire() {
+        private synchronized SSTReaderLease acquire() {
             if (retired) {
                 return null;
             }
             leases++;
-            return new ReaderLease(this, reader);
+            return new SSTReaderLease(this);
         }
 
         private void retire(Runnable cleanup) {
@@ -468,18 +472,16 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
     }
 
-    private static final class ReaderLease implements AutoCloseable {
-        private final ReaderHolder holder;
-        private final SSTReader reader;
+    private static final class SSTReaderLease implements AutoCloseable {
+        private final SSTReaderRef ref;
         private boolean closed;
 
-        private ReaderLease(ReaderHolder holder, SSTReader reader) {
-            this.holder = holder;
-            this.reader = reader;
+        private SSTReaderLease(SSTReaderRef ref) {
+            this.ref = ref;
         }
 
         private SSTReader reader() {
-            return reader;
+            return ref.reader();
         }
 
         @Override
@@ -488,16 +490,16 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 return;
             }
             closed = true;
-            holder.release();
+            ref.release();
         }
     }
 
     private static final class LeasedSSTEntryIterator implements SSTEntryIterator {
         private final SSTEntryIterator delegate;
-        private final ReaderLease lease;
+        private final SSTReaderLease lease;
         private boolean closed;
 
-        private LeasedSSTEntryIterator(SSTEntryIterator delegate, ReaderLease lease) {
+        private LeasedSSTEntryIterator(SSTEntryIterator delegate, SSTReaderLease lease) {
             this.delegate = delegate;
             this.lease = lease;
         }
