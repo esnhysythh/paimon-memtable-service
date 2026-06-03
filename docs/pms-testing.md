@@ -87,3 +87,12 @@ class PMSTestCluster implements AutoCloseable {
     void killPMS();  // 模拟进程崩溃
 }
 ```
+
+---
+
+## 4. Benchmark
+
+性能验证不放入常规单元/集成测试链路, 独立由 `pms-benchmark` 模块承载. 第一阶段先实现 `pms-core`
+的 db_bench-like macro benchmark, 直接调用内部 byte-oriented API, 用于建立 PMS 本地 LSM/KV 能力基线.
+
+详细说明见 [pms-benchmark.md](pms-benchmark.md)。

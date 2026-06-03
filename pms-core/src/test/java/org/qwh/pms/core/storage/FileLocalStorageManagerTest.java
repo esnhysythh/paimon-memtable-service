@@ -107,6 +107,30 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void openIteratorKeepsReaderAliveUntilClosed() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable(
+            "k1", "v1".getBytes(), 1L,
+            "k2", "v2".getBytes(), 2L
+        ));
+
+        List<String> keys = new ArrayList<>();
+        try (SSTEntryIterator iterator = storage.openIterator(meta)) {
+            storage.deleteSST(meta);
+
+            assertTrue(storage.metas().isEmpty());
+            assertTrue(Files.exists(meta.path()));
+            while (iterator.hasNext()) {
+                keys.add(new String(iterator.next().key().bytes()));
+            }
+        }
+
+        assertEquals(List.of("k1", "k2"), keys);
+        assertFalse(Files.exists(meta.path()));
+        assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+    }
+
+    @Test
     void rangeIteratorScansOnlyRequestedKeyRange() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable(
@@ -307,8 +331,8 @@ class FileLocalStorageManagerTest {
         assertEquals(2L, compacted.maxFlushId());
         assertEquals(3L, compacted.entryCount());
         assertTrue(Files.exists(tempDir.resolve("sst-000001-000002.new.sst")));
-        assertTrue(Files.exists(first.path()));
-        assertTrue(Files.exists(second.path()));
+        assertFalse(Files.exists(first.path()));
+        assertFalse(Files.exists(second.path()));
         assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
         assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
         assertArrayEquals("new-a".getBytes(), storage.get(compacted, new Key("a".getBytes())).orElseThrow().bytes());
@@ -321,15 +345,39 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void compactDelaysInputSstDataFileDeletionUntilIteratorLeaseCloses() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable("a", "old-a".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("b", "old-b".getBytes(), 2L));
+
+        try (SSTEntryIterator iterator = storage.openIterator(first)) {
+            storage.compactSSTs(List.of(first, second));
+
+            assertTrue(Files.exists(first.path()));
+            assertFalse(Files.exists(second.path()));
+            assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+            assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
+            assertTrue(iterator.hasNext());
+            assertEquals("a", new String(iterator.next().key().bytes()));
+        }
+
+        assertFalse(Files.exists(first.path()));
+    }
+
+    @Test
     void initPrefersCompactedMetaWhenInputMetasRemainAfterCrash() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta first = storage.flushToSST(immutable("a", "old-a".getBytes(), 1L));
         SSTMeta second = storage.flushToSST(immutable("a", "new-a".getBytes(), 2L));
+        byte[] firstData = Files.readAllBytes(first.path());
+        byte[] secondData = Files.readAllBytes(second.path());
         storage.persistFlushedSequenceId(second.maxSequenceId());
 
         SSTMeta compacted = storage.compactSSTs(List.of(first, second));
         SSTMetaStore metaStore = new SSTMetaStore(tempDir);
         metaStore.init();
+        Files.write(first.path(), firstData);
+        Files.write(second.path(), secondData);
         metaStore.save(first);
         metaStore.save(second);
 
