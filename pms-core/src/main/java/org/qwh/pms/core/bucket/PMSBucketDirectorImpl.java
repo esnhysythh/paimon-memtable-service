@@ -18,6 +18,7 @@ import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.sink.SinkRecoveryState;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.core.storage.SSTMeta;
+import org.qwh.pms.core.storage.SSTReadSnapshot;
 import org.qwh.pms.core.storage.SSTState;
 import org.qwh.pms.core.wal.ReplayCallback;
 import org.qwh.pms.core.wal.WALManagerImpl;
@@ -51,9 +52,9 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private final SinkCoordinator sinkCoordinator;
 
     private volatile CurMemTable curMemTable;
-    private volatile List<ImmutableMemTable> immutableMemTables = new ArrayList<>();
-    private volatile List<SSTMeta> newSSTs = new ArrayList<>();
-    private volatile List<SSTMeta> sinkedSSTs = new ArrayList<>();
+    private volatile List<ImmutableMemTable> immutableMemTables = List.of();
+    private volatile List<SSTMeta> newSSTs = List.of();
+    private volatile List<SSTMeta> sinkedSSTs = List.of();
     private volatile long lastSinkedSnapshotId;
     private volatile RecoverySummary lastRecoverySummary = RecoverySummary.empty();
 
@@ -210,11 +211,15 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 }
             }
 
-            Optional<Value> newSSTValue = lookupSSTs(newSSTs, k);
-            if (newSSTValue.isPresent()) {
-                return newSSTValue;
+            try (SSTReadSnapshot newSSTSnapshot = acquireNewSSTSnapshot()) {
+                Optional<Value> newSSTValue = lookupSSTs(newSSTSnapshot, k);
+                if (newSSTValue.isPresent()) {
+                    return newSSTValue;
+                }
             }
-            return lookupSSTs(sinkedSSTs, k);
+            try (SSTReadSnapshot sinkedSSTSnapshot = acquireSinkedSSTSnapshot()) {
+                return lookupSSTs(sinkedSSTSnapshot, k);
+            }
         } finally {
             lifecycleLock.readLock().unlock();
         }
@@ -241,8 +246,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 collectLatest(latest, immutable.iterator(start, end));
             }
 
-            collectLatestFromSSTs(latest, newSSTs, start, end);
-            collectLatestFromSSTs(latest, sinkedSSTs, start, end);
+            try (SSTSnapshotPair snapshots = acquireSSTSnapshotPair()) {
+                collectLatestFromSSTs(latest, snapshots.newSSTs(), start, end);
+                collectLatestFromSSTs(latest, snapshots.sinkedSSTs(), start, end);
+            }
 
             List<Entry> result = new ArrayList<>();
             for (Map.Entry<Key, Value> entry : latest.entrySet()) {
@@ -300,11 +307,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             synchronized (writeMutex) {
                 List<ImmutableMemTable> immutableList = new ArrayList<>(immutableMemTables);
                 immutableList.remove(toFlush);
-                immutableMemTables = immutableList;
+                immutableMemTables = List.copyOf(immutableList);
 
                 List<SSTMeta> sstList = new ArrayList<>(newSSTs);
                 sstList.add(meta);
-                newSSTs = sstList;
+                newSSTs = List.copyOf(sstList);
                 LOG.debug("Flush: immutable count={}, newSST count={}", immutableList.size(), sstList.size());
             }
         } finally {
@@ -465,9 +472,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
-    private Optional<Value> lookupSSTs(List<SSTMeta> ssts, Key key) {
+    private Optional<Value> lookupSSTs(SSTReadSnapshot snapshot, Key key) {
+        List<SSTMeta> ssts = snapshot.metas();
         for (int i = ssts.size() - 1; i >= 0; i--) {
-            Optional<Value> result = storageManager.get(ssts.get(i), key);
+            Optional<Value> result = snapshot.get(ssts.get(i), key);
             if (result.isPresent()) {
                 return result;
             }
@@ -475,10 +483,39 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return Optional.empty();
     }
 
-    private void collectLatestFromSSTs(TreeMap<Key, Value> latest, List<SSTMeta> ssts, Key start, Optional<Key> end) {
-        for (SSTMeta sst : ssts) {
-            try (var iterator = storageManager.openIterator(sst, start, end)) {
+    private void collectLatestFromSSTs(TreeMap<Key, Value> latest, SSTReadSnapshot snapshot, Key start, Optional<Key> end) {
+        for (SSTMeta sst : snapshot.metas()) {
+            try (var iterator = snapshot.openIterator(sst, start, end)) {
                 collectLatest(latest, iterator);
+            }
+        }
+    }
+
+    private SSTReadSnapshot acquireNewSSTSnapshot() {
+        synchronized (writeMutex) {
+            return storageManager.readSnapshot(newSSTs);
+        }
+    }
+
+    private SSTReadSnapshot acquireSinkedSSTSnapshot() {
+        synchronized (writeMutex) {
+            return storageManager.readSnapshot(sinkedSSTs);
+        }
+    }
+
+    private SSTSnapshotPair acquireSSTSnapshotPair() {
+        synchronized (writeMutex) {
+            SSTReadSnapshot newSnapshot = storageManager.readSnapshot(newSSTs);
+            try {
+                SSTReadSnapshot sinkedSnapshot = storageManager.readSnapshot(sinkedSSTs);
+                return new SSTSnapshotPair(newSnapshot, sinkedSnapshot);
+            } catch (RuntimeException e) {
+                try {
+                    newSnapshot.close();
+                } catch (RuntimeException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                throw e;
             }
         }
     }
@@ -579,7 +616,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         ImmutableMemTable frozen = curMemTable.freeze();
         List<ImmutableMemTable> newList = new ArrayList<>(immutableMemTables);
         newList.add(frozen);
-        immutableMemTables = newList;
+        immutableMemTables = List.copyOf(newList);
         LOG.debug("Freeze: immutable count={}", newList.size());
     }
 
@@ -665,4 +702,29 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private record SequenceStats(long totalBytes, long minSequenceId, long maxSequenceId) {}
 
     private record SSTStats(long totalBytes, long totalRows, long minSequenceId, long maxSequenceId) {}
+
+    private record SSTSnapshotPair(SSTReadSnapshot newSSTs, SSTReadSnapshot sinkedSSTs) implements AutoCloseable {
+
+        @Override
+        public void close() {
+            RuntimeException failure = null;
+            try {
+                newSSTs.close();
+            } catch (RuntimeException e) {
+                failure = e;
+            }
+            try {
+                sinkedSSTs.close();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
 }

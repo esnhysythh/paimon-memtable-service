@@ -189,7 +189,7 @@ record SSTMeta(
 ) {}
 ```
 
-`SSTState` 初期可包含 `NEW` 和 `SINKED`；带 Mem 缓存的状态由 BucketDirector 的状态条目表达，而不是写进 SST 文件。SST 文件名可带 `flushId` range 和 `.new` / `.sinked` 标签用于人工观察，但可靠状态来源是 metadata 和 SinkMeta，而不是文件名或 Footer。
+`SSTState` 初期可包含 `NEW` 和 `SINKED`；带 Mem 缓存的状态由 BucketDirector 的状态条目表达，而不是写进 SST 文件。SST 数据文件 publish 后不再 rename, 文件名只包含稳定的 `flushId` range, 例如 `sst-000001-000001.sst`。可靠状态来源是 metadata 和 SinkMeta, 而不是文件名或 Footer。
 
 ## 10. Footer 格式
 
@@ -229,9 +229,13 @@ LevelDB 在每个 block 后追加 5 字节 trailer：
 SST 查询接口必须表达三态：
 
 ```java
-Optional<Value> get(SSTMeta meta, Key key);
-SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive);
+try (SSTReadSnapshot snapshot = storageManager.readSnapshot(ssts)) {
+    Optional<Value> value = snapshot.get(meta, key);
+    SSTEntryIterator iterator = snapshot.openIterator(meta, startInclusive, endExclusive);
+}
 ```
+
+`LocalStorageManager` 不直接暴露单 SST `get/openIterator` 作为外部读取入口；调用方必须先创建 `SSTReadSnapshot`, 再通过 snapshot 读取。snapshot 注册 read epoch, compact/evict 只能把旧 SST 放入 retired queue, 等所有可能看到旧 SST 的 snapshot 关闭后才物理删除文件。
 
 语义：
 

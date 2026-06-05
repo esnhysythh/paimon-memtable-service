@@ -20,6 +20,7 @@ import org.qwh.pms.core.sink.SinkFileRef;
 import org.qwh.pms.core.storage.LocalStorageManager;
 import org.qwh.pms.core.storage.SSTEntryIterator;
 import org.qwh.pms.core.storage.SSTMeta;
+import org.qwh.pms.core.storage.SSTReadSnapshot;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -66,8 +67,8 @@ public final class PaimonFlusher {
     }
 
     public PreparedSinkCommit prepare(SinkBatch batch) {
-        try {
-            List<SSTEntryIterator> inputs = openIterators(batch.ssts());
+        try (SSTReadSnapshot snapshot = storageManager.readSnapshot(batch.ssts())) {
+            List<SSTEntryIterator> inputs = openIterators(snapshot);
             long outputRecordCount = 0;
             List<CommitMessage> messages;
             StreamWriteBuilder builder = table.newStreamWriteBuilder().withCommitUser(commitUser);
@@ -98,11 +99,12 @@ public final class PaimonFlusher {
         }
     }
 
-    private List<SSTEntryIterator> openIterators(List<SSTMeta> ssts) {
+    private List<SSTEntryIterator> openIterators(SSTReadSnapshot snapshot) {
+        List<SSTMeta> ssts = snapshot.metas();
         List<SSTEntryIterator> inputs = new ArrayList<>(ssts.size());
         try {
             for (SSTMeta sst : ssts) {
-                inputs.add(storageManager.openIterator(sst));
+                inputs.add(snapshot.openIterator(sst));
             }
             return inputs;
         } catch (RuntimeException e) {

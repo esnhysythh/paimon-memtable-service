@@ -66,7 +66,8 @@ PMS V1 只支持 Paimon primary-key + deduplicate merge-engine 表。`PaimonSink
 
 ```text
 SinkBatch.ssts
-  -> LocalStorageManager.openIterator(...)
+  -> LocalStorageManager.readSnapshot(...)
+  -> SSTReadSnapshot.openIterator(...)
   -> PaimonSinkEntryMerger.mergeLatest(...)
   -> PaimonSinkRowConverter.toPaimonRow(...)
   -> StreamTableWrite.write(row)

@@ -55,28 +55,27 @@ record SSTMeta(
 
 ## 4. 文件命名
 
-SST 文件名主要是人类可观测标签。当前实现会解析文件名中的 `minFlushId/maxFlushId` 辅助目录扫描、孤儿文件识别和 meta 文件排序，但不能依赖文件名判断可靠业务状态。恢复和状态判断必须以 `SSTMeta` 与 SinkMeta 为准。
+SST 文件名只表达稳定的 `minFlushId/maxFlushId` 范围。当前实现会解析文件名中的范围辅助目录扫描、孤儿文件识别和 meta 文件排序，但不能依赖文件名判断可靠业务状态。恢复和状态判断必须以 `SSTMeta` 与 SinkMeta 为准。
 
 推荐文件名格式：
 
 ```text
-sst-{minFlushId}-{maxFlushId}.{new|sinked}.sst
+sst-{minFlushId}-{maxFlushId}.sst
 ```
 
 实际落盘建议使用固定宽度十进制补零，便于目录中按名称观察：
 
 ```text
-sst-000001-000001.new.sst
-sst-000002-000004.new.sst
-sst-000001-000010.sinked.sst
+sst-000001-000001.sst
+sst-000002-000004.sst
+sst-000001-000010.sst
 ```
 
 命名规则说明：
 
-- 未 compact 的 SST 使用相同的起止 flushId，例如 `sst-000010-000010.new.sst`。
-- compact 输出使用覆盖后的 flushId 范围，例如 `[11,13]` 输出为 `sst-000011-000013.new.sst`。
-- `new` / `sinked` 仍然只是观测标签；可靠状态来源不是文件名。
-- 状态迁移可以 best-effort rename，例如 `sst-000011-000013.new.sst` 改为 `sst-000011-000013.sinked.sst`。
+- 未 compact 的 SST 使用相同的起止 flushId，例如 `sst-000010-000010.sst`。
+- compact 输出使用覆盖后的 flushId 范围，例如 `[11,13]` 输出为 `sst-000011-000013.sst`。
+- `NEW` / `SINKED` 写入 `sst-*.meta.json`; 数据文件 publish 后不再因为状态迁移 rename。
 - 临时文件和未发布文件可以带 `runId`、随机后缀或 `.tmp` 后缀，避免和可见文件冲突；它们不属于可观测稳定命名。
 
 ## 5. 查询顺序
@@ -151,7 +150,7 @@ Compact 输出约束：
 
 发布 compact 结果时，应以元数据切换为准：新 run 完整落盘并写入元数据后，才替换旧 run 的可见列表。
 
-第一阶段实现为了避免并发查询仍持有旧 `SSTMeta` 时读到已删除文件，compact 发布后只删除旧 run 的 `sst-*.meta.json`，保留旧 SST 数据文件作为被 compact run 覆盖的 orphan。启动恢复时，如果一个无 meta 的 SST 文件的 flush 范围已经被可见 run 连续覆盖，则忽略该 orphan；如果 compact 输出 meta 已写入但旧输入 meta 尚未删除就崩溃，恢复时选择覆盖范围更大的 compact run。后续引入 SST 引用计数或延迟删除队列后，再安全清理这些 covered orphan 数据文件。
+当前实现通过 read epoch 避免并发查询读到已删除文件：查询、scan、sink 和 compact 读取 SST 前会创建 `SSTReadSnapshot` 并注册当前 epoch；compact 发布新 run 或 evict 移除旧 run 后, 旧 run 进入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于旧 run 的 `retireEpoch` 时, storage 才关闭旧 reader 并删除旧 data/meta 文件。启动恢复时，如果一个无 meta 的 SST 文件的 flush 范围已经被可见 run 连续覆盖，则忽略该 orphan；如果 compact 输出 meta 已写入但旧输入 meta 尚未删除就崩溃，恢复时选择覆盖范围更大的 compact run。
 
 ## 8. 淘汰规则
 
