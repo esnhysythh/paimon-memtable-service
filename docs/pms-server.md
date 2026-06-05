@@ -69,7 +69,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
    - 若本地有 prepare 但无 success：
      使用 SinkMeta 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。
    - 若存在 success：
-     通过 success.sstIds 与 persistedSequenceId 推导 sinkedSST，并 best-effort 修正文件名标签。
+     通过 success.sstIds 与 persistedSequenceId 推导 sinkedSST，并修正 SST metadata state。
 5. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程
 ```
 

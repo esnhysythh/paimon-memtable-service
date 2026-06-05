@@ -184,15 +184,9 @@ interface LocalStorageManager {
     // 将 ImmutableMemTable 刷盘为 newSST
     SSTMeta flushToSST(ImmutableMemTable memTable);
 
-    // 读取 SST 中的指定 Key:
-    // Optional.empty() = miss
-    // Optional.of(Value with bytes != null) = PUT 命中
-    // Optional.of(Value with bytes == null) = DELETE tombstone 命中
-    Optional<Value> get(SSTMeta meta, Key key);
-
-    // 打开 [startInclusive, endExclusive) 范围内的 SST 有序 iterator。
-    // endExclusive 为 Optional.empty() 时表示扫描到文件末尾。
-    SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive);
+    // 获取 SST 读快照。点查、scan 和 sink 必须通过返回的 snapshot 读取 SST。
+    // snapshot 注册 read epoch, 保护调用方已经选中的 SST 列表不被物理删除。
+    SSTReadSnapshot readSnapshot(List<SSTMeta> metas);
 
     // 多路归并合并多个 SST，保留最新 Key
     SSTMeta compactSSTs(List<SSTMeta> metas);
@@ -205,9 +199,23 @@ interface LocalStorageManager {
 }
 ```
 
+`SSTReadSnapshot` 是 SST 查询读取的唯一外部入口：
+
+```java
+interface SSTReadSnapshot extends AutoCloseable {
+    List<SSTMeta> metas();
+    Optional<Value> get(SSTMeta meta, Key key);
+    SSTEntryIterator openIterator(SSTMeta meta);
+    SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive);
+}
+```
+
+`SSTReadSnapshot` 的语义是 read epoch, 不是文件级 reader lease。创建 snapshot 时记录当前 SST 可见集合 epoch, 删除和 compact 会先从可见集合移除旧 SST, 推进 epoch, 再把旧 SST 放入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于某个 retired SST 的 `retireEpoch` 时, storage 才会关闭对应 reader 并删除 data/meta 文件。这样点查仍可按 SST 顺序按需读取并在命中后停止, 不需要提前获取列表中所有 SST 的 reader lease。
+```
+
 **SSTMeta** 至少包含 `runId`、`minFlushId/maxFlushId`、文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、createdAtMillis、状态和引用计数。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
 
-SST 文件名使用 `sst-%06d-%06d.new.sst` / `sst-%06d-%06d.sinked.sst` 表达 `minFlushId/maxFlushId` 可观察标签。文件名不是可靠状态来源；启动恢复时以 SinkMeta success 信息和 `persistedSequenceId` 推导真实状态，并 best-effort 修正文件名标签。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
+SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` 表达稳定的 `minFlushId/maxFlushId` 范围。`NEW` / `SINKED` 状态写入 `sst-*.meta.json`, 可靠状态来源是 SST metadata 和 SinkMeta success, 不是数据文件名。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
 
 **BloomFilter**：
 - 每个 SST 文件包含基于主键的 BloomFilter。
@@ -315,7 +323,7 @@ interface ReplayCallback {
 4. 通过 `SinkMetaStore` 写入 prepare metadata，包含 batch、sstIds、sequence 范围和 prepared commit 信息
 5. 调用 Paimon commit → 新 Snapshot
 6. 通过 `SinkMetaStore` 写入 success metadata，包含 batch、snapshotId、persistedSequenceId 和 sstIds
-7. BucketDirector 根据 SinkMeta success 将对应 SST 视为 sinked，并 best-effort rename 文件名标签
+7. BucketDirector 根据 SinkMeta success 将对应 SST 视为 sinked，并更新 SST metadata
 ```
 
 **接口**：
@@ -496,7 +504,7 @@ RecoveryManager 启动
    └───────────────────────────────────────────────────────┘
         │
         ▼
-5. 根据 SinkMeta success 修正 SST 状态和文件名标签
+5. 根据 SinkMeta success 修正 SST metadata 状态
         │
         ▼
 6. 恢复完毕，启动 RPC 和后台任务

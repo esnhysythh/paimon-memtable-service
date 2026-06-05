@@ -7,7 +7,7 @@
 - 数据变更写入 WAL 的 `DATA` 记录。
 - Sink Paimon 的 prepare/success 也写入 WAL。
 - Flush SST 的本地恢复边界写入 `storage/flush-boundary.meta`。
-- SST 是否已经 sinked 由 WAL 中的 success metadata 推导，文件名只做 best-effort 修正。
+- SST 是否已经 sinked 由 success metadata 推导，并写回 SST metadata state。
 
 这套实现可以工作，但职责边界不够清晰：WAL 既是数据日志，又承载部分后台状态机；Flush 和 Sink 同样是后台物化进度，却分别使用不同持久化方式。V1 的新恢复模型把这些信息整理为更容易解释、测试和人工排障的结构。
 
@@ -26,7 +26,7 @@ SinkMeta  = Paimon prepare/commit 进度与外部持久化边界
 - WAL 只记录数据变更，不再记录 flush/sink 控制事件。
 - Flush SST 与 Sink Paimon 都通过独立、可读、可校验、原子更新的 metadata 文件记录恢复所需信息。
 - WAL 截断以 `SinkMeta.success.persistedSequenceId` 为主边界，而不是以 Paimon `snapshotId` 为主边界。
-- 文件名可以保留 `.new` / `.sinked` 等人工可观察标签，但可靠状态来源必须是 metadata，而不是文件名。
+- SST 数据文件名 publish 后保持稳定，不包含 `NEW` / `SINKED` 状态；可靠状态来源必须是 metadata，而不是文件名。
 
 该选择的理由：
 
@@ -104,9 +104,9 @@ SSTMeta 负责回答：
 
 ```text
 storage/
-  sst-000001-000001.new.sst
+  sst-000001-000001.sst
   sst-000001-000001.meta.json
-  sst-000002-000004.sinked.sst
+  sst-000002-000004.sst
   sst-000002-000004.meta.json
   flush-boundary.meta
 ```
@@ -127,7 +127,7 @@ storage/
   "runId": 1,
   "minFlushId": 1,
   "maxFlushId": 1,
-  "sstFile": "sst-000001-000001.new.sst",
+  "sstFile": "sst-000001-000001.sst",
   "state": "NEW",
   "fileSize": 12345,
   "entryCount": 1000,
@@ -145,7 +145,7 @@ storage/
 
 - `state` 初期包含 `NEW` / `SINKED`。
 - `runId` 是物理唯一标识，只用于 reader cache、删除和排障；逻辑新旧顺序由 `minFlushId/maxFlushId` 表达。
-- `sstFile` 是当前 SST 文件名；恢复时如果文件名标签与 meta 暂时不一致，会按 `minFlushId/maxFlushId` 查找实际存在的 `.new.sst` / `.sinked.sst`，随后由 SinkMeta success 修正。
+- `sstFile` 是稳定 SST 数据文件名；恢复时按 `minFlushId/maxFlushId` 查找实际存在的 SST 文件，并由 SinkMeta success 修正 metadata 中的 `state`。
 - `minKeyBase64/maxKeyBase64` 保持 JSON 可读结构，同时避免二进制 key 破坏文本格式。
 - SST 数据文件完整性仍由 SST footer 中的 full-file CRC 校验；启动时还会对比 `.meta.json` 与 SST properties 中的关键字段。
 - `metaCrc32` 覆盖 metadata 中除自身外的稳定字段，用于发现半写或人工误改。
@@ -155,9 +155,9 @@ storage/
 Flush 必须保持以下顺序：
 
 ```text
-1. 写 sst-000001-000001.new.sst.tmp
+1. 写 sst-000001-000001.sst.tmp
 2. force SST 文件内容
-3. atomic rename -> sst-000001-000001.new.sst
+3. atomic rename -> sst-000001-000001.sst
 4. force storage directory
 5. 写 sst-000001-000001.meta.json.tmp
 6. force meta 文件内容
@@ -327,7 +327,7 @@ Sink 必须保持以下顺序：
 
 6. 修正本地 SST 状态
    - 根据 success.sstIds 和 persistedSequenceId 将 SSTMeta state 更新为 SINKED
-   - 文件名标签只做 best-effort 修正
+   - SST 数据文件名保持不变
 
 7. 启动服务和后台任务
 ```

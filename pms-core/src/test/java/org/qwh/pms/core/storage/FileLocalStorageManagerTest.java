@@ -43,6 +43,12 @@ class FileLocalStorageManagerTest {
         return cur.freeze();
     }
 
+    private Optional<Value> get(FileLocalStorageManager storage, SSTMeta meta, String key) {
+        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(meta))) {
+            return leases.get(meta, new Key(key.getBytes()));
+        }
+    }
+
     @Test
     void flushAndReadPut() throws IOException {
         FileLocalStorageManager storage = storage();
@@ -52,7 +58,7 @@ class FileLocalStorageManagerTest {
         );
 
         SSTMeta meta = storage.flushToSST(memTable);
-        Optional<Value> value = storage.get(meta, new Key("k2".getBytes()));
+        Optional<Value> value = get(storage, meta, "k2");
 
         assertTrue(value.isPresent());
         assertFalse(value.get().isTombstone());
@@ -65,7 +71,7 @@ class FileLocalStorageManagerTest {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
 
-        assertTrue(storage.get(meta, new Key("missing".getBytes())).isEmpty());
+        assertTrue(get(storage, meta, "missing").isEmpty());
     }
 
     @Test
@@ -73,7 +79,7 @@ class FileLocalStorageManagerTest {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable("k1", null, 7L));
 
-        Optional<Value> value = storage.get(meta, new Key("k1".getBytes()));
+        Optional<Value> value = get(storage, meta, "k1");
 
         assertTrue(value.isPresent());
         assertTrue(value.get().isTombstone());
@@ -92,7 +98,8 @@ class FileLocalStorageManagerTest {
         List<String> keys = new ArrayList<>();
         List<Long> sequences = new ArrayList<>();
         List<Boolean> tombstones = new ArrayList<>();
-        try (SSTEntryIterator iterator = storage.openIterator(meta)) {
+        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(meta))) {
+            SSTEntryIterator iterator = leases.openIterator(meta);
             while (iterator.hasNext()) {
                 var entry = iterator.next();
                 keys.add(new String(entry.key().bytes()));
@@ -115,11 +122,12 @@ class FileLocalStorageManagerTest {
         ));
 
         List<String> keys = new ArrayList<>();
-        try (SSTEntryIterator iterator = storage.openIterator(meta)) {
+        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(meta))) {
             storage.deleteSST(meta);
 
             assertTrue(storage.metas().isEmpty());
             assertTrue(Files.exists(meta.path()));
+            SSTEntryIterator iterator = leases.openIterator(meta);
             while (iterator.hasNext()) {
                 keys.add(new String(iterator.next().key().bytes()));
             }
@@ -128,6 +136,35 @@ class FileLocalStorageManagerTest {
         assertEquals(List.of("k1", "k2"), keys);
         assertFalse(Files.exists(meta.path()));
         assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+    }
+
+    @Test
+    void readSnapshotKeepsAllReadersAliveUntilClosed() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+
+        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(first, second))) {
+            storage.deleteSST(first);
+            storage.deleteSST(second);
+
+            assertTrue(storage.metas().isEmpty());
+            assertTrue(Files.exists(first.path()));
+            assertTrue(Files.exists(second.path()));
+            assertArrayEquals(
+                "v1".getBytes(),
+                leases.get(first, new Key("k1".getBytes())).orElseThrow().bytes()
+            );
+            assertArrayEquals(
+                "v2".getBytes(),
+                leases.get(second, new Key("k2".getBytes())).orElseThrow().bytes()
+            );
+        }
+
+        assertFalse(Files.exists(first.path()));
+        assertFalse(Files.exists(second.path()));
+        assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+        assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
     }
 
     @Test
@@ -141,11 +178,12 @@ class FileLocalStorageManagerTest {
         ));
 
         List<String> keys = new ArrayList<>();
-        try (SSTEntryIterator iterator = storage.openIterator(
-            meta,
-            new Key("b".getBytes()),
-            Optional.of(new Key("d".getBytes()))
-        )) {
+        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(meta))) {
+            SSTEntryIterator iterator = leases.openIterator(
+                meta,
+                new Key("b".getBytes()),
+                Optional.of(new Key("d".getBytes()))
+            );
             while (iterator.hasNext()) {
                 keys.add(new String(iterator.next().key().bytes()));
             }
@@ -183,7 +221,7 @@ class FileLocalStorageManagerTest {
         assertTrue(content.contains("\"runId\": " + meta.runId()));
         assertTrue(content.contains("\"minFlushId\": 1"));
         assertTrue(content.contains("\"maxFlushId\": 1"));
-        assertTrue(content.contains("\"sstFile\": \"sst-000001-000001.new.sst\""));
+        assertTrue(content.contains("\"sstFile\": \"sst-000001-000001.sst\""));
         assertTrue(content.contains("\"state\": \"NEW\""));
         assertTrue(content.contains("\"minSequenceId\": 1"));
         assertTrue(content.contains("\"maxSequenceId\": 1"));
@@ -203,7 +241,7 @@ class FileLocalStorageManagerTest {
         SSTMeta loaded = reloaded.metas().get(0);
         assertEquals(meta.runId(), loaded.runId());
         assertEquals(meta.entryCount(), loaded.entryCount());
-        assertArrayEquals("v1".getBytes(), reloaded.get(loaded, new Key("k1".getBytes())).orElseThrow().bytes());
+        assertArrayEquals("v1".getBytes(), get(reloaded, loaded, "k1").orElseThrow().bytes());
     }
 
     @Test
@@ -229,13 +267,13 @@ class FileLocalStorageManagerTest {
         FileLocalStorageManager storage = storage();
         SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
 
-        assertArrayEquals("v1".getBytes(), storage.get(meta, new Key("k1".getBytes())).orElseThrow().bytes());
+        assertArrayEquals("v1".getBytes(), get(storage, meta, "k1").orElseThrow().bytes());
         try (RandomAccessFile file = new RandomAccessFile(meta.path().toFile(), "rw")) {
             file.seek(file.length() - 1);
             file.writeByte('X');
         }
 
-        assertArrayEquals("v1".getBytes(), storage.get(meta, new Key("k1".getBytes())).orElseThrow().bytes());
+        assertArrayEquals("v1".getBytes(), get(storage, meta, "k1").orElseThrow().bytes());
     }
 
     @Test
@@ -330,14 +368,14 @@ class FileLocalStorageManagerTest {
         assertEquals(1L, compacted.minFlushId());
         assertEquals(2L, compacted.maxFlushId());
         assertEquals(3L, compacted.entryCount());
-        assertTrue(Files.exists(tempDir.resolve("sst-000001-000002.new.sst")));
+        assertTrue(Files.exists(tempDir.resolve("sst-000001-000002.sst")));
         assertFalse(Files.exists(first.path()));
         assertFalse(Files.exists(second.path()));
         assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
         assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
-        assertArrayEquals("new-a".getBytes(), storage.get(compacted, new Key("a".getBytes())).orElseThrow().bytes());
-        assertArrayEquals("old-b".getBytes(), storage.get(compacted, new Key("b".getBytes())).orElseThrow().bytes());
-        assertTrue(storage.get(compacted, new Key("c".getBytes())).orElseThrow().isTombstone());
+        assertArrayEquals("new-a".getBytes(), get(storage, compacted, "a").orElseThrow().bytes());
+        assertArrayEquals("old-b".getBytes(), get(storage, compacted, "b").orElseThrow().bytes());
+        assertTrue(get(storage, compacted, "c").orElseThrow().isTombstone());
 
         storage.persistFlushedSequenceId(compacted.maxSequenceId());
         FileLocalStorageManager reloaded = storage();
@@ -345,23 +383,27 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
-    void compactDelaysInputSstDataFileDeletionUntilIteratorLeaseCloses() throws IOException {
+    void compactDelaysInputSstFileDeletionUntilReadSnapshotCloses() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta first = storage.flushToSST(immutable("a", "old-a".getBytes(), 1L));
         SSTMeta second = storage.flushToSST(immutable("b", "old-b".getBytes(), 2L));
 
-        try (SSTEntryIterator iterator = storage.openIterator(first)) {
+        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(first))) {
             storage.compactSSTs(List.of(first, second));
 
             assertTrue(Files.exists(first.path()));
-            assertFalse(Files.exists(second.path()));
-            assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
-            assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
+            assertTrue(Files.exists(second.path()));
+            assertTrue(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+            assertTrue(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
+            SSTEntryIterator iterator = leases.openIterator(first);
             assertTrue(iterator.hasNext());
             assertEquals("a", new String(iterator.next().key().bytes()));
         }
 
         assertFalse(Files.exists(first.path()));
+        assertFalse(Files.exists(second.path()));
+        assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+        assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
     }
 
     @Test

@@ -321,7 +321,7 @@ class PmsServerEndToEndTest {
             server.flush();
             server.sink();
 
-            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
+            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
             assertTrue(Files.exists(oldestSinked));
             assertEquals(
                 Map.of("id", 1, "marker", "retained-1"),
@@ -337,8 +337,8 @@ class PmsServerEndToEndTest {
             assertEquals(2L, number(state, "sinkedSSTTotalRows"));
             assertEquals(2L, number(state, "sinkedSSTCount"));
             assertFalse(Files.exists(oldestSinked));
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000002.sinked.sst")));
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000003-000003.sinked.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000002.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000003-000003.sst")));
 
             assertEquals(
                 Map.of("id", 1, "marker", "retained-1"),
@@ -528,7 +528,7 @@ class PmsServerEndToEndTest {
     }
 
     private Path flushedSstPath() {
-        return tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
+        return tempDir.resolve("storage").resolve("sst-000001-000001.sst");
     }
 
     private static void waitUntil(BooleanSupplier condition) throws Exception {

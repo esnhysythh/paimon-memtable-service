@@ -74,7 +74,7 @@ class FakeSinkManager implements SinkManager {
 | 完整查询路径 | 各层命中 + Paimon 穿透，结果正确 |
 | WAL 崩溃恢复 - 正常 | Kill → 重启 → 数据完整、不重复提交 |
 | SinkMeta 崩溃恢复 - prepare 后 | Kill → 重启 → 使用 SinkMeta 中的 prepared payload、batch 和 fileRefs 重试 commit |
-| SinkMeta 崩溃恢复 - success 后文件名未更新 | Kill → 重启 → 通过 SinkMeta success 推导 sinkedSST，并 best-effort 修正文件名标签 |
+| SinkMeta 崩溃恢复 - success 后 SSTMeta 未更新 | Kill → 重启 → 通过 SinkMeta success 推导 sinkedSST，并修正 SST metadata state |
 | 优雅停机 | 停机 → 所有 in-flight 操作完成 → 重启后数据完整 |
 
 ### 3.3 测试基础设施

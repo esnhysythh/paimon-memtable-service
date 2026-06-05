@@ -71,7 +71,7 @@ final class SSTMetaStore {
             readLongField(content, "minSequenceId"),
             readLongField(content, "maxSequenceId"),
             readLongField(content, "createdAtMillis"),
-            stateFromPath(sstPath, SSTState.valueOf(readStringField(content, "state"))),
+            SSTState.valueOf(readStringField(content, "state")),
             readLongField(content, "refCount")
         );
     }
@@ -104,26 +104,11 @@ final class SSTMetaStore {
         if (Files.exists(recorded)) {
             return recorded;
         }
-        Path newPath = SSTWriter.pathFor(dir, minFlushId, maxFlushId, SSTState.NEW);
-        if (Files.exists(newPath)) {
-            return newPath;
-        }
-        Path sinkedPath = SSTWriter.pathFor(dir, minFlushId, maxFlushId, SSTState.SINKED);
-        if (Files.exists(sinkedPath)) {
-            return sinkedPath;
+        Path rangePath = SSTWriter.pathFor(dir, minFlushId, maxFlushId, SSTState.NEW);
+        if (Files.exists(rangePath)) {
+            return rangePath;
         }
         return recorded;
-    }
-
-    private static SSTState stateFromPath(Path path, SSTState fallback) {
-        String name = path.getFileName().toString();
-        if (name.endsWith(".new.sst")) {
-            return SSTState.NEW;
-        }
-        if (name.endsWith(".sinked.sst")) {
-            return SSTState.SINKED;
-        }
-        return fallback;
     }
 
     private static String toJson(SSTMeta meta) {

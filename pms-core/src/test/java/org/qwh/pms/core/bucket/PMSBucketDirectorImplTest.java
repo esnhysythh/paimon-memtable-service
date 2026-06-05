@@ -14,7 +14,6 @@ import java.nio.charset.StandardCharsets;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -412,7 +411,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(2L, snap.newSSTTotalRows());
             assertArrayEquals("new".getBytes(), dir.get("k1".getBytes()).orElse(null));
             assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElse(null));
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.new.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sst")));
         } finally {
             dir.close();
         }
@@ -429,9 +428,8 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            Path newFile = tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
-            Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
-            assertTrue(Files.exists(newFile));
+            Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
+            assertTrue(Files.exists(sstFile));
 
             dir.sinkToPaimon();
 
@@ -440,7 +438,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(0, snap.newSSTCount());
             assertEquals(1, snap.sinkedSSTCount());
             assertEquals(1L, snap.lastSinkedSnapshotId());
-            assertTrue(Files.exists(sinkedFile));
+            assertTrue(Files.exists(sstFile));
         } finally {
             dir.close();
         }
@@ -488,7 +486,7 @@ class PMSBucketDirectorImplTest {
             BucketStateSnapshot compacted = dir1.stateSnapshot();
             assertEquals(0, compacted.newSSTCount());
             assertEquals(1, compacted.sinkedSSTCount());
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sinked.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sst")));
         } finally {
             dir1.close();
         }
@@ -526,7 +524,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(1, snap.sinkedSSTCount());
             assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
             assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElse(null));
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sinked.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sst")));
         } finally {
             dir.close();
         }
@@ -555,9 +553,9 @@ class PMSBucketDirectorImplTest {
             assertEquals(2, before.sinkedSSTCount());
             assertEquals(2L, before.sinkedSSTTotalRows());
 
-            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
-            Path newerSinked = tempDir.resolve("storage").resolve("sst-000002-000002.sinked.sst");
-            Path unsinked = tempDir.resolve("storage").resolve("sst-000003-000003.new.sst");
+            Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
+            Path newerSinked = tempDir.resolve("storage").resolve("sst-000002-000002.sst");
+            Path unsinked = tempDir.resolve("storage").resolve("sst-000003-000003.sst");
             assertTrue(Files.exists(oldestSinked));
             assertTrue(Files.exists(newerSinked));
             assertTrue(Files.exists(unsinked));
@@ -584,7 +582,7 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
-    void restartRecoversSinkedSSTFromWalAndRepairsFileNameLabel() throws IOException {
+    void restartRecoversSinkedSSTFromSuccessMetadata() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 
         PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
@@ -595,9 +593,8 @@ class PMSBucketDirectorImplTest {
         dir1.sinkToPaimon();
         dir1.close();
 
-        Path newFile = tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
-        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
-        Files.move(sinkedFile, newFile, StandardCopyOption.REPLACE_EXISTING);
+        Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
+        assertTrue(Files.exists(sstFile));
 
         PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
         dir2.init();
@@ -607,8 +604,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(0, snap.newSSTCount());
             assertEquals(1, snap.sinkedSSTCount());
             assertEquals(1L, snap.lastSinkedSnapshotId());
-            assertFalse(Files.exists(newFile));
-            assertTrue(Files.exists(sinkedFile));
+            assertTrue(Files.exists(sstFile));
         } finally {
             dir2.close();
         }
@@ -634,10 +630,8 @@ class PMSBucketDirectorImplTest {
             dir1.close();
         }
 
-        Path newFile = tempDir.resolve("storage").resolve("sst-000001-000001.new.sst");
-        Path sinkedFile = tempDir.resolve("storage").resolve("sst-000001-000001.sinked.sst");
-        assertTrue(Files.exists(newFile));
-        assertFalse(Files.exists(sinkedFile));
+        Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
+        assertTrue(Files.exists(sstFile));
 
         RecordingSinkManager recoveringSink = new RecordingSinkManager(77);
         PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg, recoveringSink);
@@ -651,8 +645,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(0, snap.newSSTCount());
             assertEquals(1, snap.sinkedSSTCount());
             assertEquals(77L, snap.lastSinkedSnapshotId());
-            assertFalse(Files.exists(newFile));
-            assertTrue(Files.exists(sinkedFile));
+            assertTrue(Files.exists(sstFile));
         } finally {
             dir2.close();
         }

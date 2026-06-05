@@ -132,8 +132,7 @@ final class SSTWriter {
     }
 
     static Path pathFor(Path dir, long minFlushId, long maxFlushId, SSTState state) {
-        String label = state == SSTState.SINKED ? "sinked" : "new";
-        return dir.resolve(String.format("sst-%06d-%06d.%s.sst", minFlushId, maxFlushId, label));
+        return dir.resolve(String.format("sst-%06d-%06d.sst", minFlushId, maxFlushId));
     }
 
     private Path pathFor(long minFlushId, long maxFlushId, SSTState state) {

@@ -60,17 +60,16 @@ SST 的可靠 sinked 状态来源是 SinkMeta success，而不是文件名或 SS
 3. 从 success metadata 中读取 sstIds 和 persistedSequenceId
 4. sstIds 命中的 SST，或 maxSequenceId 不超过 persistedSequenceId 的 SST 视为 sinkedSST
 5. 其余 SST 视为 newSST
-6. best-effort 修正 SST 文件名标签
+6. 将 SSTMeta state 修正为 SINKED
 ```
 
-SST 文件名仅作为人工可观察标签：
+SST 数据文件名仅表达稳定 flush range：
 
 ```text
-sst-000001-000001.new.sst
-sst-000001-000001.sinked.sst
+sst-000001-000001.sst
 ```
 
-如果文件名和 SinkMeta 推导状态不一致，以 SinkMeta 为准；rename 失败只记录 warning，不影响正确性。
+如果 SST metadata state 和 SinkMeta 推导状态不一致，以 SinkMeta 为准并重写 metadata。数据文件不做状态 rename。
 
 ## 3. 当前 mock 与未完成边界
 

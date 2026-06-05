@@ -35,6 +35,7 @@ import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.core.storage.LocalStorageManager;
 import org.qwh.pms.core.storage.SSTEntryIterator;
 import org.qwh.pms.core.storage.SSTMeta;
+import org.qwh.pms.core.storage.SSTReadSnapshot;
 import org.qwh.pms.core.storage.SSTState;
 
 import java.io.IOException;
@@ -219,10 +220,11 @@ class PaimonSinkManagerIntegrationTest {
     void closesOpenedIteratorsWhenPrepareCannotOpenLaterSst() throws Exception {
         try (TestTable testTable = createTable()) {
             TrackingIterator opened = new TrackingIterator();
+            FailingSnapshotStorage storage = new FailingSnapshotStorage(opened);
             PaimonSinkManager sinkManager = new PaimonSinkManager(
                 testTable.table(),
                 "pms-test",
-                new FailingOpenStorage(opened)
+                storage
             );
 
             RuntimeException error = assertThrows(
@@ -236,6 +238,7 @@ class PaimonSinkManagerIntegrationTest {
             );
 
             assertTrue(opened.closed);
+            assertTrue(storage.snapshotClosed);
             assertTrue(error.getMessage().contains("Paimon prepare failed for batch batch-open-fails"));
             assertTrue(error.getCause().getMessage().contains("open failed"));
         }
@@ -466,11 +469,12 @@ class PaimonSinkManagerIntegrationTest {
         }
     }
 
-    private static final class FailingOpenStorage implements LocalStorageManager {
+    private static final class FailingSnapshotStorage implements LocalStorageManager {
         private final TrackingIterator firstIterator;
         private final List<SSTMeta> opened = new ArrayList<>();
+        private boolean snapshotClosed;
 
-        private FailingOpenStorage(TrackingIterator firstIterator) {
+        private FailingSnapshotStorage(TrackingIterator firstIterator) {
             this.firstIterator = firstIterator;
         }
 
@@ -480,22 +484,37 @@ class PaimonSinkManagerIntegrationTest {
         }
 
         @Override
-        public Optional<Value> get(SSTMeta meta, Key key) {
-            throw new UnsupportedOperationException();
-        }
+        public SSTReadSnapshot readSnapshot(List<SSTMeta> metas) {
+            return new SSTReadSnapshot() {
+                @Override
+                public List<SSTMeta> metas() {
+                    return metas;
+                }
 
-        @Override
-        public SSTEntryIterator openIterator(SSTMeta meta) {
-            opened.add(meta);
-            if (opened.size() == 1) {
-                return firstIterator;
-            }
-            throw new IllegalStateException("open failed for " + meta.runId());
-        }
+                @Override
+                public Optional<Value> get(SSTMeta meta, Key key) {
+                    throw new UnsupportedOperationException();
+                }
 
-        @Override
-        public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
-            return openIterator(meta);
+                @Override
+                public SSTEntryIterator openIterator(SSTMeta meta) {
+                    opened.add(meta);
+                    if (opened.size() == 1) {
+                        return firstIterator;
+                    }
+                    throw new IllegalStateException("open failed for " + meta.runId());
+                }
+
+                @Override
+                public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
+                    return openIterator(meta);
+                }
+
+                @Override
+                public void close() {
+                    snapshotClosed = true;
+                }
+            };
         }
 
         @Override

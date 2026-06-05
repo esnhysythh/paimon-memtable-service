@@ -80,9 +80,9 @@ PMS 中的数据单元经历以下状态流转：
 
 - **freeze**：`curMemTable` 引用用 volatile 修饰，原子切换为新的空 MemTable，原 MemTable 标记为 immutable 并加入 `newImmutableList`。冻结结果必须携带 `minSequenceId/maxSequenceId`，后续 Flush/Sink/WAL 截断以该边界推进。
 - **flush**：SST 文件原子落盘成功后，先推进本地 `lastFlushedSequenceId`，再将对应 ImmutableMemTable 从 `newImmutableList` 移至 `newSSTWithMemList`，同时注册 newSST 的 BloomFilter。若边界推进失败，ImmutableMemTable 仍保留在内存列表中，不进入已 flush 状态。
-- **sink**：Paimon prepare 成功后，`SinkMetaStore` 先将 batch、SST id 列表、sequence 范围和 prepared commit payload 写入 prepare metadata；Paimon commit 成功后，再将 batch、snapshotId、persistedSequenceId 和 SST id 列表写入 success metadata。随后内存中将对应 newSST 批量移至 sinkedSST，并 best-effort rename 文件名用于人工观察。SST 是否 sinked 的可靠判断以 SinkMeta success 为准，不以文件名为准。
+- **sink**：Paimon prepare 成功后，`SinkMetaStore` 先将 batch、SST id 列表、sequence 范围和 prepared commit payload 写入 prepare metadata；Paimon commit 成功后，再将 batch、snapshotId、persistedSequenceId 和 SST id 列表写入 success metadata。随后内存中将对应 newSST 批量移至 sinkedSST，并更新 SST metadata 中的状态。SST 数据文件 publish 后不再 rename；是否 sinked 的可靠判断以 SinkMeta success 为准。
 - **mem退役**：ImmutableMemTable 的引用计数归零后，从对应列表中移除，只保留 SST 引用。
-- **evict**：淘汰最老的 sinkedSST，从列表移除并删除磁盘文件。当前 V1 尚未实现 SST 引用计数，后续需要补齐无查询引用确认或延迟删除队列。
+- **evict**：淘汰最老的 sinkedSST，先从可见列表移除并放入 retired queue；待所有可能看到该 SST 的 read epoch 结束后，再物理删除 data/meta 文件。
 
 ## 4. 查询穿透
 
@@ -105,7 +105,7 @@ PMS 中的数据单元经历以下状态流转：
 | `Value.bytes() != null` | PUT 命中 | 返回该 value bytes |
 | `Value.bytes() == null` | DELETE tombstone 命中 | 停止穿透，返回 `Optional.empty()` |
 
-因此 LocalStorageManager 的 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 穿透中复活。
+因此 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 穿透中复活。当前实现中，SST 点查通过 `LocalStorageManager.readSnapshot(...)` 返回的 `SSTReadSnapshot.get(...)` 执行。
 
 V1 实现决策：`pms-core` 的 `lookup(key)` 只负责本地层三态判断，不直接依赖 Paimon API；`pms-server` 调用 `lookup(key)` 后，若本地返回 PUT 或 tombstone 则停止，只有本地完全 miss 时才通过 Paimon `ReadBuilder` 主键等值过滤执行穿透点查。这样既保持 core 的 byte-oriented 边界，也保证 tombstone 能阻断 Paimon 旧值复活。
 
@@ -131,7 +131,7 @@ sinkedSSTs
 
 该设计理由是：点查可以利用层级新旧顺序命中即返回，但 range/prefix scan 必须同时观察所有层，否则无法正确处理不同 key 在不同层上的最新 sequence，也无法在 tombstone 覆盖旧 SST/Paimon 数据时维持 Deduplicate 语义。
 
-**查询穿透过程中的并发**：初期方案为直接遍历 volatile 列表，不做快照拷贝。层列表通过 volatile 引用替换整个列表，查询线程不会看到半更新状态。详见 [pms-core.md](pms-core.md) § 5.2。
+**查询穿透过程中的并发**：MemTable 层仍直接读取当前 volatile 引用；进入 SST 层前，BucketDirector 会在短临界区内读取当前 SST 列表并创建 `SSTReadSnapshot`。snapshot 注册 read epoch, 后续磁盘读取仍按 SST 顺序按需执行并在命中后停止。compact/evict 只会把旧 SST 放入 retired queue, 等所有活跃 snapshot 的最小 epoch 不早于旧 SST 的 `retireEpoch` 后才物理删除文件。详见 [pms-core.md](pms-core.md) § 3.2。
 
 ## 5. 接口定义
 
@@ -287,10 +287,10 @@ PMSBucketDirector / future SinkCoordinator        SinkManager
      | 5. SinkMetaStore save success metadata           |
      |                                                  |
      | 6. move newSST -> sinkedSST                      |
-     |    best-effort rename file label                 |
+     |    update SST metadata state                     |
 ```
 
-### 7.2.1 SST 状态恢复与文件名标签
+### 7.2.1 SST 状态恢复
 
 SST 的可靠状态不写入 SST footer。启动时：
 
@@ -299,17 +299,16 @@ SST 的可靠状态不写入 SST footer。启动时：
 2. 扫描 SinkMeta prepare/success
 3. 由 success metadata 中的 sstIds 与 persistedSequenceId 推导 sinkedSST 集合
 4. 其余 SST = newSST
-5. best-effort 修正文件名标签
+5. 修正 SST metadata state
 ```
 
-文件名只用于人工观察：
+SST 数据文件名只表达稳定的 flush range, 不表达状态：
 
 ```text
-sst-000001-000001.new.sst
-sst-000001-000001.sinked.sst
+sst-000001-000001.sst
 ```
 
-如果文件名和 SinkMeta 推导状态不一致，以 SinkMeta 为准并尝试 rename 修正。rename 失败只记录 warning，不影响正确性。
+如果 SST metadata 中的 state 和 SinkMeta 推导状态不一致，以 SinkMeta 为准并重写 metadata。数据文件不做状态 rename。
 
 ### 7.3 Sink 失败处理
 

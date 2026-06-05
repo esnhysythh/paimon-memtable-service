@@ -9,15 +9,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
@@ -33,8 +34,11 @@ public class FileLocalStorageManager implements LocalStorageManager {
     private final SSTMetaStore sstMetaStore;
     private final ConcurrentSkipListMap<Long, SSTMeta> metas = new ConcurrentSkipListMap<>();
     private final ConcurrentHashMap<Long, SSTReaderRef> readers = new ConcurrentHashMap<>();
+    private final Map<Long, Integer> activeReadEpochs = new HashMap<>();
+    private final List<RetiredSST> retiredSSTs = new ArrayList<>();
     private final AtomicLong nextRunId = new AtomicLong(1);
     private final AtomicLong nextFlushId = new AtomicLong(1);
+    private long currentEpoch = 1;
     private long lastFlushedSequenceId;
 
     public FileLocalStorageManager(StorageConfig config) {
@@ -129,8 +133,10 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     public synchronized void close() {
+        activeReadEpochs.clear();
+        reclaimRetiredSSTs();
         for (SSTReaderRef holder : readers.values()) {
-            holder.retire(null);
+            holder.close();
         }
         readers.clear();
     }
@@ -169,8 +175,8 @@ public class FileLocalStorageManager implements LocalStorageManager {
             SSTState target = sinkedIds.contains(meta.runId()) || meta.maxSequenceId() <= persistedSequenceId
                 ? SSTState.SINKED
                 : SSTState.NEW;
-            if (meta.state() != target || !meta.path().equals(pathFor(meta.minFlushId(), meta.maxFlushId(), target))) {
-                updateStateLabel(meta, target);
+            if (meta.state() != target) {
+                updateState(meta, target);
             }
         }
     }
@@ -179,7 +185,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
         for (SSTMeta meta : toMark) {
             SSTMeta current = metas.get(meta.runId());
             if (current != null) {
-                updateStateLabel(current, SSTState.SINKED);
+                updateState(current, SSTState.SINKED);
             }
         }
         return metas(SSTState.SINKED);
@@ -204,31 +210,17 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     @Override
-    public Optional<Value> get(SSTMeta meta, Key key) {
-        try (SSTReaderLease lease = acquireReader(meta)) {
-            return lease.reader().get(key);
-        } catch (IOException e) {
-            throw new RuntimeException("SST read failed: " + meta.path(), e);
+    public SSTReadSnapshot readSnapshot(List<SSTMeta> metas) {
+        Objects.requireNonNull(metas, "metas must not be null");
+        if (metas.isEmpty()) {
+            return EmptySSTReadSnapshot.INSTANCE;
         }
-    }
-
-    @Override
-    public SSTEntryIterator openIterator(SSTMeta meta) {
+        long epoch = beginReadEpoch();
         try {
-            SSTReaderLease lease = acquireReader(meta);
-            return new LeasedSSTEntryIterator(lease.reader().iterator(), lease);
-        } catch (IOException e) {
-            throw new RuntimeException("SST iterator open failed: " + meta.path(), e);
-        }
-    }
-
-    @Override
-    public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
-        try {
-            SSTReaderLease lease = acquireReader(meta);
-            return new LeasedSSTEntryIterator(lease.reader().iterator(startInclusive, endExclusive), lease);
-        } catch (IOException e) {
-            throw new RuntimeException("SST range iterator open failed: " + meta.path(), e);
+            return new FileSSTReadSnapshot(epoch, List.copyOf(metas));
+        } catch (RuntimeException e) {
+            endReadEpoch(epoch);
+            throw e;
         }
     }
 
@@ -244,40 +236,39 @@ public class FileLocalStorageManager implements LocalStorageManager {
 
         List<SSTEntryIterator> iterators = new ArrayList<>(inputs.size());
         try {
-            for (SSTMeta meta : inputs) {
-                iterators.add(openIterator(meta));
-            }
             long expectedEntries = inputs.stream().mapToLong(SSTMeta::entryCount).sum();
             long minSequenceId = inputs.stream().mapToLong(SSTMeta::minSequenceId).min().orElse(0);
             long maxSequenceId = inputs.stream().mapToLong(SSTMeta::maxSequenceId).max().orElse(0);
             SSTMeta output;
-            try (SSTEntryIterator merged = new MergedSSTEntryIterator(iterators)) {
-                output = new SSTWriter(
-                    dir,
-                    SSTFormat.DEFAULT_BLOCK_SIZE,
-                    SSTFormat.DEFAULT_RESTART_INTERVAL
-                ).write(
-                    nextRunId.getAndIncrement(),
-                    inputs.get(0).minFlushId(),
-                    inputs.get(inputs.size() - 1).maxFlushId(),
-                    inputs.get(0).state(),
-                    merged,
-                    expectedEntries,
-                    minSequenceId,
-                    maxSequenceId
-                );
+            try (SSTReadSnapshot snapshot = readSnapshot(inputs)) {
+                for (SSTMeta meta : inputs) {
+                    iterators.add(snapshot.openIterator(meta));
+                }
+                try (SSTEntryIterator merged = new MergedSSTEntryIterator(iterators)) {
+                    output = new SSTWriter(
+                        dir,
+                        SSTFormat.DEFAULT_BLOCK_SIZE,
+                        SSTFormat.DEFAULT_RESTART_INTERVAL
+                    ).write(
+                        nextRunId.getAndIncrement(),
+                        inputs.get(0).minFlushId(),
+                        inputs.get(inputs.size() - 1).maxFlushId(),
+                        inputs.get(0).state(),
+                        merged,
+                        expectedEntries,
+                        minSequenceId,
+                        maxSequenceId
+                    );
+                }
             }
             synchronized (this) {
                 sstMetaStore.save(output);
                 for (SSTMeta input : inputs) {
                     this.metas.remove(input.runId());
-                    retireReader(input.runId(), () -> deleteSSTDataFileQuietly(input));
                 }
                 putVisibleMeta(output);
                 readers.put(output.runId(), new SSTReaderRef(SSTReader.open(output)));
-                for (SSTMeta input : inputs) {
-                    deleteSSTMetadata(input);
-                }
+                retireSSTs(inputs);
             }
             return output;
         } catch (IOException e) {
@@ -291,7 +282,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
     @Override
     public synchronized void deleteSST(SSTMeta meta) {
         metas.remove(meta.runId());
-        retireReader(meta.runId(), () -> deleteSSTFiles(meta));
+        retireSSTs(List.of(meta));
     }
 
     private void deleteSSTFiles(SSTMeta meta) {
@@ -307,14 +298,6 @@ public class FileLocalStorageManager implements LocalStorageManager {
         Files.deleteIfExists(meta.path());
     }
 
-    private void deleteSSTDataFileQuietly(SSTMeta meta) {
-        try {
-            deleteSSTDataFile(meta);
-        } catch (IOException e) {
-            LOG.warn("Failed to delete obsolete SST data file: {}", meta.path(), e);
-        }
-    }
-
     private void deleteSSTMetadata(SSTMeta meta) throws IOException {
         Files.deleteIfExists(sstMetaStore.metaPath(meta));
     }
@@ -328,75 +311,93 @@ public class FileLocalStorageManager implements LocalStorageManager {
         return oldest;
     }
 
-    private void updateStateLabel(SSTMeta meta, SSTState target) {
-        Path targetPath = pathFor(meta.minFlushId(), meta.maxFlushId(), target);
-        Path newPath = meta.path();
-        try {
-            if (!meta.path().equals(targetPath)) {
-                try {
-                    Files.move(meta.path(), targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                } catch (AtomicMoveNotSupportedException e) {
-                    Files.move(meta.path(), targetPath, StandardCopyOption.REPLACE_EXISTING);
-                }
-                newPath = targetPath;
-            }
-        } catch (IOException e) {
-            LOG.warn("Failed to rename SST state label from {} to {}", meta.path(), targetPath, e);
-        }
-        SSTMeta updated = meta.withPathAndState(newPath, target);
+    private void updateState(SSTMeta meta, SSTState target) {
+        SSTMeta updated = meta.withPathAndState(meta.path(), target);
         try {
             sstMetaStore.save(updated);
             putVisibleMeta(updated);
-            retireReader(meta.runId(), null);
         } catch (IOException e) {
             throw new RuntimeException("persist SST metadata failed: " + sstMetaStore.metaPath(meta), e);
         }
     }
 
-    private SSTReaderLease acquireReader(SSTMeta meta) throws IOException {
-        while (true) {
+    private SSTReader readerFor(SSTMeta meta) throws IOException {
+        SSTReaderRef holder = readers.get(meta.runId());
+        if (holder != null && holder.matches(meta)) {
+            return holder.reader();
+        }
+        synchronized (this) {
+            holder = readers.get(meta.runId());
+            if (holder != null && holder.matches(meta)) {
+                return holder.reader();
+            }
             SSTMeta effectiveMeta = metas.getOrDefault(meta.runId(), meta);
-            SSTReaderRef holder = readers.get(effectiveMeta.runId());
-            if (holder != null && holder.matches(effectiveMeta)) {
-                SSTReaderLease lease = holder.acquire();
-                if (lease != null) {
-                    return lease;
-                }
-            }
-            synchronized (this) {
-                effectiveMeta = metas.getOrDefault(meta.runId(), meta);
-                holder = readers.get(effectiveMeta.runId());
-                if (holder != null && holder.matches(effectiveMeta)) {
-                    SSTReaderLease lease = holder.acquire();
-                    if (lease != null) {
-                        return lease;
-                    }
-                }
-                holder = new SSTReaderRef(SSTReader.open(effectiveMeta));
-                readers.put(effectiveMeta.runId(), holder);
-                SSTReaderLease lease = holder.acquire();
-                if (lease == null) {
-                    throw new IOException("SST reader retired before acquire: " + effectiveMeta.path());
-                }
-                return lease;
-            }
+            holder = new SSTReaderRef(SSTReader.open(effectiveMeta));
+            readers.put(effectiveMeta.runId(), holder);
+            return holder.reader();
         }
     }
 
-    private void retireReader(long runId, Runnable cleanup) {
-        SSTReaderRef holder = readers.remove(runId);
-        if (holder != null) {
-            holder.retire(cleanup);
-        } else if (cleanup != null) {
-            cleanup.run();
+    private synchronized long beginReadEpoch() {
+        long epoch = currentEpoch;
+        activeReadEpochs.merge(epoch, 1, Integer::sum);
+        return epoch;
+    }
+
+    private synchronized void endReadEpoch(long epoch) {
+        Integer count = activeReadEpochs.get(epoch);
+        if (count == null) {
+            throw new IllegalStateException("read epoch released more than once: " + epoch);
+        }
+        if (count == 1) {
+            activeReadEpochs.remove(epoch);
+        } else {
+            activeReadEpochs.put(epoch, count - 1);
+        }
+        reclaimRetiredSSTs();
+    }
+
+    private void retireSSTs(List<SSTMeta> metas) {
+        if (metas.isEmpty()) {
+            return;
+        }
+        long retireEpoch = ++currentEpoch;
+        for (SSTMeta meta : metas) {
+            retiredSSTs.add(new RetiredSST(meta, retireEpoch));
+        }
+        reclaimRetiredSSTs();
+    }
+
+    private void reclaimRetiredSSTs() {
+        long minActiveEpoch = activeReadEpochs.keySet().stream()
+            .mapToLong(Long::longValue)
+            .min()
+            .orElse(Long.MAX_VALUE);
+        for (int i = 0; i < retiredSSTs.size(); ) {
+            RetiredSST retired = retiredSSTs.get(i);
+            if (minActiveEpoch < retired.retireEpoch()) {
+                i++;
+                continue;
+            }
+            retiredSSTs.remove(i);
+            SSTReaderRef holder = readers.remove(retired.meta().runId());
+            if (holder != null) {
+                holder.close();
+            }
+            deleteSSTFilesQuietly(retired.meta());
+        }
+    }
+
+    private void deleteSSTFilesQuietly(SSTMeta meta) {
+        try {
+            deleteSSTFiles(meta);
+        } catch (RuntimeException e) {
+            LOG.warn("Failed to delete retired SST files: {}", meta.path(), e);
         }
     }
 
     private static final class SSTReaderRef {
         private final SSTReader reader;
-        private int leases;
-        private boolean retired;
-        private Runnable cleanup;
 
         private SSTReaderRef(SSTReader reader) {
             this.reader = reader;
@@ -407,81 +408,85 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
 
         private boolean matches(SSTMeta meta) {
-            return reader.meta().path().equals(meta.path());
+            return reader.meta().runId() == meta.runId() && reader.meta().path().equals(meta.path());
         }
 
-        private synchronized SSTReaderLease acquire() {
-            if (retired) {
-                return null;
-            }
-            leases++;
-            return new SSTReaderLease(this);
-        }
-
-        private void retire(Runnable cleanup) {
-            Runnable toRun;
-            synchronized (this) {
-                if (retired) {
-                    return;
-                }
-                retired = true;
-                this.cleanup = cleanup;
-                toRun = cleanupIfIdleLocked();
-            }
-            runCleanup(toRun);
-        }
-
-        private void release() {
-            Runnable toRun;
-            synchronized (this) {
-                if (leases <= 0) {
-                    throw new IllegalStateException("SST reader lease released more than once: " + reader.meta().path());
-                }
-                leases--;
-                toRun = cleanupIfIdleLocked();
-            }
-            runCleanup(toRun);
-        }
-
-        private Runnable cleanupIfIdleLocked() {
-            if (!retired || leases > 0) {
-                return null;
-            }
-            Runnable toRun = cleanup;
-            cleanup = null;
-            return () -> {
-                try {
-                    reader.close();
-                } finally {
-                    if (toRun != null) {
-                        toRun.run();
-                    }
-                }
-            };
-        }
-
-        private void runCleanup(Runnable cleanup) {
-            if (cleanup == null) {
-                return;
-            }
-            try {
-                cleanup.run();
-            } catch (RuntimeException e) {
-                LOG.warn("SST reader retirement cleanup failed: {}", reader.meta().path(), e);
-            }
+        private void close() {
+            reader.close();
         }
     }
 
-    private static final class SSTReaderLease implements AutoCloseable {
-        private final SSTReaderRef ref;
-        private boolean closed;
+    private enum EmptySSTReadSnapshot implements SSTReadSnapshot {
+        INSTANCE;
 
-        private SSTReaderLease(SSTReaderRef ref) {
-            this.ref = ref;
+        @Override
+        public List<SSTMeta> metas() {
+            return List.of();
         }
 
-        private SSTReader reader() {
-            return ref.reader();
+        @Override
+        public Optional<Value> get(SSTMeta meta, Key key) {
+            throw new IllegalArgumentException("empty SST read snapshot has no SST readers");
+        }
+
+        @Override
+        public SSTEntryIterator openIterator(SSTMeta meta) {
+            throw new IllegalArgumentException("empty SST read snapshot has no SST readers");
+        }
+
+        @Override
+        public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
+            throw new IllegalArgumentException("empty SST read snapshot has no SST readers");
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private final class FileSSTReadSnapshot implements SSTReadSnapshot {
+        private final long epoch;
+        private final List<SSTMeta> metas;
+        private boolean closed;
+
+        private FileSSTReadSnapshot(long epoch, List<SSTMeta> metas) {
+            this.epoch = epoch;
+            this.metas = metas;
+        }
+
+        @Override
+        public List<SSTMeta> metas() {
+            return metas;
+        }
+
+        @Override
+        public Optional<Value> get(SSTMeta meta, Key key) {
+            ensureOpen();
+            try {
+                return readerFor(meta).get(key);
+            } catch (IOException e) {
+                throw new RuntimeException("SST read failed: " + meta.path(), e);
+            }
+        }
+
+        @Override
+        public SSTEntryIterator openIterator(SSTMeta meta) {
+            ensureOpen();
+            try {
+                return readerFor(meta).iterator();
+            } catch (IOException e) {
+                throw new RuntimeException("SST iterator open failed: " + meta.path(), e);
+            }
+        }
+
+        @Override
+        public SSTEntryIterator openIterator(SSTMeta meta, Key startInclusive, Optional<Key> endExclusive) {
+            ensureOpen();
+            try {
+                return readerFor(meta).iterator(startInclusive, endExclusive);
+            } catch (IOException e) {
+                throw new RuntimeException("SST iterator open failed: " + meta.path(), e);
+            }
         }
 
         @Override
@@ -490,70 +495,17 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 return;
             }
             closed = true;
-            ref.release();
-        }
-    }
-
-    private static final class LeasedSSTEntryIterator implements SSTEntryIterator {
-        private final SSTEntryIterator delegate;
-        private final SSTReaderLease lease;
-        private boolean closed;
-
-        private LeasedSSTEntryIterator(SSTEntryIterator delegate, SSTReaderLease lease) {
-            this.delegate = delegate;
-            this.lease = lease;
+            endReadEpoch(epoch);
         }
 
-        @Override
-        public boolean hasNext() {
+        private void ensureOpen() {
             if (closed) {
-                return false;
-            }
-            boolean hasNext = delegate.hasNext();
-            if (!hasNext) {
-                close();
-            }
-            return hasNext;
-        }
-
-        @Override
-        public Entry next() {
-            if (!hasNext()) {
-                throw new NoSuchElementException();
-            }
-            return delegate.next();
-        }
-
-        @Override
-        public void close() {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            RuntimeException failure = null;
-            try {
-                delegate.close();
-            } catch (RuntimeException e) {
-                failure = e;
-            }
-            try {
-                lease.close();
-            } catch (RuntimeException e) {
-                if (failure != null) {
-                    failure.addSuppressed(e);
-                } else {
-                    failure = e;
-                }
-            }
-            if (failure != null) {
-                throw failure;
+                throw new IllegalStateException("SST read snapshot is closed");
             }
         }
     }
 
-    private Path pathFor(long minFlushId, long maxFlushId, SSTState state) {
-        return SSTWriter.pathFor(dir, minFlushId, maxFlushId, state);
-    }
+    private record RetiredSST(SSTMeta meta, long retireEpoch) {}
 
     private boolean hasMetaForRange(long minFlushId, long maxFlushId) {
         return metas.values().stream()
