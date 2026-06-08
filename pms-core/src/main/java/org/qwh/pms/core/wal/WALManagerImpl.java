@@ -23,6 +23,7 @@ public class WALManagerImpl implements WALManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(WALManagerImpl.class);
 
+    private static final byte RECORD_TYPE_DATA_BATCH = 0x42;
     // valueLen = -1 signals Delete (no value bytes follow)
     static final int VALUE_LEN_DELETE = -1;
 
@@ -81,33 +82,56 @@ public class WALManagerImpl implements WALManager {
 
     @Override
     public synchronized long appendDataRecord(byte[] key, byte[] value) {
+        return appendDataRecords(List.of(new DataWrite(key, value)));
+    }
+
+    @Override
+    public synchronized long appendDataRecords(List<DataWrite> writes) {
         ensureNotClosed();
+        if (writes == null || writes.isEmpty()) {
+            throw new IllegalArgumentException("writes must not be empty");
+        }
 
-        long sequenceId = nextSequenceId++;
+        long sequenceBegin = nextSequenceId;
+        long sequenceEnd = sequenceBegin + writes.size() - 1;
+        nextSequenceId = sequenceEnd + 1;
 
-        // Serialize: sequenceId(8) + keyLen(4) + key + valueLen(4) + [value]
-        int payloadSize = 8 + 4 + key.length + 4 + (value != null ? value.length : 0);
+        // Serialize:
+        // recordType(1) + sequenceBegin(8) + count(4)
+        // repeated: keyLen(4) + key + valueLen(4) + [value]
+        int payloadSize = 1 + 8 + 4;
+        for (DataWrite write : writes) {
+            if (write == null || write.key() == null) {
+                throw new NullPointerException("write and write.key must not be null");
+            }
+            payloadSize += 4 + write.key().length + 4 + (write.value() != null ? write.value().length : 0);
+        }
         DynamicSliceOutput output = new DynamicSliceOutput(payloadSize);
-        output.writeLong(sequenceId);
-        output.writeInt(key.length);
-        writeBytes(output, key);
-        if (value != null) {
-            output.writeInt(value.length);
-            writeBytes(output, value);
-        } else {
-            output.writeInt(VALUE_LEN_DELETE);
+        output.writeByte(RECORD_TYPE_DATA_BATCH);
+        output.writeLong(sequenceBegin);
+        output.writeInt(writes.size());
+        for (DataWrite write : writes) {
+            output.writeInt(write.key().length);
+            writeBytes(output, write.key());
+            if (write.value() != null) {
+                output.writeInt(write.value().length);
+                writeBytes(output, write.value());
+            } else {
+                output.writeInt(VALUE_LEN_DELETE);
+            }
         }
 
         long fileNumber = currentWriter.getFileNumber();
         addRecord(output.slice(), false);
-        lastSequenceId = sequenceId;
+        lastSequenceId = sequenceEnd;
 
         WalFileInfo currentInfo = walFiles.get(fileNumber);
         if (currentInfo != null) {
-            currentInfo.observeSequence(sequenceId);
+            currentInfo.observeSequence(sequenceBegin);
+            currentInfo.observeSequence(sequenceEnd);
         }
         maybeRollToNewFile();
-        return sequenceId;
+        return sequenceBegin;
     }
 
     @Override
@@ -155,30 +179,7 @@ public class WALManagerImpl implements WALManager {
 
                 Slice record;
                 while ((record = reader.readRecord()) != null) {
-                    SliceInput input = record.input();
-                    requireBytes(input, 8 + 4, "DATA header");
-                    long sequenceId = input.readLong();
-                    if (sequenceId <= 0) {
-                        throw corruptRecord("Invalid sequenceId: " + sequenceId);
-                    }
-                    int keyLen = readNonNegativeLength(input, "keyLen");
-                    requireBytes(input, keyLen + 4, "DATA key/value header");
-                    byte[] key = new byte[keyLen];
-                    input.readBytes(key);
-                    int valueLen = input.readInt();
-                    byte[] value;
-                    if (valueLen == VALUE_LEN_DELETE) {
-                        value = null;
-                    } else {
-                        if (valueLen < 0) {
-                            throw corruptRecord("Invalid valueLen: " + valueLen);
-                        }
-                        requireBytes(input, valueLen, "DATA value");
-                        value = new byte[valueLen];
-                        input.readBytes(value);
-                    }
-                    requireFullyConsumed(input, "DATA");
-                    callback.onDataRecord(sequenceId, key, value);
+                    replayRecord(record, callback);
                 }
             } catch (IOException e) {
                 LOG.error("Error reading WAL file during replay: {}", info.file, e);
@@ -297,17 +298,14 @@ public class WALManagerImpl implements WALManager {
             long minSequenceId = Long.MAX_VALUE;
             long maxSequenceId = headerLastSequenceId;
 
-            Slice record;
-            while ((record = reader.readRecord()) != null) {
-                if (record.length() < 8) {
-                    continue;
+                Slice record;
+                while ((record = reader.readRecord()) != null) {
+                    SequenceRange range = sequenceRange(record);
+                    if (range.maxSequenceId() > 0) {
+                        minSequenceId = Math.min(minSequenceId, range.minSequenceId());
+                        maxSequenceId = Math.max(maxSequenceId, range.maxSequenceId());
+                    }
                 }
-                long sequenceId = record.getLong(0);
-                if (sequenceId > 0) {
-                    minSequenceId = Math.min(minSequenceId, sequenceId);
-                    maxSequenceId = Math.max(maxSequenceId, sequenceId);
-                }
-            }
             return new WalFileScan(minSequenceId == Long.MAX_VALUE ? 0 : minSequenceId, maxSequenceId);
         } catch (IOException e) {
             LOG.warn("Failed to scan WAL file metadata: {}", file, e);
@@ -364,6 +362,90 @@ public class WALManagerImpl implements WALManager {
         // LevelDB overhead: header per chunk (7 bytes) + block alignment padding
         // Rough estimate: payload + 7 bytes per 32KB block
         return payloadSize + 7 * ((payloadSize / (LogConstants.BLOCK_SIZE - LogConstants.HEADER_SIZE)) + 1);
+    }
+
+    private static void replayRecord(Slice record, ReplayCallback callback) {
+        if (record.length() > 0 && record.getByte(0) == RECORD_TYPE_DATA_BATCH) {
+            replayBatchRecord(record, callback);
+        } else {
+            replayLegacyDataRecord(record, callback);
+        }
+    }
+
+    private static void replayBatchRecord(Slice record, ReplayCallback callback) {
+        SliceInput input = record.input();
+        input.readByte();
+        requireBytes(input, 8 + 4, "DATA batch header");
+        long sequenceBegin = input.readLong();
+        if (sequenceBegin <= 0) {
+            throw corruptRecord("Invalid batch sequenceBegin: " + sequenceBegin);
+        }
+        int count = input.readInt();
+        if (count <= 0) {
+            throw corruptRecord("Invalid DATA batch count: " + count);
+        }
+        for (int i = 0; i < count; i++) {
+            DataRecordPayload payload = readDataRecordPayload(input);
+            callback.onDataRecord(sequenceBegin + i, payload.key(), payload.value());
+        }
+        requireFullyConsumed(input, "DATA batch");
+    }
+
+    private static void replayLegacyDataRecord(Slice record, ReplayCallback callback) {
+        SliceInput input = record.input();
+        requireBytes(input, 8 + 4, "DATA header");
+        long sequenceId = input.readLong();
+        if (sequenceId <= 0) {
+            throw corruptRecord("Invalid sequenceId: " + sequenceId);
+        }
+        DataRecordPayload payload = readDataRecordPayload(input);
+        requireFullyConsumed(input, "DATA");
+        callback.onDataRecord(sequenceId, payload.key(), payload.value());
+    }
+
+    private static SequenceRange sequenceRange(Slice record) {
+        if (record.length() > 0 && record.getByte(0) == RECORD_TYPE_DATA_BATCH) {
+            SliceInput input = record.input();
+            input.readByte();
+            requireBytes(input, 8 + 4, "DATA batch header");
+            long sequenceBegin = input.readLong();
+            int count = input.readInt();
+            if (sequenceBegin <= 0 || count <= 0) {
+                return SequenceRange.EMPTY;
+            }
+            return new SequenceRange(sequenceBegin, sequenceBegin + count - 1);
+        }
+        if (record.length() < 8) {
+            return SequenceRange.EMPTY;
+        }
+        long sequenceId = record.getLong(0);
+        return sequenceId > 0 ? new SequenceRange(sequenceId, sequenceId) : SequenceRange.EMPTY;
+    }
+
+    private static DataRecordPayload readDataRecordPayload(SliceInput input) {
+        int keyLen = readNonNegativeLength(input, "keyLen");
+        requireBytes(input, keyLen + 4, "DATA key/value header");
+        byte[] key = new byte[keyLen];
+        input.readBytes(key);
+        int valueLen = input.readInt();
+        byte[] value;
+        if (valueLen == VALUE_LEN_DELETE) {
+            value = null;
+        } else {
+            if (valueLen < 0) {
+                throw corruptRecord("Invalid valueLen: " + valueLen);
+            }
+            requireBytes(input, valueLen, "DATA value");
+            value = new byte[valueLen];
+            input.readBytes(value);
+        }
+        return new DataRecordPayload(key, value);
+    }
+
+    private record DataRecordPayload(byte[] key, byte[] value) {}
+
+    private record SequenceRange(long minSequenceId, long maxSequenceId) {
+        private static final SequenceRange EMPTY = new SequenceRange(0, 0);
     }
 
     /**

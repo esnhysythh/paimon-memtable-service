@@ -101,6 +101,29 @@ class WALManagerImplTest {
     }
 
     @Test
+    void appendDataRecordsWritesSingleBatchWithContiguousSequenceIds() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(256));
+        wal.init();
+        long sequenceBegin = wal.appendDataRecords(List.of(
+            new WALManager.DataWrite("k1".getBytes(), "v1".getBytes()),
+            new WALManager.DataWrite("k2".getBytes(), null),
+            new WALManager.DataWrite("k1".getBytes(), "v3".getBytes())
+        ));
+
+        CollectingCallback cb = writeCloseAndReplay(wal, 256);
+
+        assertEquals(1L, sequenceBegin);
+        assertEquals(3L, cb.dataRecords.get(2).sequenceId());
+        assertEquals(3L, cb.dataRecords.size());
+        assertArrayEquals("k1".getBytes(), cb.dataRecords.get(0).key());
+        assertArrayEquals("v1".getBytes(), cb.dataRecords.get(0).value());
+        assertArrayEquals("k2".getBytes(), cb.dataRecords.get(1).key());
+        assertNull(cb.dataRecords.get(1).value());
+        assertArrayEquals("k1".getBytes(), cb.dataRecords.get(2).key());
+        assertArrayEquals("v3".getBytes(), cb.dataRecords.get(2).value());
+    }
+
+    @Test
     void mmapWriterAppendAndReplayDataRecord() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256, true));
         wal.init();
