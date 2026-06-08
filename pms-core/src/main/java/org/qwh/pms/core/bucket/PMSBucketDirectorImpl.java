@@ -21,12 +21,14 @@ import org.qwh.pms.core.storage.SSTMeta;
 import org.qwh.pms.core.storage.SSTReadSnapshot;
 import org.qwh.pms.core.storage.SSTState;
 import org.qwh.pms.core.wal.ReplayCallback;
+import org.qwh.pms.core.wal.WALManager.DataWrite;
 import org.qwh.pms.core.wal.WALManagerImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -37,12 +39,15 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 
 public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private static final Logger LOG = LoggerFactory.getLogger(PMSBucketDirectorImpl.class);
+    private static final int MAX_WRITE_BATCH_COUNT = 1024;
+    private static final int MAX_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
 
     private final MemTableConfig memTableConfig;
     private final StorageConfig storageConfig;
@@ -60,7 +65,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
     private final Object writeMutex = new Object();
+    private final Object writeQueueMutex = new Object();
+    private final ArrayDeque<WriteRequest> pendingWrites = new ArrayDeque<>();
     private final Object sstMaintenanceMutex = new Object();
+    private boolean writeLeaderActive;
     private volatile boolean closed = false;
 
     public PMSBucketDirectorImpl(PMSConfig config) {
@@ -156,30 +164,25 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     public void put(byte[] key, byte[] value) {
         Objects.requireNonNull(key, "key must not be null");
         Objects.requireNonNull(value, "value must not be null; use delete(key) for tombstones or byte[0] for empty values");
-        lifecycleLock.readLock().lock();
-        try {
-            ensureNotClosed();
-            synchronized (writeMutex) {
-                long sequenceId = walManager.appendDataRecord(key, value);
-                curMemTable.put(new Key(key), new Value(value, sequenceId));
-                maybeFreezeLocked();
-            }
-        } finally {
-            lifecycleLock.readLock().unlock();
-        }
+        submitWrite(key, value);
     }
 
     @Override
     public void delete(byte[] key) {
         Objects.requireNonNull(key, "key must not be null");
+        submitWrite(key, null);
+    }
+
+    private void submitWrite(byte[] key, byte[] value) {
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
-            synchronized (writeMutex) {
-                long sequenceId = walManager.appendDataRecord(key, null);
-                curMemTable.put(new Key(key), Value.tombstone(sequenceId));
-                maybeFreezeLocked();
+            WriteRequest request = new WriteRequest(key, value);
+            boolean leader = enqueueWriteRequest(request);
+            if (leader) {
+                runWriteLeader();
             }
+            request.await();
         } finally {
             lifecycleLock.readLock().unlock();
         }
@@ -483,6 +486,80 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return Optional.empty();
     }
 
+    private boolean enqueueWriteRequest(WriteRequest request) {
+        synchronized (writeQueueMutex) {
+            pendingWrites.addLast(request);
+            if (!writeLeaderActive) {
+                writeLeaderActive = true;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    private void runWriteLeader() {
+        while (true) {
+            List<WriteRequest> batch = drainWriteBatch();
+            if (batch.isEmpty()) {
+                synchronized (writeQueueMutex) {
+                    if (pendingWrites.isEmpty()) {
+                        writeLeaderActive = false;
+                        return;
+                    }
+                    continue;
+                }
+            }
+            processWriteBatch(batch);
+        }
+    }
+
+    private List<WriteRequest> drainWriteBatch() {
+        synchronized (writeQueueMutex) {
+            if (pendingWrites.isEmpty()) {
+                return List.of();
+            }
+            List<WriteRequest> batch = new ArrayList<>();
+            int batchBytes = 0;
+            while (!pendingWrites.isEmpty() && batch.size() < MAX_WRITE_BATCH_COUNT) {
+                WriteRequest next = pendingWrites.peekFirst();
+                int nextBytes = next.estimatedWalBytes();
+                if (!batch.isEmpty() && batchBytes + nextBytes > MAX_WRITE_BATCH_BYTES) {
+                    break;
+                }
+                batch.add(pendingWrites.removeFirst());
+                batchBytes += nextBytes;
+            }
+            return batch;
+        }
+    }
+
+    private void processWriteBatch(List<WriteRequest> batch) {
+        Throwable failure = null;
+        try {
+            synchronized (writeMutex) {
+                List<DataWrite> writes = new ArrayList<>(batch.size());
+                for (WriteRequest request : batch) {
+                    writes.add(new DataWrite(request.key(), request.value()));
+                }
+                long sequenceBegin = walManager.appendDataRecords(writes);
+                for (int i = 0; i < batch.size(); i++) {
+                    WriteRequest request = batch.get(i);
+                    long sequenceId = sequenceBegin + i;
+                    Value value = request.value() != null
+                        ? new Value(request.value(), sequenceId)
+                        : Value.tombstone(sequenceId);
+                    curMemTable.put(new Key(request.key()), value);
+                }
+                maybeFreezeLocked();
+            }
+        } catch (Throwable t) {
+            failure = t;
+        }
+        for (WriteRequest request : batch) {
+            request.complete(failure);
+        }
+    }
+
     private void collectLatestFromSSTs(TreeMap<Key, Value> latest, SSTReadSnapshot snapshot, Key start, Optional<Key> end) {
         for (SSTMeta sst : snapshot.metas()) {
             try (var iterator = snapshot.openIterator(sst, start, end)) {
@@ -664,6 +741,59 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             maxSequenceId = Math.max(maxSequenceId, sst.maxSequenceId());
         }
         return new SSTStats(totalBytes, totalRows, minSequenceId, maxSequenceId);
+    }
+
+    private static final class WriteRequest {
+        private final byte[] key;
+        private final byte[] value;
+        private final CountDownLatch done = new CountDownLatch(1);
+        private Throwable failure;
+
+        private WriteRequest(byte[] key, byte[] value) {
+            this.key = key;
+            this.value = value;
+        }
+
+        private byte[] key() {
+            return key;
+        }
+
+        private byte[] value() {
+            return value;
+        }
+
+        private int estimatedWalBytes() {
+            return 8 + key.length + (value != null ? value.length : 0);
+        }
+
+        private void complete(Throwable failure) {
+            this.failure = failure;
+            done.countDown();
+        }
+
+        private void await() {
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    done.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (failure != null) {
+                if (failure instanceof RuntimeException runtimeException) {
+                    throw runtimeException;
+                }
+                if (failure instanceof Error error) {
+                    throw error;
+                }
+                throw new RuntimeException("write failed", failure);
+            }
+        }
     }
 
     private static class CollectingReplayCallback implements ReplayCallback {

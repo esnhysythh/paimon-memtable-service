@@ -258,13 +258,51 @@ PMS 当前阶段接受短提交锁，是为了保证边界正确性。它不应�
 
 这些优化不能改变一个约束：WAL 顺序、sequence 顺序、MemTable 可见顺序、freeze 边界必须可证明一致。
 
+### 7.3 V1 当前写入队列优化决策
+
+当前实现先采用保守的 `Writer Queue + Natural Group Commit`：
+
+```text
+put/delete:
+  create WriteRequest
+  enqueue
+  wait request.done
+
+leader:
+  drain 已经排队的请求形成 batch
+  append 一个 WAL batch record
+  按 batch 顺序串行写 curMemTable
+  batch 结束后检查并执行 maybeFreeze
+  唤醒 batch 内所有同步等待的调用方
+```
+
+关键决策：
+
+- `put/delete` 仍保持同步语义：调用返回时，该请求已经完成 WAL append 且在 MemTable 中可见。
+- 第一版不主动等待 coalesce window；leader 只 drain 当前已经排队的请求。这样单线程循环写不会因为空等聚合窗口而退化。
+- batch 内 MemTable apply 暂时保持串行。PMS 当前 MemTable 是 `userKey -> latest Value`，不是 LevelDB 的 `(userKey, sequenceId)` internal key；若并发 apply，同一 key 的低 sequence 写入可能后完成并覆盖高 sequence，造成旧值复活。
+- freeze 只在完整 batch apply 后触发，避免一个 WAL batch 被 freeze 切成半个可见边界。
+- 后续若要引入主动 coalesce window，应作为可配置项并默认关闭，先用 benchmark 比较吞吐与 p99 延迟。
+
+若未来进一步做 `Parallel MemTable Writer`，必须先补齐 sequence-aware update 与 batch publish barrier：
+
+```text
+same-key update:
+  仅允许更大的 sequenceId 覆盖更小的 sequenceId
+
+freeze:
+  必须等待当前 active batch 的全部 memtable apply 完成
+```
+
+否则会破坏 Deduplicate 语义和 WAL/SST 边界一致性。
+
 ## 8. 当前实现约束与后续 TODO
 
 当前阶段的约束：
 
 - V1 使用轻量 sequence，不实现 MVCC。
 - 同一 Key 仍只保留 latest value。
-- 写入提交路径应串行化，flush/sink 慢路径不持写锁。
+- 写入提交发布路径仍按 batch 串行化，flush/sink 慢路径不持写锁。
 - sequence 可有空洞，但必须单调。
 - `lastFlushedSequenceId` 只用于 SST/WAL 本地恢复边界，不用于 Paimon sink 成功判定。
 
@@ -272,5 +310,6 @@ PMS 当前阶段接受短提交锁，是为了保证边界正确性。它不应�
 
 - 移除或改造 `CurMemTable.delete(Key)`，避免无 sequence tombstone。
 - 为 WAL truncate 增加定期补偿式后台调度，避免只依赖 sink success 后的即时触发。
-- 引入 WriteCoordinator，为 writer queue / group commit 预留扩展点。
+- 将当前 BucketDirector 内部 writer queue 抽出为 WriteCoordinator。
+- 评估可配置 coalesce window，默认保持关闭，避免单线程写入空等退化。
 - 若未来需要 MVCC，将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。

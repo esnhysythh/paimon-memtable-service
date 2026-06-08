@@ -775,6 +775,7 @@ class PMSBucketDirectorImplTest {
             // With 2000 total writes and threshold 10, there should be multiple freezes
             assertTrue(snap.immutableMemTableCount() > 0,
                 "Should have frozen at least one MemTable with threshold=10 and 2000 writes");
+            assertEquals((long) threadCount * opsPerThread, snap.lastAssignedSequenceId());
 
             // Verify data integrity: all written keys should be readable
             for (int t = 0; t < threadCount; t++) {
