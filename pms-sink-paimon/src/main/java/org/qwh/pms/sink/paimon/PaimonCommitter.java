@@ -45,7 +45,8 @@ public final class PaimonCommitter {
                 prepared.batchId(),
                 snapshotId,
                 prepared.maxSequenceId(),
-                prepared.sstIds()
+                prepared.sstIds(),
+                prepared.payload()
             );
         } catch (Exception e) {
             throw new RuntimeException("Paimon commit failed for batch " + prepared.batchId(), e);

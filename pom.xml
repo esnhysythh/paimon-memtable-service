@@ -13,6 +13,7 @@
         <module>pms-core</module>
         <module>pms-codec</module>
         <module>pms-sink-paimon</module>
+        <module>pms-lookup-paimon</module>
         <module>pms-server</module>
         <module>pms-benchmark</module>
     </modules>

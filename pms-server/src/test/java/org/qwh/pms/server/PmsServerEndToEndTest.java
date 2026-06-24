@@ -237,7 +237,7 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void getFallsThroughToPaimonAfterLocalMissAndTombstoneBlocksFallback() throws Exception {
+    void getUsesPaimonLookupAfterLocalMissAndTombstoneBlocksHistoryLookup() throws Exception {
         Path warehouse = tempDir.resolve("warehouse");
 
         PmsServerConfig writerConfig = new ConfigManager().from(
@@ -400,7 +400,11 @@ class PmsServerEndToEndTest {
 
             waitUntil(() -> {
                 try {
-                    return Map.of(1, "auto-a").equals(server.readIntStringRows());
+                    Map<String, Object> state = server.getJson("/state");
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> scheduler = (Map<String, Object>) state.get("scheduler");
+                    return Map.of(1, "auto-a").equals(server.readIntStringRows())
+                        && number(scheduler, "sinkSuccessCount") > 0;
                 } catch (Exception e) {
                     return false;
                 }

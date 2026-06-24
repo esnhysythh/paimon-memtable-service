@@ -4,6 +4,7 @@ import java.util.Optional;
 import java.util.List;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Value;
+import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.storage.SSTMeta;
 
 public interface PMSBucketDirector {
@@ -24,7 +25,7 @@ public interface PMSBucketDirector {
 
     void flushImmutableMemTable();
 
-    void sinkToPaimon();
+    Optional<SinkCommitResult> sinkToPaimon();
 
     Optional<SSTMeta> evictOldestSinkedSST();
 

@@ -6,7 +6,8 @@ public record SinkCommitResult(
     String batchId,
     long snapshotId,
     long persistedSequenceId,
-    List<Long> sstIds
+    List<Long> sstIds,
+    byte[] commitPayload
 ) {
     public SinkCommitResult {
         if (batchId == null || batchId.isBlank()) {
@@ -22,5 +23,16 @@ public record SinkCommitResult(
         if (sstIds.isEmpty()) {
             throw new IllegalArgumentException("sstIds must not be empty");
         }
+        commitPayload = commitPayload == null ? new byte[0] : commitPayload.clone();
+    }
+
+    public SinkCommitResult(
+            String batchId, long snapshotId, long persistedSequenceId, List<Long> sstIds) {
+        this(batchId, snapshotId, persistedSequenceId, sstIds, new byte[0]);
+    }
+
+    @Override
+    public byte[] commitPayload() {
+        return commitPayload.clone();
     }
 }
