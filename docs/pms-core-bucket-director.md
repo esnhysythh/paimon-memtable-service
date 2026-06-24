@@ -94,7 +94,7 @@ PMS 中的数据单元经历以下状态流转：
 3. sinkedImmutableMemTables (倒序)
 4. newSSTs (BloomFilter 加速)     ── 磁盘读取
 5. sinkedSSTs (BloomFilter 加速)  ── 磁盘读取
-6. Paimon 穿透查询                ── 最慢，由 pms-server 在本地 miss 后发起
+6. Paimon 历史数据点查             ── 由 pms-server 在本地 miss 后调用 pms-lookup-paimon
 ```
 
 各层内部读取统一使用 `Value` 语义表达三态：
@@ -105,9 +105,9 @@ PMS 中的数据单元经历以下状态流转：
 | `Value.bytes() != null` | PUT 命中 | 返回该 value bytes |
 | `Value.bytes() == null` | DELETE tombstone 命中 | 停止穿透，返回 `Optional.empty()` |
 
-因此 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 穿透中复活。当前实现中，SST 点查通过 `LocalStorageManager.readSnapshot(...)` 返回的 `SSTReadSnapshot.get(...)` 执行。
+因此 SST 点查接口必须返回 `Optional<Value>`，不能返回 `Optional<byte[]>`。`Optional<byte[]>` 无法区分 miss 与 tombstone，会导致已删除数据从更老层或 Paimon 历史数据中复活。当前实现中，SST 点查通过 `LocalStorageManager.readSnapshot(...)` 返回的 `SSTReadSnapshot.get(...)` 执行。
 
-V1 实现决策：`pms-core` 的 `lookup(key)` 只负责本地层三态判断，不直接依赖 Paimon API；`pms-server` 调用 `lookup(key)` 后，若本地返回 PUT 或 tombstone 则停止，只有本地完全 miss 时才通过 Paimon `ReadBuilder` 主键等值过滤执行穿透点查。这样既保持 core 的 byte-oriented 边界，也保证 tombstone 能阻断 Paimon 旧值复活。
+V1 实现决策：`pms-core` 的 `lookup(key)` 只负责本地层三态判断，不直接依赖 Paimon API；`pms-server` 在本地完全 miss 后调用 `pms-lookup-paimon` 查询已提交 Paimon 数据。该模块的 UNKNOWN 会由 server 作为可重试错误返回，而不是回退或转换为 miss。这样保持 core 的 byte-oriented 边界，也保证 tombstone 能阻断旧值复活。详见 [pms-lookup-paimon.md](pms-lookup-paimon.md)。
 
 ### 4.1 Range / Prefix Scan
 

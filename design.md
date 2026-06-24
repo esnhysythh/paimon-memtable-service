@@ -18,10 +18,12 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
-### 2.2 查询路径
-点查请求分为默认完整表点查和 PMS-local 点查。默认 `get` 按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → Paimon 穿透`。`getLocal` 只查询 PMS 内部层，并返回 HIT / DELETED / MISS 三态；其中 DELETED 必须阻断调用方继续把它当作 Paimon fallback miss。本地 SST 带有 BloomFilter 加速；V1 当前在 `pms-server` 层通过 Paimon `ReadBuilder` 主键等值过滤完成 Paimon 穿透，以保持 `pms-core` byte-oriented 且不依赖 Paimon API。Paimon 穿透路径的 Manifest 元信息缓存复用 Paimon 内建 manifest cache，由 PMS 启动时显式透传 catalog cache 配置。
+### 2.2 查询路径（pms-lookup-paimon 接入后的目标）
+点查请求分为默认完整表点查和 PMS-local 点查。默认 `get` 按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → pms-lookup-paimon`。`getLocal` 只查询 PMS 内部层，并返回 HIT / DELETED / MISS 三态；其中 DELETED 必须阻断后续历史数据查询。
 
-> **后续演进:** 若 `ReadBuilder` 点查路径仍不能满足性能目标，优先引入基于 Paimon `LocalTableQuery` 的 hot bucket 点查缓存层；该层由 PMS 通过 sink/compaction commit message 维护 bucket 级 `DataFileMeta` 视图，`ReadBuilder` 继续作为冷路径和缓存状态不确定时的兜底。详见 [paimon-local-query-cache-design-note.md](docs/paimon-local-query-cache-design-note.md)。
+`pms-lookup-paimon` 为 `(partition, bucket)` 维护完整的 live `DataFileMeta` view，按 Paimon merge-tree 文件优先级执行 direct Parquet point lookup，并可为热点文件构建本地 value SST。其结果为 HIT / DELETED / MISS / UNKNOWN：只有完整有效 view 的 MISS 才返回 not found；UNKNOWN 表示 PMS 不能证明结果正确，server 必须返回可重试错误，不能将其降级为 MISS。生产路径不使用 Paimon `ReadBuilder`；它仅保留为测试和压测的正确性对照。详见 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md)。
+
+> 本模块及相应 server/sink API 尚待实施；在切换完成前，现有 `ReadBuilder` 代码仍是过渡实现，不代表目标架构。
 
 ### 2.3 缓存与淘汰
 - **内存淘汰**：ImmutableMemTable 维护引用计数，归零后退役释放内存。带 Mem 缓存的双持状态（newSSTWithMem / sinkedSSTWithMem）可在内存不足时退化为不带 Mem 的状态。
@@ -37,6 +39,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | 本地 SST 格式 | 参考 LevelDB/RocksDB Block Based Table，保留 Data Block/Index/Footer 结构，不照搬 MVCC InternalKey；SST 查询使用 `Optional<Value>` 表达 miss/put/delete 三态。 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) |
 | SST 当前状态 | 汇总当前 SST/MockSink/WAL 恢复边界状态，并列出后续 RowCodec 与 Paimon sink 对接要求。 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) |
 | Paimon 独占与 Compaction | PMS 独占 Paimon 表写入与合并提交，基于 Paimon `TableWrite.compact(partition, bucket, fullCompaction)` / `prepareCommit` / `TableCommit` 原生 API 触发 Compaction | [pms-core.md](docs/pms-core.md) § 3.4 / [pms-sink-paimon.md](docs/pms-sink-paimon.md) § 10 |
+| Paimon 历史点查 | `pms-lookup-paimon` 维护 partition-bucket live 文件视图；成功 commit 后严格有序地发布 data/compact delta，失效后由完整 snapshot 重建 | [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) |
 | 行编码与 Schema 兼容 | `pms-codec` 负责 Paimon `InternalRow` 与 PMS KV bytes 的转换；delete/tombstone 由 KV 层表达，不写入 row value。 | [pms-codec.md](docs/pms-codec.md) |
 | 流控 | 两层水位线：NORMAL（正常）/ OVERLOADED（拒绝写入） | [pms-core.md](docs/pms-core.md) § 4 |
 | 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；flush/sink 等慢路径异步执行，初期不做快照读 | [pms-core.md](docs/pms-core.md) § 5 |
@@ -82,23 +85,32 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 - `graceful-shutdown`: 分阶段优雅停机。
 - 详见 [pms-server.md](docs/pms-server.md)。
 
-### 4.5 pms-client
+### 4.5 pms-lookup-paimon
+Paimon primary-key 历史点查模块。由 `pms-server` 直接创建和调用，维护 bucket-scoped `DataFileMeta` live view，执行 direct Parquet lookup，并管理热点文件的本地 value SST cache。
+- 本模块不依赖 `pms-core`，不改变 core 的 byte-oriented 边界。
+- server 使用 Paimon `RowKeyExtractor` 从完整主键请求解析 partition、bucket 和 trimmed primary key。
+- sink/compaction commit 成功后，server 使用 Paimon `CommitMessage` 中的 data/compact file delta 更新 view；重启或失效后从完整 snapshot 重建，不回放不确定 delta。
+- 当前只支持固定 hash bucket、Parquet、primary-key + deduplicate 的已验证 profile；UNKNOWN 以可重试错误暴露。
+- 详见 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md)。
+
+### 4.6 pms-client
 Java SDK，负责 Schema 获取、RPC 通信、反压重试，并通过 `pms-codec` 完成行编码。早期可与 server 共用 codec 实现；是否继续保持零依赖客户端包，后续在 client 模块落地时再评估。
 - 详见 [pms-client.md](docs/pms-client.md)。
 
-### 4.6 flink-connector-pms
+### 4.7 flink-connector-pms
 Flink Sink 实现，负责对接 Flink 记录格式，调用 `pms-client`。
 - 详见 [flink-connector-pms.md](docs/flink-connector-pms.md)。
 
-### 4.7 依赖方向
+### 4.8 依赖方向
 
-第一阶段先落地父工程和 `pms-core` 子模块；`pms-codec`、`pms-sink-paimon`、`pms-server`、`pms-client` 后续逐步拆出。
+第一阶段先落地父工程和 `pms-core` 子模块；`pms-codec`、`pms-sink-paimon`、`pms-lookup-paimon`、`pms-server`、`pms-client` 后续逐步拆出。
 
 ```text
 pms-codec       -> Paimon
 pms-core        -> 不依赖 pms-codec，不暴露 InternalRow
 pms-sink-paimon -> pms-core + pms-codec + Paimon
-pms-server      -> pms-core + pms-codec + pms-sink-paimon
+pms-lookup-paimon -> Paimon
+pms-server      -> pms-core + pms-codec + pms-sink-paimon + pms-lookup-paimon
 pms-client      -> pms-codec + RPC client
 flink-connector -> pms-client
 ```
@@ -116,6 +128,7 @@ flink-connector -> pms-client
 | [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) | WAL 只记录数据、SSTMeta/SinkMeta 独立记录恢复边界的设计 |
 | [pms-codec.md](docs/pms-codec.md) | Paimon 行编码、主键编码、RowKind 与 tombstone 边界 |
 | [pms-sink-paimon.md](docs/pms-sink-paimon.md) | 真实 Paimon sink、prepare/commit、delete 语义与恢复协作 |
+| [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) | Paimon 历史点查、live 文件视图、commit delta 发布、失败与恢复语义 |
 | [pms-row-codec-format.md](docs/pms-row-codec-format.md) | PMS row value byte layout、字段查找、列值编码规则 |
 | [pms-primary-key-codec.md](docs/pms-primary-key-codec.md) | PMS primary key ordered byte layout、TiDB mem-comparable 对照、前缀扫描规则 |
 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) | Sequence、写入边界、锁粒度与 WAL 优化设计说明 |

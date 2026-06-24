@@ -10,7 +10,7 @@ PMS SST 的设计主要参考 LevelDB/RocksDB 的 Block Based Table 思路：文
 
 - 点查高效：通过 BloomFilter 快速排除不存在的 Key，通过 Index Block 定位少量 Data Block。
 - 顺序归并友好：SST iterator 按 Paimon 主键序输出，供本地 compact 和 Paimon Sink 使用。
-- Tombstone 语义完整：读取结果必须区分 miss、delete、put，避免已删除数据从更老层或 Paimon 穿透中复活。
+- Tombstone 语义完整：读取结果必须区分 miss、delete、put，避免已删除数据从更老层或 Paimon 历史数据中复活。
 - Sequence 边界可恢复：SST 文件和 `SSTMeta` 都必须记录 `minSequenceId/maxSequenceId`。
 - 格式简单可演进：V1 优先完成可 flush、可点查、可恢复边界的最小闭环，压缩、逐 Block CRC、多级索引可后续演进。
 
@@ -112,7 +112,7 @@ valueLen < -1  -> 文件损坏
 
 原版 LevelDB 支持通过 FilterPolicy 在 table 中引入 Filter Block，通常由 MetaIndex Block 间接定位；当前可参考的 Java 移植版 table 包未实现 Bloom/Filter Block，MetaIndex 也是空 block。PMS V1 因元数据种类固定，选择自行定义 BloomFilter Block，并由 Footer 直接记录 `bloomHandle`。
 
-BloomFilter Block 基于 user key 构建，PUT 和 DELETE 都必须加入 BloomFilter。原因是 tombstone 命中时必须阻断更老层或 Paimon 穿透。
+BloomFilter Block 基于 user key 构建，PUT 和 DELETE 都必须加入 BloomFilter。原因是 tombstone 命中时必须阻断更老层或 Paimon 历史数据查询。
 
 建议格式：
 

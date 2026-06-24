@@ -174,7 +174,7 @@ interface ImmutableMemTable {
 核心语义：
 - Key 按主键序排列（与 Paimon 底层主键序编码 100% 一致，保证无需再排序即可写入 Paimon）。
 - PMS V1 不采用 LevelDB `InternalKey = userKey + sequence + valueType` 设计；SST 排序 Key 只包含 user key，`sequenceId` 和 tombstone 信息放在 `Value` payload 与 `SSTMeta` 中。
-- SST 查询必须能区分 miss、PUT 命中和 DELETE tombstone 命中，避免已删除数据从更老层或 Paimon 穿透中复活。
+- SST 查询必须能区分 miss、PUT 命中和 DELETE tombstone 命中，避免已删除数据从更老层或 Paimon 历史数据中复活。
 - V1 仅使用 Footer 中的全文件 CRC 校验完整性；逐 Data Block CRC 可作为后续演进。
 
 **核心接口**：
@@ -225,7 +225,7 @@ SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` �
 
 **SST 文件校验**：
 - 打开或注册 SST 时校验 Footer 中的全文件 CRC32，覆盖 Footer 之前的全部数据。
-- 校验失败 → 标记该 SST 文件为损坏，记录告警日志。损坏 SST 中的数据从其他层（更新层的 MemTable 或 Paimon 穿透）补全。
+- 校验失败 → 标记该 SST 文件为损坏，记录告警日志。损坏 SST 中的数据从其他层（更新层的 MemTable 或 Paimon 历史数据点查）补全。
 - 若本地 `flush-boundary.meta` 已经记录 `lastFlushedSequenceId > 0`，说明 SST 已经参与 WAL 恢复边界。此时启动阶段发现 SST 损坏应失败，而不是静默跳过，否则可能因为 WAL replay 跳过已 flush sequence 而丢失数据。
 - V1 不做逐 Block 降级读取。
 
@@ -345,10 +345,10 @@ interface SinkManager {
 - 触发时机：由 `BackgroundTaskScheduler` 枚举 Paimon partition/bucket 候选，按文件数、L0/level 分布、距上次 compact 时间或手动 full compact 请求触发。V1 可先按 bucket 文件数阈值做保守触发。
 - Compaction 与 Sink 在 PMS 内串行提交 Paimon snapshot，避免同一 PMS 进程内的 commit identifier 顺序和 Paimon manifest commit 竞争复杂化；实际文件 rewrite 可在 Paimon compact executor 中异步执行，但提交阶段必须纳入 PMS recovery。
 
-**Paimon Manifest 缓存**：
-- V1 不在 PMS 内部自建 Manifest 索引；穿透查询继续通过 `pms-server` 的 Paimon `ReadBuilder` 路径执行。
-- PMS 启动加载 Paimon catalog 时显式透传 Paimon 内建 manifest cache 配置，复用 Paimon `ManifestEntryCache` 对 manifest 元信息的缓存与 partition/bucket 分段过滤能力。
-- 该决策保持 `pms-core` byte-oriented，不引入 Paimon API 依赖；后续若 `ReadBuilder` 点查仍不能满足性能目标，可在 `pms-server` / Paimon 适配层引入 `LocalTableQuery` hot bucket 点查缓存，由 sink/compaction commit message 维护 bucket 级 `DataFileMeta` 视图，`pms-core` 仍只暴露本地三态 lookup。
+**Paimon 历史点查**：
+- `pms-core` 不维护 Paimon manifest 或 data-file 索引；它只暴露本地三态 `lookup`。Paimon 历史点查由 `pms-server` 调用 `pms-lookup-paimon` 完成，因此 core 不引入 Paimon API 依赖。
+- `pms-lookup-paimon` 维护 partition-bucket `DataFileMeta` live view；普通 sink 与 compaction 的成功提交后由 server 发布严格有序 delta，重启或失效后从完整 snapshot 重建。
+- `ReadBuilder` 不属于生产查询路径，只作为测试正确性对照。lookup 无法确定结果时由 server 返回可重试错误，不能返回 miss。详见 [pms-lookup-paimon.md](pms-lookup-paimon.md)。
 
 ### 3.5 PMSBucketDirector
 
