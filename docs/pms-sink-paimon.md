@@ -325,6 +325,12 @@ compact-success-${compactionId}.json
 
 ## 11. 与 pms-server 的交接
 
+### 11.1 向 lookup 模块发布成功提交
+
+`pms-lookup-paimon` 维护 Paimon data-file live view，需要在 commit **成功后**获得同一批 `CommitMessage` 的 data/compact 文件增量。为保持 `pms-core` 不依赖 Paimon 类型，`PreparedSinkCommit.payload` 继续是 opaque bytes；但 `SinkCommitResult` 应向 server 暴露同一份 commit payload，并由 server 解码后直接发布给 lookup 模块。
+
+普通 sink、写入路径可能产生的 implicit compaction，以及未来 explicit compaction 都必须在同一张表的 commit/publish 串行约束下发布。compaction 使用独立 metadata 和 commit identifier，但提交成功后同样产出 `snapshotId + CommitMessage payload`。lookup 不重放历史 payload：发布失败或进程重启时以完整 bucket snapshot 重建。详见 [pms-lookup-paimon.md](pms-lookup-paimon.md)。
+
 `pms-sink-paimon` 当前已经足以支撑 `pms-server` 最小闭环：
 
 ```text

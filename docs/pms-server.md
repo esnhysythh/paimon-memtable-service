@@ -1,7 +1,7 @@
 # PMS Server 设计文档
 
 ## 1. 模块定位
-PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC 接口、编排故障恢复流程、暴露可观测性端点。它是 `pms-core` 的消费者，本身不包含存储逻辑。
+PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC 接口、编排故障恢复流程、暴露可观测性端点。它消费 `pms-core`、`pms-sink-paimon` 与 `pms-lookup-paimon`，本身不包含本地存储或 Paimon 文件查询逻辑。
 
 ## 2. 核心组件
 
@@ -14,7 +14,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 | 服务 | 请求 | 响应 | 调用核心接口 |
 |------|------|------|-------------|
 | `write` | `WriteRequest(key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
-| `get` | `GetRequest(key)` | `GetResponse(status, found, row?)` | `PMSBucketDirector.lookup()` + Paimon fallback |
+| `get` | `GetRequest(key)` | `GetResponse(status, found, row?)` | `PMSBucketDirector.lookup()` + `pms-lookup-paimon` |
 | `getLocal` | `GetRequest(key)` | `GetLocalResponse(status, result, row?)` | `PMSBucketDirector.lookup()` |
 | `prefix` | `PrefixRequest(primaryKeyPrefix)` | `NOT_SUPPORTED` | V1 暂不支持完整表 prefix 查询 |
 | `prefixLocal` | `PrefixRequest(primaryKeyPrefix)` | `PrefixResponse(status, rows)` | `PMSBucketDirector.prefixScan()` |
@@ -26,7 +26,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
   - `HIT`：本地命中 PUT，返回 `row`。
   - `DELETED`：本地命中 tombstone，不返回 `row`，调用方不得继续把它当成普通 miss 后查 Paimon。
   - `MISS`：PMS 本地完全未命中，调用方可自行决定是否查 Paimon。
-- 本地 tombstone 必须阻断 Paimon fallback，避免已删除旧值从 Paimon 复活。
+- 本地 tombstone 必须阻断后续 Paimon 历史数据查询，避免已删除旧值复活。
 
 **主键前缀查询语义**：
 
@@ -37,13 +37,13 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 - 本地多层数据按 sequence 选择最新版本；最新版本为 tombstone 的 key 不返回，避免旧层数据复活。
 - V1 仅支持 `prefixLocal`。`prefix` 作为完整表 prefix 查询接口名预留，当前直接返回 `NOT_SUPPORTED`；未来实现时必须合并 PMS 本地层与 Paimon 结果，并用 PMS 本地 tombstone 覆盖 Paimon 旧值。
 
-**点查 Paimon 穿透语义**：
+**点查 Paimon 历史数据语义（pms-lookup-paimon 接入后的目标）**：
 
 - `pms-server` 先将主键编码为 PMS key，并调用 `PMSBucketDirector.lookup()` 获取本地三态结果。
-- 本地 PUT 命中时直接解码返回；本地 tombstone 命中时直接返回 not found，禁止继续穿透 Paimon。
-- 只有本地 memTable 与本地 SST 全部 miss 时，才进入 Paimon fallback。当前实现使用 Paimon `ReadBuilder` 构造所有主键字段的等值 predicate，并以 `limit=1` 查询 Paimon。
-- 该实现决策是为了保持 `pms-core` 不依赖 Paimon，同时让后续 sinkedSST 淘汰后仍能从 Paimon 补读已持久化数据。
-- 后续若启用 Paimon `LocalTableQuery`，应只作为 `ReadBuilder` 之前的 hot bucket 加速层：bucket 文件视图完整且最新时可直接返回命中或 not found；状态不确定、未初始化或 bucket 模式不支持时必须回退 `ReadBuilder`。详见 [paimon-local-query-cache-design-note.md](paimon-local-query-cache-design-note.md)。
+- 本地 PUT 命中时直接解码返回；本地 tombstone 命中时直接返回 not found，禁止继续查询历史 Paimon 数据。
+- 只有本地 memTable 与本地 SST 全部 miss 时，才调用 `pms-lookup-paimon`。server 用 `FileStoreTable.createRowKeyExtractor()` 从完整主键请求得到 partition、bucket 与 trimmed primary key，并将它们传入 bucket-scoped lookup primitive。
+- lookup 的 HIT / DELETED / MISS 分别映射为 row / not found / not found。UNKNOWN 映射为可重试的 `PmsLookupUnavailableException`，不得映射为 MISS。
+- 生产路径不使用 Paimon `ReadBuilder` 或 `LocalTableQuery`。`ReadBuilder` 只用于集成测试与压测正确性对照。模块的完整 snapshot、commit delta、恢复和 profile 约束见 [pms-lookup-paimon.md](pms-lookup-paimon.md)。
 
 **写入响应状态**：
 
@@ -71,7 +71,8 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
      使用 SinkMeta 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。
    - 若存在 success：
      通过 success.sstIds 与 persistedSequenceId 推导 sinkedSST，并修正 SST metadata state。
-5. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程
+5. 创建 `pms-lookup-paimon` stack 并取得其独立 cache directory 的所有权；不恢复 live file view，也不回放历史 delta。
+6. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程。首次访问每个 bucket 时从完整最新 snapshot 安装其 view。
 ```
 
 **启动顺序**：

@@ -87,10 +87,10 @@ curMemTable
 immutableMemTables
 newRuns    按 maxFlushId 倒序
 sinkedRuns 按 maxFlushId 倒序
-Paimon 穿透
+pms-lookup-paimon 历史数据点查
 ```
 
-因为 PMS 使用 deduplicate latest-state 语义，点查遇到首个 key 命中即可停止；如果命中 tombstone，也必须停止穿透，避免旧值从更老 run 或 Paimon 中复活。
+因为 PMS 使用 deduplicate latest-state 语义，点查遇到首个 key 命中即可停止；如果命中 tombstone，也必须停止后续历史数据查询，避免旧值从更老 run 或 Paimon 中复活。
 
 Range / prefix scan 不能只返回首个命中层。它必须遍历所有本地层，并按 `Value.sequenceId` 为每个 key 选择最新 entry；最新 entry 是 tombstone 时不返回该 key。
 

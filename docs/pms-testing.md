@@ -71,7 +71,7 @@ class FakeSinkManager implements SinkManager {
 | 场景 | 验证点 |
 |------|--------|
 | 完整写入路径 | Client 序列化 → RPC → MemTable → SST → Paimon 2PC → 数据可查 |
-| 完整查询路径 | 各层命中 + Paimon 穿透，结果正确 |
+| 完整查询路径 | 各本地层命中 + `pms-lookup-paimon` 的 HIT/DELETED/MISS/UNKNOWN 语义正确；`ReadBuilder` 仅作为测试对照 |
 | WAL 崩溃恢复 - 正常 | Kill → 重启 → 数据完整、不重复提交 |
 | SinkMeta 崩溃恢复 - prepare 后 | Kill → 重启 → 使用 SinkMeta 中的 prepared payload、batch 和 fileRefs 重试 commit |
 | SinkMeta 崩溃恢复 - success 后 SSTMeta 未更新 | Kill → 重启 → 通过 SinkMeta success 推导 sinkedSST，并修正 SST metadata state |
