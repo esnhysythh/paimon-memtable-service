@@ -21,7 +21,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 ### 2.2 查询路径
 点查请求分为默认完整表点查和 PMS-local 点查。默认 `get` 按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → Paimon 穿透`。`getLocal` 只查询 PMS 内部层，并返回 HIT / DELETED / MISS 三态；其中 DELETED 必须阻断调用方继续把它当作 Paimon fallback miss。本地 SST 带有 BloomFilter 加速；V1 当前在 `pms-server` 层通过 Paimon `ReadBuilder` 主键等值过滤完成 Paimon 穿透，以保持 `pms-core` byte-oriented 且不依赖 Paimon API。Paimon 穿透路径的 Manifest 元信息缓存复用 Paimon 内建 manifest cache，由 PMS 启动时显式透传 catalog cache 配置。
 
-> **后续演进:** 若 `ReadBuilder` 点查路径仍不能满足性能目标，再评估基于 Paimon `LocalTableQuery` 的 bucket 级点查视图，用于替换/优化 V1 的穿透路径。
+> **后续演进:** 若 `ReadBuilder` 点查路径仍不能满足性能目标，优先引入基于 Paimon `LocalTableQuery` 的 hot bucket 点查缓存层；该层由 PMS 通过 sink/compaction commit message 维护 bucket 级 `DataFileMeta` 视图，`ReadBuilder` 继续作为冷路径和缓存状态不确定时的兜底。详见 [paimon-local-query-cache-design-note.md](docs/paimon-local-query-cache-design-note.md)。
 
 ### 2.3 缓存与淘汰
 - **内存淘汰**：ImmutableMemTable 维护引用计数，归零后退役释放内存。带 Mem 缓存的双持状态（newSSTWithMem / sinkedSSTWithMem）可在内存不足时退化为不带 Mem 的状态。
@@ -36,7 +36,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | 轻量级 Sequence | 每条写入分配单调递增 sequenceId，作为 freeze/flush/sink/WAL 截断的内部边界坐标。V1 不做 MVCC 多版本。 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) |
 | 本地 SST 格式 | 参考 LevelDB/RocksDB Block Based Table，保留 Data Block/Index/Footer 结构，不照搬 MVCC InternalKey；SST 查询使用 `Optional<Value>` 表达 miss/put/delete 三态。 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) |
 | SST 当前状态 | 汇总当前 SST/MockSink/WAL 恢复边界状态，并列出后续 RowCodec 与 Paimon sink 对接要求。 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) |
-| Paimon 独占与 Compaction | PMS 独占 Paimon 表写入，内部直接调用 Paimon 原生 API 触发 Compaction | [pms-core.md](docs/pms-core.md) § 3.4 |
+| Paimon 独占与 Compaction | PMS 独占 Paimon 表写入与合并提交，基于 Paimon `TableWrite.compact(partition, bucket, fullCompaction)` / `prepareCommit` / `TableCommit` 原生 API 触发 Compaction | [pms-core.md](docs/pms-core.md) § 3.4 / [pms-sink-paimon.md](docs/pms-sink-paimon.md) § 10 |
 | 行编码与 Schema 兼容 | `pms-codec` 负责 Paimon `InternalRow` 与 PMS KV bytes 的转换；delete/tombstone 由 KV 层表达，不写入 row value。 | [pms-codec.md](docs/pms-codec.md) |
 | 流控 | 两层水位线：NORMAL（正常）/ OVERLOADED（拒绝写入） | [pms-core.md](docs/pms-core.md) § 4 |
 | 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；flush/sink 等慢路径异步执行，初期不做快照读 | [pms-core.md](docs/pms-core.md) § 5 |

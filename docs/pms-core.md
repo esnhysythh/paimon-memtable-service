@@ -338,14 +338,17 @@ interface SinkManager {
 当前实现使用 `SinkCoordinator` 编排 `SinkManager` 与 `SinkMetaStore`；默认 `MockSinkManager` 可跑通 PMS 内部状态流转，真实 Paimon sink 由 `pms-sink-paimon` 注入。
 
 **Compaction 集成**：
-- 调用 Paimon 原生 `Table.compact()` 接口，不自己实现合并逻辑。
-- 触发时机：Paimon L0 文件数超过阈值时，由 `BackgroundTaskScheduler` 触发。
-- Compaction 是异步操作，不阻塞 Sink 路径。
+- PMS 不自己实现 Paimon 文件合并算法；由 `pms-sink-paimon` 调用 Paimon 原生 `TableWrite.compact(partition, bucket, fullCompaction)`，再通过 `prepareCommit(waitCompaction=true, commitIdentifier)` 和 `TableCommit` 提交 compact 结果。
+- Paimon `Table` 本身没有面向 Java Program API 的 `compact()` 入口，compact 是 partition/bucket 级的 write operation。该决策来自 Paimon 1.4.x 源码：`TableWrite` 暴露 `compact(...)`，`StreamTableWrite` 暴露带 `commitIdentifier` 的 `prepareCommit(...)`。
+- 为了让 PMS 掌控 snapshot 生成，写入 sink 与显式 compaction 应拆成两个 Paimon table view：写入路径使用 `table.copy(Map.of("write-only", "true"))` 关闭写入端隐式 compaction；compaction 路径使用 `table.copy(Map.of("write-only", "false"))` 执行显式 compact。这样 PMS 的普通 sink 只产生数据写入 snapshot，Paimon compact snapshot 只由 PMS compaction scheduler 产生。
+- Compaction 不改变 PMS 本地 SST/WAL 边界，也不推进 `persistedSequenceId`；它只改变 Paimon manifest 中的数据文件布局。因此恢复 metadata 不应复用 `SinkMeta` 的 `sstIds/persistedSequenceId` 语义，而应由 `pms-sink-paimon` 或 `pms-server` 维护独立的 prepared/success compaction metadata。
+- 触发时机：由 `BackgroundTaskScheduler` 枚举 Paimon partition/bucket 候选，按文件数、L0/level 分布、距上次 compact 时间或手动 full compact 请求触发。V1 可先按 bucket 文件数阈值做保守触发。
+- Compaction 与 Sink 在 PMS 内串行提交 Paimon snapshot，避免同一 PMS 进程内的 commit identifier 顺序和 Paimon manifest commit 竞争复杂化；实际文件 rewrite 可在 Paimon compact executor 中异步执行，但提交阶段必须纳入 PMS recovery。
 
 **Paimon Manifest 缓存**：
 - V1 不在 PMS 内部自建 Manifest 索引；穿透查询继续通过 `pms-server` 的 Paimon `ReadBuilder` 路径执行。
 - PMS 启动加载 Paimon catalog 时显式透传 Paimon 内建 manifest cache 配置，复用 Paimon `ManifestEntryCache` 对 manifest 元信息的缓存与 partition/bucket 分段过滤能力。
-- 该决策保持 `pms-core` byte-oriented，不引入 Paimon API 依赖；后续若 `ReadBuilder` 点查仍不能满足性能目标，再评估基于 Paimon `LocalTableQuery` 的 bucket 级点查视图。
+- 该决策保持 `pms-core` byte-oriented，不引入 Paimon API 依赖；后续若 `ReadBuilder` 点查仍不能满足性能目标，可在 `pms-server` / Paimon 适配层引入 `LocalTableQuery` hot bucket 点查缓存，由 sink/compaction commit message 维护 bucket 级 `DataFileMeta` 视图，`pms-core` 仍只暴露本地三态 lookup。
 
 ### 3.5 PMSBucketDirector
 

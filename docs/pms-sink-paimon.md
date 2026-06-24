@@ -243,7 +243,87 @@ PMS 暂不通过填充占位值的方式绕过该限制，以免污染 delete �
 - prepared file ref 数量。
 - pending prepared commit 数量。
 
-## 10. 与 pms-server 的交接
+## 10. Paimon Compaction 集成方案
+
+PMS 需要掌控 Paimon 表的合并，因为 PMS 是该表的唯一修改者。调研 Paimon 1.4.x 代码后，结论是：不应设计成调用 `Table.compact()`，因为 `Table` 没有这个 Java Program API；Paimon 的 compact 入口在 `TableWrite` 上：
+
+```java
+write.compact(partition, bucket, fullCompaction);
+messages = write.prepareCommit(true, commitIdentifier);
+commit.filterAndCommit(Map.of(commitIdentifier, messages));
+```
+
+`compact(...)` 只提交或触发后台 compaction task，不保证返回时 compact 已完成；compact 结果会在后续 `prepareCommit(waitCompaction=true, ...)` 中 drain 成 `CommitMessage`。因此 PMS 必须把 compaction 当作一种可恢复的 Paimon commit，而不是 fire-and-forget 后台动作。
+
+### 10.1 与普通 Sink 的关系
+
+当前 `PaimonFlusher.prepare` 使用 `StreamTableWrite.prepareCommit(true, commitIdentifier)`。在 Paimon 主键表中，写入 flush 后会触发 `CompactManager.triggerCompaction(false)`，`waitCompaction=true` 还会等待结果。这意味着当前 PMS 写入路径可能已经隐式产生 compact committable，但该行为不受 PMS scheduler、metadata 和指标掌控。
+
+推荐改成两份 table view：
+
+| 用途 | table view | commit user | 行为 |
+|------|------------|-------------|------|
+| 普通 sink | `table.copy(Map.of("write-only", "true"))` | `pms-sink-${tableId}` | 只写入新 data files，不做写入端 compaction/snapshot expiration |
+| 显式 compaction | `table.copy(Map.of("write-only", "false"))` | `pms-compact-${tableId}` | 枚举 partition/bucket，显式调用 Paimon compact，并提交 compact snapshot |
+
+使用独立 commit user 的原因是 Paimon stream commit 的 `commitIdentifier` 需要在同一 commit user 下单调递增并可用于幂等过滤。普通 sink 已使用 `SinkBatch.maxSequenceId()` 作为 identifier；compaction 没有 PMS sequence 边界，应维护独立的本地单调 `compactionCommitId`。
+
+### 10.2 Compaction Prepare/Commit 流程
+
+建议新增 `PaimonCompactionManager`，仍放在 `pms-sink-paimon`，不让 `pms-core` 依赖 Paimon API。
+
+```text
+PaimonCompactionPlanner
+  -> FileStoreTable.newSnapshotReader().bucketEntries()
+  -> select partition/bucket candidates
+  -> StreamTableWrite.compact(partition, bucket, fullCompaction)
+  -> StreamTableWrite.prepareCommit(true, compactionCommitId)
+  -> encode CommitMessage payload
+  -> save prepared compaction metadata
+  -> StreamTableCommit.filterAndCommit(compactionCommitId -> messages)
+  -> save success compaction metadata
+```
+
+候选枚举可先使用 `SnapshotReader.bucketEntries()`，它能得到 `partition`、`bucket`、`fileCount`、`fileSizeInBytes`、`recordCount` 和最近文件创建时间。V1 先按 `fileCount >= threshold` 或手动 full compact 触发即可；后续如果要精确识别 L0 文件数或 level 分布，再读取 manifest entries 或 `DataSplit.dataFiles()`。
+
+### 10.3 Metadata 与恢复
+
+Compaction 不推进 PMS `persistedSequenceId`，也不改变本地 SST 状态，因此不要把 compact success 写成 `SinkMeta`。建议新增独立 metadata：
+
+```text
+compact-prepare-${compactionId}.json
+  compactionId
+  commitIdentifier
+  fullCompaction
+  partitionBuckets
+  paimonCommitPayloadBase64
+  outputFileRefs
+  inputFileCount/outputFileCount
+
+compact-success-${compactionId}.json
+  compactionId
+  commitIdentifier
+  snapshotId
+  committedAtMillis
+```
+
+崩溃恢复时，对存在 prepare 但没有 success 的 compaction，使用原始 `commitIdentifier` 和 payload 调用 `StreamTableCommit.filterAndCommit(...)`。这与普通 sink 的 prepared commit 恢复模型一致，可保证重复提交幂等。
+
+### 10.4 调度与并发约束
+
+- 同一 PMS 进程内，普通 sink commit 与 compact commit 应串行化。文件 rewrite 可以异步，但 manifest commit 要串行，以保持 snapshot 来源可解释。
+- 同一 Paimon partition 的 compaction 只能有一个执行者。PMS 独占写入模型下，禁止外部 Flink/Spark dedicated compact job 同时作用于同一表。
+- Compaction 失败不应回滚 PMS 本地 WAL/SST 边界；只标记 compact task 失败并重试或等待人工处理。普通 sink 仍可继续推进，但如果 compact 长期失败，点查穿透和 AP 查询会承受更多 sorted runs。
+- 优雅停机应停止调度新的 compact task；已写出 prepared metadata 的 task 必须完成 commit 或在下次启动恢复提交。
+
+### 10.5 实现优先级
+
+1. 先调整 `PaimonSinkManager` 构造，让普通 sink 使用 `write-only=true` 的 table copy，并把 `prepareCommit` 的隐式 compaction 从写入路径剥离。
+2. 新增 `PaimonCompactionManager`、`PreparedPaimonCompaction`、`PaimonCompactionMetaStore`，复用现有 `PaimonCommitPayloadCodec` 和 file ref 校验逻辑。
+3. server scheduler 增加 `compactPaimon()`，V1 以 bucket file count 阈值和手动 full compact API 为触发条件。
+4. 增加真实 Paimon 集成测试：write-only sink 不产生 compact snapshot；显式 compact 后文件数下降/compact snapshot 出现；prepare 后崩溃能 recovery commit；重复 recovery commit 幂等。
+
+## 11. 与 pms-server 的交接
 
 `pms-sink-paimon` 当前已经足以支撑 `pms-server` 最小闭环：
 

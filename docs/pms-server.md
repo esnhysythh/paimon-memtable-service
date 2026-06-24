@@ -14,7 +14,7 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 | 服务 | 请求 | 响应 | 调用核心接口 |
 |------|------|------|-------------|
 | `write` | `WriteRequest(key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
-| `get` | `GetRequest(key)` | `GetResponse(status, found, row?)` | `PMSBucketDirector.lookup()` + Paimon `ReadBuilder` fallback |
+| `get` | `GetRequest(key)` | `GetResponse(status, found, row?)` | `PMSBucketDirector.lookup()` + Paimon fallback |
 | `getLocal` | `GetRequest(key)` | `GetLocalResponse(status, result, row?)` | `PMSBucketDirector.lookup()` |
 | `prefix` | `PrefixRequest(primaryKeyPrefix)` | `NOT_SUPPORTED` | V1 暂不支持完整表 prefix 查询 |
 | `prefixLocal` | `PrefixRequest(primaryKeyPrefix)` | `PrefixResponse(status, rows)` | `PMSBucketDirector.prefixScan()` |
@@ -41,8 +41,9 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 
 - `pms-server` 先将主键编码为 PMS key，并调用 `PMSBucketDirector.lookup()` 获取本地三态结果。
 - 本地 PUT 命中时直接解码返回；本地 tombstone 命中时直接返回 not found，禁止继续穿透 Paimon。
-- 只有本地 memTable 与本地 SST 全部 miss 时，才使用 Paimon `ReadBuilder` 构造所有主键字段的等值 predicate，并以 `limit=1` 查询 Paimon。
+- 只有本地 memTable 与本地 SST 全部 miss 时，才进入 Paimon fallback。当前实现使用 Paimon `ReadBuilder` 构造所有主键字段的等值 predicate，并以 `limit=1` 查询 Paimon。
 - 该实现决策是为了保持 `pms-core` 不依赖 Paimon，同时让后续 sinkedSST 淘汰后仍能从 Paimon 补读已持久化数据。
+- 后续若启用 Paimon `LocalTableQuery`，应只作为 `ReadBuilder` 之前的 hot bucket 加速层：bucket 文件视图完整且最新时可直接返回命中或 not found；状态不确定、未初始化或 bucket 模式不支持时必须回退 `ReadBuilder`。详见 [paimon-local-query-cache-design-note.md](paimon-local-query-cache-design-note.md)。
 
 **写入响应状态**：
 
@@ -178,13 +179,15 @@ class ConfigManager {
 | MemTable Freeze 检查 | 1s | 检查 curMemTable 是否达阈值，触发 `freezeCurMemTable()` |
 | Immutable Flush | 立即（Freeze 后） | 将新冻结的 ImmutableMemTable 刷盘为 SST |
 | Sink Paimon | 30s | 检查 newSST 数量，触发 `sinkToPaimon()` |
-| Paimon Compaction | 60s | 检查 Paimon L0 文件数，触发 `compact()` |
+| Paimon Compaction | 60s | 枚举 Paimon partition/bucket 候选，通过 `pms-sink-paimon` 调用 Paimon `TableWrite.compact(...)` 并以独立 metadata 提交 compact snapshot |
 | 本地 SST 合并 | 300s | 检查小文件数量，触发 `compactLocalSSTs()` |
 | sinkedSST 淘汰 | Sink 后 | 根据本地 SST 总大小、总文件数或总物理 entry 数检查阈值，循环触发 `evictOldestSinkedSST()`；只删除已 sinked 的最老 SST |
-
-本地 SST 合并当前是 standalone compact，不与 Paimon sink merge 融合。sink、local compact 和 sinkedSST evict 在 core 内串行化，避免 compact 修改正在 sink 的 new run；sink+compact 融合优化暂缓，需等独立恢复状态机设计清楚后再实现。
 | WAL 截断 | 300s | 检查可安全截断的 WAL 文件，执行 `truncate()` |
 | 水位线检查 | 0.5s | 评估当前水位线，调整后台任务优先级 |
+
+本地 SST 合并当前是 standalone compact，不与 Paimon sink merge 融合。sink、local compact 和 sinkedSST evict 在 core 内串行化，避免 compact 修改正在 sink 的 new run；sink+compact 融合优化暂缓，需等独立恢复状态机设计清楚后再实现。
+
+Paimon compaction 是 Paimon manifest/data-file 层的维护任务，不进入 `pms-core` 的本地 SST 状态机。server 层负责调度它，并确保同一 PMS 进程内普通 sink commit 与 compact commit 串行化。写入路径建议使用 `write-only=true` 的 Paimon table copy 关闭隐式 compaction；compact 任务使用 `write-only=false` 的 table copy 显式触发合并。
 
 **任务优先级调整**（与流控联动）：
 
