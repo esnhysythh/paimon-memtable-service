@@ -12,7 +12,7 @@ import java.util.List;
 public final class SinkMetaPayloadCodec {
     private static final int PREPARE_MAGIC = 0x50535052; // PSPR
     private static final int SUCCESS_MAGIC = 0x50535343; // PSSC
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     private SinkMetaPayloadCodec() {}
 
@@ -101,6 +101,7 @@ public final class SinkMetaPayloadCodec {
             out.writeLong(result.snapshotId());
             out.writeLong(result.persistedSequenceId());
             writeLongList(out, result.sstIds());
+            writeBytes(out, result.commitPayload());
             out.flush();
             return bytes.toByteArray();
         } catch (IOException e) {
@@ -120,7 +121,8 @@ public final class SinkMetaPayloadCodec {
                 readString(in),
                 in.readLong(),
                 in.readLong(),
-                readLongList(in)
+                readLongList(in),
+                readBytes(in)
             );
             requireFullyConsumed(in);
             return result;

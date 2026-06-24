@@ -1,23 +1,37 @@
 package org.qwh.pms.server;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.KeyValueFileStore;
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.predicate.PredicateBuilder;
-import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.io.DataFilePathFactory;
+import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.table.Table;
-import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.RowKeyExtractor;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
 import org.qwh.pms.codec.PmsRowValueCodec;
+import org.qwh.pms.lookup.api.LookupRequest;
+import org.qwh.pms.lookup.api.LookupResult;
+import org.qwh.pms.lookup.api.ResolvedDataFile;
+import org.qwh.pms.lookup.api.SchemaMismatchException;
+import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
+import org.qwh.pms.lookup.live.CandidatePlanner;
+import org.qwh.pms.lookup.live.LiveFileIndex;
+import org.qwh.pms.lookup.paimon.PaimonKeyValueLookupService;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
 import org.qwh.pms.core.config.StorageConfig;
 import org.qwh.pms.core.memtable.model.Value;
+import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
+import org.qwh.pms.sink.paimon.PaimonCommitPayloadCodec;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +49,7 @@ public final class PmsTableService implements AutoCloseable {
 
     private final PaimonTableLoader.LoadedTable loadedTable;
     private final Table table;
+    private final FileStoreTable fileStoreTable;
     private final PMSBucketDirectorImpl director;
     private final PmsPrimaryKeyCodec keyCodec;
     private final PmsRowValueCodec valueCodec;
@@ -42,6 +57,11 @@ public final class PmsTableService implements AutoCloseable {
     private final List<String> primaryKeys;
     private final StorageConfig storageConfig;
     private final ReentrantLock maintenanceLock = new ReentrantLock();
+    private final Object paimonCommitPublishLock = new Object();
+    private final PaimonKeyValueLookupService paimonLookup;
+    private final PaimonCommitPayloadCodec commitPayloadCodec = new PaimonCommitPayloadCodec();
+    private final ThreadLocal<RowKeyExtractor> rowKeyExtractors;
+    private volatile RuntimeException lookupPayloadDecodeFailure;
 
     @FunctionalInterface
     interface SinkManagerFactory {
@@ -58,6 +78,7 @@ public final class PmsTableService implements AutoCloseable {
             PMSBucketDirectorImpl director) {
         this.loadedTable = loadedTable;
         this.table = loadedTable.table();
+        this.fileStoreTable = validateLookupProfile(table);
         this.director = director;
         this.storageConfig = config.coreConfig().storage();
         RowType rowType = table.rowType();
@@ -65,6 +86,25 @@ public final class PmsTableService implements AutoCloseable {
         this.keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, primaryKeys);
         this.valueCodec = new PmsRowValueCodec();
         this.rowMapper = new JsonRowMapper(rowType);
+        KeyValueFileStore keyValueStore = (KeyValueFileStore) fileStoreTable.store();
+        this.paimonLookup = new PaimonKeyValueLookupService(
+            new LiveFileIndex(keyValueStore.newKeyComparator(), 4),
+            new CandidatePlanner(keyValueStore.newKeyComparator(), 0),
+            new PaimonKeyValueDirectLookup(
+                rowType,
+                primaryKeyFieldIndexes(rowType, primaryKeys),
+                fileStoreTable.schema().id(),
+                (context, file) -> {
+                    DataFilePathFactory pathFactory = fileStoreTable.store().pathFactory()
+                        .createDataFilePathFactory(context.partition(), context.bucket());
+                    org.apache.paimon.fs.Path path = pathFactory.toPath(file);
+                    return new ResolvedDataFile(
+                        table.fileIO(), path, table.fileIO().getFileStatus(path).getLen());
+                }
+            ),
+            fileStoreTable.schema().id()
+        );
+        this.rowKeyExtractors = ThreadLocal.withInitial(fileStoreTable::createRowKeyExtractor);
     }
 
     public static PmsTableService open(PmsServerConfig config) throws Exception {
@@ -105,8 +145,8 @@ public final class PmsTableService implements AutoCloseable {
     }
 
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
-        GenericRow keyTuple = rowMapper.keyTuple(primaryKeyValues, primaryKeys);
-        byte[] key = keyCodec.encodeKeyTuple(keyTuple);
+        GenericRow fullPrimaryKeyRow = rowMapper.fullPrimaryKeyRow(primaryKeyValues, primaryKeys);
+        byte[] key = keyCodec.encodeKey(fullPrimaryKeyRow);
         PmsLocalLookupResult local = getLocal(key);
         if (local.type() == PmsLocalLookupResult.Type.HIT) {
             return Optional.of(local.row());
@@ -114,7 +154,7 @@ public final class PmsTableService implements AutoCloseable {
         if (local.type() == PmsLocalLookupResult.Type.DELETED) {
             return Optional.empty();
         }
-        return lookupPaimon(keyTuple);
+        return lookupPaimon(fullPrimaryKeyRow);
     }
 
     public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
@@ -153,7 +193,9 @@ public final class PmsTableService implements AutoCloseable {
         maintenanceLock.lock();
         try {
             LOG.info("PMS sink started");
-            director.sinkToPaimon();
+            synchronized (paimonCommitPublishLock) {
+                director.sinkToPaimon().ifPresent(this::publishCommittedLookupDelta);
+            }
             retainLocalSSTsLocked();
             LOG.info("PMS sink completed");
         } finally {
@@ -178,22 +220,47 @@ public final class PmsTableService implements AutoCloseable {
         return recoverySummaryToMap(director.lastRecoverySummary());
     }
 
-    private Optional<Map<String, Object>> lookupPaimon(GenericRow keyTuple) {
-        ReadBuilder readBuilder = table.newReadBuilder()
-            .withFilter(primaryKeyPredicate(keyTuple))
-            .withLimit(1);
-        try (RecordReader<InternalRow> reader =
-                 readBuilder.newRead().createReader(readBuilder.newScan().plan())) {
-            PaimonLookupResult result = new PaimonLookupResult();
-            reader.forEachRemaining(row -> {
-                if (result.row == null) {
-                    result.row = rowMapper.toJsonObject(row);
-                }
-            });
-            return Optional.ofNullable(result.row);
-        } catch (IOException e) {
-            throw new RuntimeException("Paimon point lookup failed for primary keys " + primaryKeys, e);
+    private Optional<Map<String, Object>> lookupPaimon(GenericRow fullPrimaryKeyRow) {
+        if (lookupPayloadDecodeFailure != null) {
+            throw new PmsLookupUnavailableException(
+                "Paimon lookup commit delta publishing failed; restart or repair the lookup view",
+                lookupPayloadDecodeFailure
+            );
         }
+        RowKeyExtractor extractor = rowKeyExtractors.get();
+        extractor.setRecord(fullPrimaryKeyRow);
+        BinaryRow partition = extractor.partition();
+        int bucket = extractor.bucket();
+        LookupRequest request = LookupRequest.fullRow(extractor.trimmedPrimaryKey());
+        LookupResult result;
+        try {
+            result = paimonLookup.lookup(partition, bucket, request);
+        } catch (IOException e) {
+            result = LookupResult.unknown();
+        } catch (SchemaMismatchException e) {
+            throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
+        }
+        if (result.kind() == LookupResult.Kind.UNKNOWN) {
+            try {
+                synchronized (paimonCommitPublishLock) {
+                    installSnapshot(partition, bucket);
+                    result = paimonLookup.lookup(partition, bucket, request);
+                }
+            } catch (IOException e) {
+                throw new PmsLookupUnavailableException(
+                    "Unable to rebuild Paimon lookup view for partition=" + partition + ", bucket=" + bucket,
+                    e
+                );
+            } catch (SchemaMismatchException e) {
+                throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
+            }
+        }
+        return switch (result.kind()) {
+            case HIT -> Optional.of(rowMapper.toJsonObject(result.row().orElseThrow()));
+            case DELETED, MISS -> Optional.empty();
+            case UNKNOWN -> throw new PmsLookupUnavailableException(
+                "Paimon lookup is unavailable for partition=" + partition + ", bucket=" + bucket);
+        };
     }
 
     private PmsLocalLookupResult getLocal(byte[] key) {
@@ -208,13 +275,68 @@ public final class PmsTableService implements AutoCloseable {
         return PmsLocalLookupResult.hit(rowMapper.toJsonObject(valueCodec.decode(table.rowType(), value.bytes())));
     }
 
-    private Predicate primaryKeyPredicate(GenericRow keyTuple) {
-        PredicateBuilder builder = new PredicateBuilder(table.rowType());
-        List<Predicate> predicates = new ArrayList<>(primaryKeys.size());
-        for (int i = 0; i < primaryKeys.size(); i++) {
-            predicates.add(builder.equal(builder.indexOf(primaryKeys.get(i)), keyTuple.getField(i)));
+    private void installSnapshot(BinaryRow partition, int bucket) throws IOException {
+        List<org.apache.paimon.io.DataFileMeta> files = fileStoreTable.store().newScan()
+            .withPartitionBucket(partition, bucket)
+            .plan()
+            .files(FileKind.ADD)
+            .stream()
+            .map(entry -> entry.file())
+            .toList();
+        paimonLookup.installSnapshot(partition, bucket, files);
+    }
+
+    private void publishCommittedLookupDelta(SinkCommitResult result) {
+        byte[] payload = result.commitPayload();
+        if (payload.length == 0) {
+            return;
         }
-        return PredicateBuilder.and(predicates);
+        List<org.apache.paimon.table.sink.CommitMessage> messages;
+        try {
+            messages = commitPayloadCodec.decode(payload);
+        } catch (RuntimeException e) {
+            lookupPayloadDecodeFailure = e;
+            throw new PmsLookupUnavailableException(
+                "Paimon commit succeeded but its lookup delta could not be published", e);
+        }
+        try {
+            synchronized (paimonCommitPublishLock) {
+                paimonLookup.applyCommittedMessages(messages);
+            }
+        } catch (RuntimeException e) {
+            throw new PmsLookupUnavailableException(
+                "Paimon commit succeeded but its lookup delta could not be applied", e);
+        }
+    }
+
+    private static FileStoreTable validateLookupProfile(Table table) {
+        if (!(table instanceof FileStoreTable fileStoreTable)) {
+            throw new IllegalArgumentException("Paimon lookup requires a FileStoreTable");
+        }
+        if (fileStoreTable.primaryKeys().isEmpty()) {
+            throw new IllegalArgumentException("Paimon lookup requires a primary-key table");
+        }
+        if (fileStoreTable.bucketMode() != BucketMode.HASH_FIXED) {
+            throw new IllegalArgumentException(
+                "Paimon lookup requires HASH_FIXED buckets, actual=" + fileStoreTable.bucketMode());
+        }
+        CoreOptions options = new CoreOptions(fileStoreTable.options());
+        if (options.mergeEngine() != CoreOptions.MergeEngine.DEDUPLICATE) {
+            throw new IllegalArgumentException(
+                "Paimon lookup requires merge-engine=deduplicate, actual=" + options.mergeEngine());
+        }
+        if (!CoreOptions.FILE_FORMAT_PARQUET.equals(options.fileFormatString())) {
+            throw new IllegalArgumentException(
+                "Paimon lookup requires parquet data files, actual=" + options.fileFormatString());
+        }
+        return fileStoreTable;
+    }
+
+    private static int[] primaryKeyFieldIndexes(RowType rowType, List<String> primaryKeys) {
+        return primaryKeys.stream()
+            .map(rowType::getField)
+            .mapToInt(field -> rowType.getFieldIndexByFieldId(field.id()))
+            .toArray();
     }
 
     private void retainLocalSSTsLocked() {
@@ -299,7 +421,4 @@ public final class PmsTableService implements AutoCloseable {
         return result;
     }
 
-    private static final class PaimonLookupResult {
-        private Map<String, Object> row;
-    }
 }

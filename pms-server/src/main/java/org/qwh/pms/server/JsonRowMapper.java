@@ -54,6 +54,16 @@ final class JsonRowMapper {
         return row;
     }
 
+    GenericRow fullPrimaryKeyRow(Map<String, Object> values, List<String> primaryKeys) {
+        GenericRow keyTuple = keyTuple(values, primaryKeys);
+        GenericRow row = new GenericRow(RowKind.INSERT, rowType.getFieldCount());
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            DataField field = rowType.getField(primaryKeys.get(i));
+            row.setField(rowType.getFieldIndexByFieldId(field.id()), keyTuple.getField(i));
+        }
+        return row;
+    }
+
     GenericRow keyPrefixTuple(Map<String, Object> values, List<String> primaryKeys) {
         Set<String> primaryKeySet = new HashSet<>(primaryKeys);
         for (String fieldName : values.keySet()) {

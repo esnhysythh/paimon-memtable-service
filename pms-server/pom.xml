@@ -29,6 +29,11 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <groupId>org.qwh</groupId>
+            <artifactId>pms-lookup-paimon</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
             <groupId>org.apache.paimon</groupId>
             <artifactId>paimon-api</artifactId>
             <version>${paimon.version}</version>

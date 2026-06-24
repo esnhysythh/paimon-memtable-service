@@ -33,7 +33,8 @@ public class MockSinkManager implements SinkManager {
             prepared.batchId(),
             nextSnapshotId.getAndIncrement(),
             prepared.maxSequenceId(),
-            prepared.sstIds()
+            prepared.sstIds(),
+            new byte[0]
         );
     }
 }

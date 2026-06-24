@@ -323,7 +323,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public void sinkToPaimon() {
+    public Optional<SinkCommitResult> sinkToPaimon() {
         synchronized (sstMaintenanceMutex) {
             List<SSTMeta> toSink;
             lifecycleLock.readLock().lock();
@@ -331,7 +331,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 ensureNotClosed();
                 synchronized (writeMutex) {
                     if (newSSTs.isEmpty()) {
-                        return;
+                        return Optional.empty();
                     }
                     toSink = List.copyOf(newSSTs);
                 }
@@ -359,6 +359,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             } finally {
                 lifecycleLock.readLock().unlock();
             }
+            return Optional.of(result);
         }
     }
 

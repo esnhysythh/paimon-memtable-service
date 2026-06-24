@@ -8,7 +8,7 @@
 
 这是一个刻意的取舍：`ReadBuilder` 的谓词读取路径不是面向 KV point lookup 的性能模型。PMS 宁可在无法证明结果正确时明确失败，也不回退到不可预测的扫描式读取。
 
-本文定义的是目标实现。本文写入时模块和相应 server/sink API 尚未落地，现有代码仍有 `ReadBuilder` 路径；实施第 2 阶段必须删除该生产路径，才可按本文启用完整历史点查能力。
+当前实现已完成模块迁入、direct Parquet 历史点查、完整 snapshot lazy rebuild，以及普通 sink 成功提交后的 delta 发布；生产 `ReadBuilder` 路径已经删除。热点 value SST cache 的 server 集成、显式 compaction、配置与指标仍按本文后续阶段推进。
 
 ### 1.1 边界
 
@@ -203,10 +203,10 @@ Paimon commit success
 
 ## 9. 实施顺序与测试
 
-1. 新建模块并迁入 demo 生产代码，固定 Paimon 1.4.1，保留真实 Paimon 测试。
-2. 接入 server 的 key 路由、snapshot install 与四态错误语义；删除生产 `ReadBuilder` 路径。
-3. 暴露成功 commit payload，接入普通 sink 的严格有序 delta 发布。
-4. 接入 explicit compaction 的独立恢复 metadata 和统一发布。
-5. 加入单表配置、资源预算、指标与压测。
+1. 已完成：新建模块并迁入 demo 生产代码，固定 Paimon 1.4.1，保留真实 Paimon 测试。
+2. 已完成：接入 server 的 key 路由、snapshot install 与四态错误语义；删除生产 `ReadBuilder` 路径。
+3. 已完成：暴露成功 commit payload，接入普通 sink 的严格有序 delta 发布。
+4. 待实现：接入 explicit compaction 的独立恢复 metadata 和统一发布。
+5. 待实现：加入热点 value SST cache 的 server 配置、资源预算、指标与压测。
 
 必须覆盖的集成测试包括：分区/多 bucket、复合 key、PUT/DELETE/MISS、L0 与 compaction、snapshot lazy rebuild、非法/重复/乱序 delta、commit 成功后 publish 失败、进程重启后不回放 delta、direct lookup 与 `ReadBuilder` 对照、cache build/evict 以及 schema/profile 拒绝。

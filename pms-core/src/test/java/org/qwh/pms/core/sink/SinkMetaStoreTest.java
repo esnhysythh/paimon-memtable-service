@@ -55,7 +55,13 @@ class SinkMetaStoreTest {
         PreparedSinkCommit prepared = prepared("sink-10-2");
 
         store.savePrepare(prepared);
-        store.saveSuccess(new SinkCommitResult(prepared.batchId(), 42L, prepared.maxSequenceId(), prepared.sstIds()));
+        store.saveSuccess(new SinkCommitResult(
+            prepared.batchId(),
+            42L,
+            prepared.maxSequenceId(),
+            prepared.sstIds(),
+            prepared.payload()
+        ));
 
         SinkRecoveryState state = store.load();
 

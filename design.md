@@ -23,7 +23,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 `pms-lookup-paimon` 为 `(partition, bucket)` 维护完整的 live `DataFileMeta` view，按 Paimon merge-tree 文件优先级执行 direct Parquet point lookup，并可为热点文件构建本地 value SST。其结果为 HIT / DELETED / MISS / UNKNOWN：只有完整有效 view 的 MISS 才返回 not found；UNKNOWN 表示 PMS 不能证明结果正确，server 必须返回可重试错误，不能将其降级为 MISS。生产路径不使用 Paimon `ReadBuilder`；它仅保留为测试和压测的正确性对照。详见 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md)。
 
-> 本模块及相应 server/sink API 尚待实施；在切换完成前，现有 `ReadBuilder` 代码仍是过渡实现，不代表目标架构。
+> direct Parquet 查询、普通 sink delta 发布与 server 切换已实现。热点 value SST cache 的 server 集成、显式 compaction、配置和指标仍按 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) 后续阶段推进。
 
 ### 2.3 缓存与淘汰
 - **内存淘汰**：ImmutableMemTable 维护引用计数，归零后退役释放内存。带 Mem 缓存的双持状态（newSSTWithMem / sinkedSSTWithMem）可在内存不足时退化为不带 Mem 的状态。
