@@ -268,6 +268,43 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void repeatedPaimonLookupBuildsAndUsesValueSstCache() throws Exception {
+        Path warehouse = tempDir.resolve("warehouse");
+
+        PmsServerConfig writerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("writer"), warehouse)
+        );
+        try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
+            writer.write(Map.of("id", 1, "marker", "cache-a"));
+            writer.flush();
+            writer.sink();
+        }
+
+        PmsServerConfig readerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("reader"), warehouse)
+        );
+        try (PMSTestServer reader = PMSTestServer.create(readerConfig, schema()).start()) {
+            for (int i = 0; i < readerConfig.lookup().buildThreshold(); i++) {
+                assertEquals(
+                    Map.of("id", 1, "marker", "cache-a"),
+                    reader.get(Map.of("id", 1)).orElseThrow()
+                );
+            }
+
+            waitUntil(() -> number(reader.runtime().state(), "lookupCacheBuildsSucceeded") >= 1);
+
+            assertEquals(
+                Map.of("id", 1, "marker", "cache-a"),
+                reader.get(Map.of("id", 1)).orElseThrow()
+            );
+            Map<String, Object> state = reader.runtime().state();
+            assertTrue(number(state, "lookupLocalLookups") >= 1);
+            assertTrue(number(state, "lookupCacheReadyEntries") >= 1);
+            assertTrue(number(state, "lookupCacheBytes") > 0);
+        }
+    }
+
+    @Test
     void getLocalOnlyReadsPmsLocalLayersAndExposesTombstones() throws Exception {
         Path warehouse = tempDir.resolve("warehouse");
 
@@ -454,6 +491,12 @@ class PmsServerEndToEndTest {
         assertFalse(config.scheduler().enabled());
         assertEquals(0, config.scheduler().flushIntervalMs());
         assertEquals(30000, config.scheduler().sinkIntervalMs());
+        assertTrue(config.lookup().cacheEnabled());
+        assertEquals(tempDir.resolve("target").resolve("lookup-cache").toAbsolutePath().normalize(), config.lookup().cacheDir());
+        assertEquals(3L * 1024 * 1024 * 1024, config.lookup().maxCacheBytes());
+        assertEquals(3, config.lookup().buildThreshold());
+        assertEquals(2, config.lookup().buildThreads());
+        assertEquals(1024, config.lookup().directMetadataCacheEntries());
     }
 
     @Test
@@ -466,6 +509,55 @@ class PmsServerEndToEndTest {
             () -> new ConfigManager().from(props)
         );
         assertTrue(error.getMessage().contains("must not be the same directory"));
+    }
+
+    @Test
+    void configManagerRejectsLookupCacheDirectoryOverlappingDurableState() {
+        Properties walOverlap = baseProperties();
+        walOverlap.setProperty("pms.lookup.cache.dir", tempDir.resolve("wal").resolve("lookup").toString());
+        IllegalArgumentException walError = assertThrows(
+            IllegalArgumentException.class,
+            () -> new ConfigManager().from(walOverlap)
+        );
+        assertTrue(walError.getMessage().contains("pms.wal.dir"));
+
+        Properties storageOverlap = baseProperties();
+        storageOverlap.setProperty("pms.lookup.cache.dir", tempDir.resolve("storage").resolve("lookup").toString());
+        IllegalArgumentException storageError = assertThrows(
+            IllegalArgumentException.class,
+            () -> new ConfigManager().from(storageOverlap)
+        );
+        assertTrue(storageError.getMessage().contains("pms.storage.dir"));
+
+        Properties warehouseOverlap = baseProperties();
+        warehouseOverlap.setProperty("pms.lookup.cache.dir", tempDir.resolve("warehouse").resolve("lookup").toString());
+        IllegalArgumentException warehouseError = assertThrows(
+            IllegalArgumentException.class,
+            () -> new ConfigManager().from(warehouseOverlap)
+        );
+        assertTrue(warehouseError.getMessage().contains("Paimon warehouse"));
+    }
+
+    @Test
+    void configManagerParsesLookupCacheOverrides() {
+        Properties props = baseProperties();
+        props.setProperty("pms.lookup.cache.enabled", "false");
+        props.setProperty("pms.lookup.cache.max_bytes", "128mb");
+        props.setProperty("pms.lookup.cache.build_threshold", "5");
+        props.setProperty("pms.lookup.cache.build_threads", "4");
+        props.setProperty("pms.lookup.cache.build_timeout_ms", "1000");
+        props.setProperty("pms.lookup.cache.retry_backoff_ms", "2000");
+        props.setProperty("pms.lookup.direct.metadata_cache_entries", "64");
+
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        assertFalse(config.lookup().cacheEnabled());
+        assertEquals(128L * 1024 * 1024, config.lookup().maxCacheBytes());
+        assertEquals(5, config.lookup().buildThreshold());
+        assertEquals(4, config.lookup().buildThreads());
+        assertEquals(java.time.Duration.ofMillis(1000), config.lookup().buildTimeout());
+        assertEquals(java.time.Duration.ofMillis(2000), config.lookup().retryBackoff());
+        assertEquals(64, config.lookup().directMetadataCacheEntries());
     }
 
     @Test
@@ -528,6 +620,7 @@ class PmsServerEndToEndTest {
         props.setProperty("pms.paimon.table", "server_pk");
         props.setProperty("pms.wal.dir", rootDir.resolve("wal").toString());
         props.setProperty("pms.storage.dir", rootDir.resolve("storage").toString());
+        props.setProperty("pms.lookup.cache.dir", rootDir.resolve("target").resolve("lookup-cache").toString());
         return props;
     }
 

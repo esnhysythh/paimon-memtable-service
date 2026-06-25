@@ -9,6 +9,7 @@ public record PmsServerConfig(
     String table,
     String commitUser,
     PmsSchedulerConfig scheduler,
+    PmsLookupConfig lookup,
     PMSConfig coreConfig
 ) {
     public PmsServerConfig {
@@ -32,6 +33,18 @@ public record PmsServerConfig(
         }
         if (scheduler == null) {
             scheduler = PmsSchedulerConfig.disabled(coreConfig.sink().intervalMs());
+        }
+        if (lookup == null) {
+            lookup = new PmsLookupConfig(
+                PmsLookupConfig.DEFAULT_CACHE_ENABLED,
+                PmsLookupConfig.defaultCacheDir(database, table),
+                PmsLookupConfig.DEFAULT_MAX_CACHE_BYTES,
+                PmsLookupConfig.DEFAULT_BUILD_THRESHOLD,
+                PmsLookupConfig.DEFAULT_BUILD_THREADS,
+                PmsLookupConfig.DEFAULT_BUILD_TIMEOUT,
+                PmsLookupConfig.DEFAULT_RETRY_BACKOFF,
+                PmsLookupConfig.DEFAULT_DIRECT_METADATA_CACHE_ENTRIES
+            );
         }
     }
 }
