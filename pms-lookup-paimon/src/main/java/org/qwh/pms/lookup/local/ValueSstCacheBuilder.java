@@ -13,6 +13,8 @@ import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.BloomFilter;
 import org.apache.paimon.utils.FileIOUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
@@ -26,6 +28,8 @@ import java.util.function.Function;
 
 /** Builds VALUE_SST local cache entries by scanning one Paimon KeyValue data file. */
 public final class ValueSstCacheBuilder implements LocalCacheBuilder {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ValueSstCacheBuilder.class);
 
     private final RowType keyType;
     private final RowType valueType;
@@ -79,6 +83,7 @@ public final class ValueSstCacheBuilder implements LocalCacheBuilder {
     public LocalCacheEntry build(DataFileMeta file, LocalCacheBuildContext context)
             throws IOException {
         Objects.requireNonNull(file, "file");
+        long startedNanos = System.nanoTime();
         File localFile = localFileFactory.apply(file, context);
         File buildLock = acquireBuildLock(localFile);
         try {
@@ -101,6 +106,15 @@ public final class ValueSstCacheBuilder implements LocalCacheBuilder {
                 publish(temporaryFile, localFile);
                 published = true;
                 LookupStoreReader reader = lookupStoreFactory.createReader(localFile);
+                LOG.info(
+                        "Built VALUE_SST local cache: partition={}, bucket={}, file={}, localFile={}, sizeBytes={}, durationMs={}",
+                        context.partition(),
+                        context.bucket(),
+                        file.fileName(),
+                        localFile,
+                        localFile.length(),
+                        java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                                System.nanoTime() - startedNanos));
                 return new ValueSstCacheEntry(
                         file,
                         localFile,

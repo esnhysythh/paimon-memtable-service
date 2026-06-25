@@ -168,6 +168,14 @@ class ConfigManager {
 | `pms.paimon.manifest_cache_small_file_memory` | 128mb | `PaimonConfig.manifestCacheSmallFileMemory`，透传为 Paimon `cache.manifest.small-file-memory` |
 | `pms.paimon.manifest_cache_small_file_threshold` | 1mb | `PaimonConfig.manifestCacheSmallFileThreshold`，透传为 Paimon `cache.manifest.small-file-threshold` |
 | `pms.paimon.manifest_cache_max_memory` | - | `PaimonConfig.manifestCacheMaxMemory`，非空时透传为 Paimon `cache.manifest.max-memory` |
+| `pms.lookup.cache.enabled` | true | `PmsLookupConfig.cacheEnabled` |
+| `pms.lookup.cache.dir` | `${java.io.tmpdir}/pms-lookup-cache/<db>.<table>` | `PmsLookupConfig.cacheDir`；不得位于 WAL、storage 或本地 Paimon warehouse 下 |
+| `pms.lookup.cache.max_bytes` | 3gb | `PmsLookupConfig.maxCacheBytes` |
+| `pms.lookup.cache.build_threshold` | 3 | `PmsLookupConfig.buildThreshold` |
+| `pms.lookup.cache.build_threads` | 2 | `PmsLookupConfig.buildThreads`，也作为当前最大在途 build 数 |
+| `pms.lookup.cache.build_timeout_ms` | 30000 | `PmsLookupConfig.buildTimeout` |
+| `pms.lookup.cache.retry_backoff_ms` | 60000 | `PmsLookupConfig.retryBackoff` |
+| `pms.lookup.direct.metadata_cache_entries` | 1024 | direct Parquet lookup 的文件 metadata cache 容量 |
 
 ### 2.4 BackgroundTaskScheduler
 
@@ -180,7 +188,7 @@ class ConfigManager {
 | MemTable Freeze 检查 | 1s | 检查 curMemTable 是否达阈值，触发 `freezeCurMemTable()` |
 | Immutable Flush | 立即（Freeze 后） | 将新冻结的 ImmutableMemTable 刷盘为 SST |
 | Sink Paimon | 30s | 检查 newSST 数量，触发 `sinkToPaimon()` |
-| Paimon Compaction | 60s | 枚举 Paimon partition/bucket 候选，通过 `pms-sink-paimon` 调用 Paimon `TableWrite.compact(...)` 并以独立 metadata 提交 compact snapshot |
+| Paimon Compaction | 暂不启用 | 未来由 server 显式掌控 Paimon data-file compaction；V1 初期依赖 Paimon 写入提交中的隐式维护 |
 | 本地 SST 合并 | 300s | 检查小文件数量，触发 `compactLocalSSTs()` |
 | sinkedSST 淘汰 | Sink 后 | 根据本地 SST 总大小、总文件数或总物理 entry 数检查阈值，循环触发 `evictOldestSinkedSST()`；只删除已 sinked 的最老 SST |
 | WAL 截断 | 300s | 检查可安全截断的 WAL 文件，执行 `truncate()` |
@@ -188,7 +196,7 @@ class ConfigManager {
 
 本地 SST 合并当前是 standalone compact，不与 Paimon sink merge 融合。sink、local compact 和 sinkedSST evict 在 core 内串行化，避免 compact 修改正在 sink 的 new run；sink+compact 融合优化暂缓，需等独立恢复状态机设计清楚后再实现。
 
-Paimon compaction 是 Paimon manifest/data-file 层的维护任务，不进入 `pms-core` 的本地 SST 状态机。server 层负责调度它，并确保同一 PMS 进程内普通 sink commit 与 compact commit 串行化。写入路径建议使用 `write-only=true` 的 Paimon table copy 关闭隐式 compaction；compact 任务使用 `write-only=false` 的 table copy 显式触发合并。
+Paimon compaction 是 Paimon manifest/data-file 层的维护任务，不进入 `pms-core` 的本地 SST 状态机。V1 初期暂不实现显式 Paimon compaction 控制；普通 sink 成功提交 payload 已能覆盖 Paimon 写入提交中可能携带的 data/compact 文件变动。未来显式 compaction 接入时，server 需确保普通 sink commit 与 compact commit 串行化，并复用 `pms-lookup-paimon` 的成功提交 delta 发布协议。
 
 **任务优先级调整**（与流控联动）：
 

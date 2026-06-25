@@ -5,16 +5,26 @@ import org.apache.paimon.KeyValueFileStore;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.serializer.RowCompactedSerializer;
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.io.DataFilePathFactory;
+import org.apache.paimon.io.KeyValueFileReaderFactory;
+import org.apache.paimon.io.cache.CacheManager;
+import org.apache.paimon.lookup.LookupStoreFactory;
 import org.apache.paimon.manifest.FileKind;
+import org.apache.paimon.mergetree.lookup.LookupSerializerFactory;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.PrimaryKeyTableUtils;
 import org.apache.paimon.table.sink.RowKeyExtractor;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
 import org.qwh.pms.codec.PmsRowValueCodec;
+import org.qwh.pms.lookup.api.DataFileLookup;
+import org.qwh.pms.lookup.api.FileLookupContext;
 import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
 import org.qwh.pms.lookup.api.ResolvedDataFile;
@@ -22,7 +32,12 @@ import org.qwh.pms.lookup.api.SchemaMismatchException;
 import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
 import org.qwh.pms.lookup.live.CandidatePlanner;
 import org.qwh.pms.lookup.live.LiveFileIndex;
+import org.qwh.pms.lookup.local.LocalCacheDirectory;
+import org.qwh.pms.lookup.local.ValueSstCacheBuilder;
 import org.qwh.pms.lookup.paimon.PaimonKeyValueLookupService;
+import org.qwh.pms.lookup.router.ThresholdFileLookupRouter;
+import org.qwh.pms.lookup.router.ThresholdFileLookupRouterOptions;
+import org.qwh.pms.lookup.router.ThresholdFileLookupRouterStats;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
@@ -37,19 +52,26 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 public final class PmsTableService implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(PmsTableService.class);
+    private static final AtomicInteger LOOKUP_BUILD_THREAD_ID = new AtomicInteger();
 
     private final PaimonTableLoader.LoadedTable loadedTable;
     private final Table table;
     private final FileStoreTable fileStoreTable;
+    private final KeyValueFileStore keyValueStore;
     private final PMSBucketDirectorImpl director;
     private final PmsPrimaryKeyCodec keyCodec;
     private final PmsRowValueCodec valueCodec;
@@ -59,6 +81,9 @@ public final class PmsTableService implements AutoCloseable {
     private final ReentrantLock maintenanceLock = new ReentrantLock();
     private final Object paimonCommitPublishLock = new Object();
     private final PaimonKeyValueLookupService paimonLookup;
+    private final ThresholdFileLookupRouter lookupRouter;
+    private final LocalCacheDirectory lookupCacheDirectory;
+    private final ExecutorService lookupBuildExecutor;
     private final PaimonCommitPayloadCodec commitPayloadCodec = new PaimonCommitPayloadCodec();
     private final ThreadLocal<RowKeyExtractor> rowKeyExtractors;
     private volatile RuntimeException lookupPayloadDecodeFailure;
@@ -86,24 +111,18 @@ public final class PmsTableService implements AutoCloseable {
         this.keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, primaryKeys);
         this.valueCodec = new PmsRowValueCodec();
         this.rowMapper = new JsonRowMapper(rowType);
-        KeyValueFileStore keyValueStore = (KeyValueFileStore) fileStoreTable.store();
+        this.keyValueStore = (KeyValueFileStore) fileStoreTable.store();
+        int[] primaryKeyFieldIndexes = primaryKeyFieldIndexes(rowType, primaryKeys);
+        LookupStack lookupStack = createLookupStack(config.lookup(), rowType, primaryKeyFieldIndexes);
         this.paimonLookup = new PaimonKeyValueLookupService(
             new LiveFileIndex(keyValueStore.newKeyComparator(), 4),
             new CandidatePlanner(keyValueStore.newKeyComparator(), 0),
-            new PaimonKeyValueDirectLookup(
-                rowType,
-                primaryKeyFieldIndexes(rowType, primaryKeys),
-                fileStoreTable.schema().id(),
-                (context, file) -> {
-                    DataFilePathFactory pathFactory = fileStoreTable.store().pathFactory()
-                        .createDataFilePathFactory(context.partition(), context.bucket());
-                    org.apache.paimon.fs.Path path = pathFactory.toPath(file);
-                    return new ResolvedDataFile(
-                        table.fileIO(), path, table.fileIO().getFileStatus(path).getLen());
-                }
-            ),
+            lookupStack.fileLookup(),
             fileStoreTable.schema().id()
         );
+        this.lookupRouter = lookupStack.router();
+        this.lookupCacheDirectory = lookupStack.cacheDirectory();
+        this.lookupBuildExecutor = lookupStack.buildExecutor();
         this.rowKeyExtractors = ThreadLocal.withInitial(fileStoreTable::createRowKeyExtractor);
     }
 
@@ -213,7 +232,9 @@ public final class PmsTableService implements AutoCloseable {
     }
 
     public Map<String, Object> state() {
-        return stateToMap(director.stateSnapshot());
+        Map<String, Object> state = stateToMap(director.stateSnapshot());
+        appendLookupState(state);
+        return state;
     }
 
     public Map<String, Object> recoverySummary() {
@@ -276,6 +297,7 @@ public final class PmsTableService implements AutoCloseable {
     }
 
     private void installSnapshot(BinaryRow partition, int bucket) throws IOException {
+        long startedNanos = System.nanoTime();
         List<org.apache.paimon.io.DataFileMeta> files = fileStoreTable.store().newScan()
             .withPartitionBucket(partition, bucket)
             .plan()
@@ -284,6 +306,13 @@ public final class PmsTableService implements AutoCloseable {
             .map(entry -> entry.file())
             .toList();
         paimonLookup.installSnapshot(partition, bucket, files);
+        LOG.info(
+            "Installed Paimon lookup snapshot: partition={}, bucket={}, liveFileCount={}, durationMs={}",
+            partition,
+            bucket,
+            files.size(),
+            elapsedMillis(startedNanos)
+        );
     }
 
     private void publishCommittedLookupDelta(SinkCommitResult result) {
@@ -339,6 +368,137 @@ public final class PmsTableService implements AutoCloseable {
             .toArray();
     }
 
+    private LookupStack createLookupStack(
+            PmsLookupConfig lookupConfig, RowType rowType, int[] primaryKeyFieldIndexes) {
+        DataFileLookup directLookup = new PaimonKeyValueDirectLookup(
+            rowType,
+            primaryKeyFieldIndexes,
+            fileStoreTable.schema().id(),
+            this::resolveDataFile,
+            new Options(),
+            1024,
+            lookupConfig.directMetadataCacheEntries()
+        );
+        if (!lookupConfig.cacheEnabled()) {
+            LOG.info("Paimon lookup ValueSST cache disabled; using direct Parquet lookup only");
+            return new LookupStack(directLookup, null, null, null);
+        }
+
+        LocalCacheDirectory cacheDirectory = null;
+        ExecutorService buildExecutor = null;
+        try {
+            cacheDirectory = new LocalCacheDirectory(lookupConfig.cacheDir());
+            buildExecutor = Executors.newFixedThreadPool(
+                lookupConfig.buildThreads(),
+                lookupBuildThreadFactory()
+            );
+            ThresholdFileLookupRouter router = new ThresholdFileLookupRouter(
+                directLookup,
+                valueSstCacheBuilder(rowType, primaryKeyFieldIndexes, cacheDirectory),
+                buildExecutor,
+                new ThresholdFileLookupRouterOptions(
+                    lookupConfig.buildThreshold(),
+                    lookupConfig.buildThreads(),
+                    lookupConfig.maxCacheBytes(),
+                    lookupConfig.buildTimeout(),
+                    lookupConfig.retryBackoff()
+                )
+            );
+            LOG.info(
+                "Paimon lookup ValueSST cache enabled: dir={}, maxBytes={}, buildThreshold={}, buildThreads={}, buildTimeout={}, retryBackoff={}",
+                lookupConfig.cacheDir(),
+                lookupConfig.maxCacheBytes(),
+                lookupConfig.buildThreshold(),
+                lookupConfig.buildThreads(),
+                lookupConfig.buildTimeout(),
+                lookupConfig.retryBackoff()
+            );
+            return new LookupStack(router, router, cacheDirectory, buildExecutor);
+        } catch (IOException | RuntimeException e) {
+            if (buildExecutor != null) {
+                buildExecutor.shutdownNow();
+            }
+            if (cacheDirectory != null) {
+                try {
+                    cacheDirectory.close();
+                } catch (IOException closeError) {
+                    e.addSuppressed(closeError);
+                }
+            }
+            throw new IllegalStateException(
+                "Failed to initialize Paimon lookup ValueSST cache at " + lookupConfig.cacheDir(),
+                e
+            );
+        }
+    }
+
+    private ValueSstCacheBuilder valueSstCacheBuilder(
+            RowType rowType, int[] primaryKeyFieldIndexes, LocalCacheDirectory cacheDirectory) {
+        CoreOptions options = new CoreOptions(fileStoreTable.options());
+        RowType fileKeyType = PrimaryKeyTableUtils.addKeyNamePrefix(rowType.project(primaryKeyFieldIndexes));
+        LookupStoreFactory lookupStoreFactory = LookupStoreFactory.create(
+            options,
+            new CacheManager(options.lookupCacheMaxMemory(), options.lookupCacheHighPrioPoolRatio()),
+            new RowCompactedSerializer(fileKeyType).createSliceComparator()
+        );
+        return new ValueSstCacheBuilder(
+            fileKeyType,
+            rowType,
+            (file, context) -> {
+                KeyValueFileReaderFactory readerFactory = keyValueStore
+                    .newReaderFactoryBuilder()
+                    .build(context.partition(), context.bucket(), DeletionVector.emptyFactory());
+                return readerFactory.createRecordReader(file);
+            },
+            lookupStoreFactory,
+            LookupSerializerFactory.INSTANCE.get(),
+            LookupStoreFactory.bfGenerator(options.toConfiguration()),
+            cacheDirectory
+        );
+    }
+
+    private ResolvedDataFile resolveDataFile(FileLookupContext context, org.apache.paimon.io.DataFileMeta file)
+            throws IOException {
+        DataFilePathFactory pathFactory = fileStoreTable.store().pathFactory()
+            .createDataFilePathFactory(context.partition(), context.bucket());
+        org.apache.paimon.fs.Path path = pathFactory.toPath(file);
+        return new ResolvedDataFile(table.fileIO(), path, table.fileIO().getFileStatus(path).getLen());
+    }
+
+    private void appendLookupState(Map<String, Object> state) {
+        state.put("lookupCacheEnabled", lookupRouter != null);
+        if (lookupRouter == null) {
+            return;
+        }
+        ThresholdFileLookupRouterStats stats = lookupRouter.stats();
+        state.put("lookupDirectLookups", stats.directLookups());
+        state.put("lookupLocalLookups", stats.localLookups());
+        state.put("lookupCacheBuildsScheduled", stats.buildsScheduled());
+        state.put("lookupCacheBuildsSucceeded", stats.buildsSucceeded());
+        state.put("lookupCacheBuildsFailed", stats.buildsFailed());
+        state.put("lookupCacheBuildsTimedOut", stats.buildsTimedOut());
+        state.put("lookupCacheBuildsRejected", stats.buildsRejected());
+        state.put("lookupCacheEntriesEvicted", stats.entriesEvicted());
+        state.put("lookupCacheReadyEntries", stats.readyEntries());
+        state.put("lookupCacheBytes", stats.cacheBytes());
+        state.put("lookupCacheInFlightBuilds", stats.inFlightBuilds());
+    }
+
+    private static ThreadFactory lookupBuildThreadFactory() {
+        return runnable -> {
+            Thread thread = new Thread(
+                runnable,
+                "pms-lookup-cache-build-" + LOOKUP_BUILD_THREAD_ID.incrementAndGet()
+            );
+            thread.setDaemon(true);
+            return thread;
+        };
+    }
+
+    private static long elapsedMillis(long startedNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
+    }
+
     private void retainLocalSSTsLocked() {
         int evictedCount = 0;
         while (shouldEvictSinkedSST(director.stateSnapshot())) {
@@ -375,9 +535,63 @@ public final class PmsTableService implements AutoCloseable {
     @Override
     public void close() throws Exception {
         LOG.info("Closing PMS table service");
-        director.close();
-        loadedTable.close();
+        Exception failure = null;
+        try {
+            if (lookupRouter != null) {
+                lookupRouter.close();
+            }
+        } catch (Exception e) {
+            failure = e;
+        }
+        shutdownLookupBuildExecutor();
+        try {
+            if (lookupCacheDirectory != null) {
+                lookupCacheDirectory.close();
+            }
+        } catch (Exception e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        try {
+            director.close();
+        } catch (Exception e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        try {
+            loadedTable.close();
+        } catch (Exception e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
         LOG.info("PMS table service closed");
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private void shutdownLookupBuildExecutor() {
+        if (lookupBuildExecutor == null) {
+            return;
+        }
+        lookupBuildExecutor.shutdownNow();
+        try {
+            if (!lookupBuildExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOG.warn("Paimon lookup cache build executor did not terminate within timeout");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Interrupted while stopping Paimon lookup cache build executor", e);
+        }
     }
 
     private static Map<String, Object> stateToMap(BucketStateSnapshot state) {
@@ -420,5 +634,11 @@ public final class PmsTableService implements AutoCloseable {
         result.put("curMemTableEstimatedEntryCount", recovery.curMemTableEstimatedEntryCount());
         return result;
     }
+
+    private record LookupStack(
+            DataFileLookup fileLookup,
+            ThresholdFileLookupRouter router,
+            LocalCacheDirectory cacheDirectory,
+            ExecutorService buildExecutor) {}
 
 }

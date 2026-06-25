@@ -18,12 +18,16 @@ import org.qwh.pms.lookup.api.ResolvedDataFile;
 import org.qwh.pms.lookup.api.SchemaMismatchException;
 import org.qwh.pms.lookup.key.KeyTypeCodecs;
 import org.qwh.pms.lookup.key.LookupKeySpec;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Arrays;
 
 /** Direct Parquet lookup path for real Paimon primary-key KeyValue data files. */
 public class PaimonKeyValueDirectLookup implements DataFileLookup {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PaimonKeyValueDirectLookup.class);
 
     private final RowType keyType;
     private final long expectedSchemaId;
@@ -106,6 +110,12 @@ public class PaimonKeyValueDirectLookup implements DataFileLookup {
             }
             return LookupResult.miss();
         } catch (LookupUnknownException | IOException e) {
+            LOG.warn(
+                    "Direct Paimon Parquet lookup failed: partition={}, bucket={}, file={}",
+                    context.partition(),
+                    context.bucket(),
+                    file.fileName(),
+                    e);
             return LookupResult.unknown();
         }
     }

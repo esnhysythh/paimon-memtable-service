@@ -8,7 +8,7 @@
 
 这是一个刻意的取舍：`ReadBuilder` 的谓词读取路径不是面向 KV point lookup 的性能模型。PMS 宁可在无法证明结果正确时明确失败，也不回退到不可预测的扫描式读取。
 
-当前实现已完成模块迁入、direct Parquet 历史点查、完整 snapshot lazy rebuild，以及普通 sink 成功提交后的 delta 发布；生产 `ReadBuilder` 路径已经删除。热点 value SST cache 的 server 集成、显式 compaction、配置与指标仍按本文后续阶段推进。
+当前实现已完成模块迁入、direct Parquet 历史点查、完整 snapshot lazy rebuild、普通 sink 成功提交后的 delta 发布，以及热点 value SST cache 的 server 集成；生产 `ReadBuilder` 路径已经删除。显式 compaction 与更完整的压测/观测仍按本文后续阶段推进。
 
 ### 1.1 边界
 
@@ -192,21 +192,28 @@ Paimon commit success
 
 ## 8. 配置、资源与观测
 
-当前 PMS 是单表项目，暂不引入多表 feature flag、跨表预算或配置归属模型。模块实现并受控启用时，由 `pms-server` 拥有单表 `PmsLookupConfig`，至少提供：
+当前 PMS 是单表项目，暂不引入多表 feature flag、跨表预算或配置归属模型。`pms-server` 拥有单表 `PmsLookupConfig`：
 
-- enabled；
-- 独立 `cacheDir`（不得与 WAL 或 PMS local SST 目录重合）；
-- `maxCacheBytes`、build threshold、最大在途 build、timeout 与 retry backoff；
-- direct lookup metadata cache 容量。
+- `pms.lookup.cache.enabled`：默认 `true`。关闭后仍使用 direct Parquet lookup，不启用本地 value SST。
+- `pms.lookup.cache.dir`：默认 `${java.io.tmpdir}/pms-lookup-cache/<database>.<table>`；测试/开发环境建议覆盖到 `target/lookup-cache`，便于人工检查并随 `mvn clean` 清理。
+- `pms.lookup.cache.max_bytes`：默认 `3gb`。这是本表 lookup cache 的本地磁盘预算。
+- `pms.lookup.cache.build_threshold`：默认 `3`。同一 data file 被查询达到阈值后异步构建本地 value SST。
+- `pms.lookup.cache.build_threads`：默认 `2`，同时也作为当前最大在途 build 数。
+- `pms.lookup.cache.build_timeout_ms`：默认 `30000`。
+- `pms.lookup.cache.retry_backoff_ms`：默认 `60000`。
+- `pms.lookup.direct.metadata_cache_entries`：默认 `1024`。
 
-首期指标至少包括四态查询计数、`UNKNOWN`/服务错误数、snapshot rebuild 耗时、delta invalidation 数、direct lookup 延迟、cache build/evict 数量和本地 cache bytes。多表隔离与每表配置在 PMS 多表化时设计。
+cache directory 是纯性能层，不是恢复数据源。`ConfigManager` 会拒绝将它放在 WAL、本地 SST storage 或本地 Paimon warehouse 下，避免 cache 清理、锁文件或磁盘预算与 durable state 互相干扰。
+
+当前 `/state` 暴露 lookup cache 开关、direct/local lookup 次数、build 成功/失败/超时/拒绝、ready entry 数、cache bytes 和在途 build 数；日志记录 snapshot install、delta apply、direct/local 路由、build/evict/failure 等关键信息。后续仍需补充四态查询计数、`UNKNOWN`/服务错误数、direct/local lookup 延迟和压测视图。多表隔离与每表配置在 PMS 多表化时设计。
 
 ## 9. 实施顺序与测试
 
 1. 已完成：新建模块并迁入 demo 生产代码，固定 Paimon 1.4.1，保留真实 Paimon 测试。
 2. 已完成：接入 server 的 key 路由、snapshot install 与四态错误语义；删除生产 `ReadBuilder` 路径。
 3. 已完成：暴露成功 commit payload，接入普通 sink 的严格有序 delta 发布。
-4. 待实现：接入 explicit compaction 的独立恢复 metadata 和统一发布。
-5. 待实现：加入热点 value SST cache 的 server 配置、资源预算、指标与压测。
+4. 已完成：加入热点 value SST cache 的 server 配置、资源预算、基础指标与关键日志。
+5. 待实现：补充 lookup/cache 压测与更细粒度指标。
+6. 待实现：接入 explicit compaction 的独立恢复 metadata 和统一发布。
 
 必须覆盖的集成测试包括：分区/多 bucket、复合 key、PUT/DELETE/MISS、L0 与 compaction、snapshot lazy rebuild、非法/重复/乱序 delta、commit 成功后 publish 失败、进程重启后不回放 delta、direct lookup 与 `ReadBuilder` 对照、cache build/evict 以及 schema/profile 拒绝。

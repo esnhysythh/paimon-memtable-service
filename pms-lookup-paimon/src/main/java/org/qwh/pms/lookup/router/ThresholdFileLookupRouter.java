@@ -8,6 +8,8 @@ import org.qwh.pms.lookup.api.LookupResult;
 import org.qwh.pms.lookup.local.LocalCacheBuildContext;
 import org.qwh.pms.lookup.local.LocalCacheBuilder;
 import org.qwh.pms.lookup.local.LocalCacheEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -30,6 +32,7 @@ import java.util.concurrent.TimeUnit;
  */
 public final class ThresholdFileLookupRouter implements DataFileLookup, AutoCloseable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ThresholdFileLookupRouter.class);
     public static final int DEFAULT_BUILD_THRESHOLD = 3;
 
     private final DataFileLookup directLookup;
@@ -144,6 +147,11 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
 
         if (readyEntry == null) {
             incrementDirectLookups();
+            LOG.debug(
+                    "Routing Paimon lookup to direct path: partition={}, bucket={}, file={}",
+                    context.partition(),
+                    context.bucket(),
+                    file.fileName());
             return directLookup.lookup(context, file, request);
         }
 
@@ -151,10 +159,22 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
             LookupResult result = readyEntry.lookup(request);
             incrementLocalLookups();
             if (result.kind() != LookupResult.Kind.UNKNOWN) {
+                LOG.debug(
+                        "Routing Paimon lookup to local cache: partition={}, bucket={}, file={}, result={}",
+                        context.partition(),
+                        context.bucket(),
+                        file.fileName(),
+                        result.kind());
                 return result;
             }
         } catch (IOException | RuntimeException e) {
             // A local cache failure can safely fall back to the immutable source data file.
+            LOG.warn(
+                    "Paimon local cache lookup failed; falling back to direct path: partition={}, bucket={}, file={}",
+                    context.partition(),
+                    context.bucket(),
+                    file.fileName(),
+                    e);
         }
 
         discardReadyEntry(key, readyEntry, now);
@@ -245,6 +265,12 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
         if (inFlightBuilds >= options.maxInFlightBuilds()) {
             markBuildFailed(state, now);
             buildsRejected++;
+            LOG.debug(
+                    "Reject Paimon local cache build because in-flight limit is reached: partition={}, bucket={}, file={}, maxInFlight={}",
+                    context.partition(),
+                    context.bucket(),
+                    file.fileName(),
+                    options.maxInFlightBuilds());
             return null;
         }
         state.status = Status.BUILDING;
@@ -261,11 +287,24 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
                             () -> timeoutBuild(submission),
                             options.buildTimeout().toNanos(),
                             TimeUnit.NANOSECONDS);
+            LOG.info(
+                    "Scheduled Paimon local cache build: partition={}, bucket={}, file={}, threshold={}, inFlight={}",
+                    context.partition(),
+                    context.bucket(),
+                    file.fileName(),
+                    options.buildThreshold(),
+                    inFlightBuilds);
         } catch (RuntimeException e) {
             state.build = null;
             releaseBuildSlot(submission);
             markBuildFailed(state, now);
             buildsFailed++;
+            LOG.warn(
+                    "Failed to schedule Paimon local cache build: partition={}, bucket={}, file={}",
+                    context.partition(),
+                    context.bucket(),
+                    file.fileName(),
+                    e);
             return null;
         }
         return submission;
@@ -275,6 +314,12 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
         try {
             buildExecutor.execute(submission.task());
         } catch (RuntimeException e) {
+            LOG.warn(
+                    "Failed to submit Paimon local cache build: partition={}, bucket={}, file={}",
+                    submission.context.partition(),
+                    submission.context.bucket(),
+                    submission.file.fileName(),
+                    e);
             completeBuild(submission, null, true);
         }
     }
@@ -290,6 +335,12 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
                                     submission.context.partition(), submission.context.bucket()));
         } catch (IOException | RuntimeException e) {
             failed = true;
+            LOG.warn(
+                    "Paimon local cache build failed: partition={}, bucket={}, file={}",
+                    submission.context.partition(),
+                    submission.context.bucket(),
+                    submission.file.fileName(),
+                    e);
         }
         completeBuild(submission, entry, failed);
     }
@@ -337,6 +388,13 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
                         state.lastAccessNanos = System.nanoTime();
                         cacheBytes += entryBytes;
                         buildsSucceeded++;
+                        LOG.info(
+                                "Paimon local cache build succeeded: partition={}, bucket={}, file={}, entryBytes={}, cacheBytes={}",
+                                submission.context.partition(),
+                                submission.context.bucket(),
+                                submission.file.fileName(),
+                                entryBytes,
+                                cacheBytes);
                     }
                 }
             }
@@ -363,6 +421,12 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
             if (removal.entry() != null) {
                 entriesToClose.add(removal.entry());
                 entriesEvicted++;
+                LOG.info(
+                        "Evicted Paimon local cache entry: partition={}, bucket={}, file={}, cacheBytes={}",
+                        victim.getKey().context.partition(),
+                        victim.getKey().context.bucket(),
+                        victim.getKey().fileName(),
+                        cacheBytes);
             }
         }
     }
@@ -432,6 +496,12 @@ public final class ThresholdFileLookupRouter implements DataFileLookup, AutoClos
             markBuildFailed(state, System.nanoTime());
             buildsTimedOut++;
             buildTask = submission.task();
+            LOG.warn(
+                    "Paimon local cache build timed out: partition={}, bucket={}, file={}, timeout={}",
+                    submission.context.partition(),
+                    submission.context.bucket(),
+                    submission.file.fileName(),
+                    options.buildTimeout());
         }
         cancelQuietly(buildTask);
     }

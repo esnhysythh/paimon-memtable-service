@@ -200,6 +200,7 @@ public final class PMSTestServer implements AutoCloseable {
         props.setProperty("pms.paimon.table", tableName);
         props.setProperty("pms.wal.dir", rootDir.resolve("wal").toString());
         props.setProperty("pms.storage.dir", rootDir.resolve("storage").toString());
+        props.setProperty("pms.lookup.cache.dir", rootDir.resolve("target").resolve("lookup-cache").toString());
         props.setProperty("pms.memtable.max_entries", "1000000");
         return new ConfigManager().from(props);
     }
