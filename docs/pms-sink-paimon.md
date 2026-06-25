@@ -268,6 +268,10 @@ commit.filterAndCommit(Map.of(commitIdentifier, messages));
 
 使用独立 commit user 的原因是 Paimon stream commit 的 `commitIdentifier` 需要在同一 commit user 下单调递增并可用于幂等过滤。普通 sink 已使用 `SinkBatch.maxSequenceId()` 作为 identifier；compaction 没有 PMS sequence 边界，应维护独立的本地单调 `compactionCommitId`。
 
+docs: record Paimon implicit compaction cleanup note当前 PMS 初期暂不急于切换到 `write-only=true`。普通 sink 可能携带 Paimon 写入端隐式 compaction 产生的 `CompactIncrement`，但该增量已经包含在同一份成功提交 payload 中，lookup view 可按统一 delta 正确更新。以分钟级 sink 频率为目标时，隐式 compaction 的延迟和指标可先作为后续优化项。
+
+需要注意：`write-only=true` 不只会关闭写入端隐式 compaction，也会跳过 Paimon snapshot expiration。当前未启用 `write-only=true` 时，Paimon 会在普通 commit 后按表配置清理过期 snapshot 及其不再被引用的旧文件；未来如果 PMS 接管 compaction 并启用 write-only sink，则也需要同步接管 snapshot/file 清理与对应指标。
+
 ### 10.2 Compaction Prepare/Commit 流程
 
 建议新增 `PaimonCompactionManager`，仍放在 `pms-sink-paimon`，不让 `pms-core` 依赖 Paimon API。
