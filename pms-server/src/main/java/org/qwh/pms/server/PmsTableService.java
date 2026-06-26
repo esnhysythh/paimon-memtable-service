@@ -29,15 +29,15 @@ import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
 import org.qwh.pms.lookup.api.ResolvedDataFile;
 import org.qwh.pms.lookup.api.SchemaMismatchException;
-import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
-import org.qwh.pms.lookup.live.CandidatePlanner;
-import org.qwh.pms.lookup.live.LiveFileIndex;
-import org.qwh.pms.lookup.local.LocalCacheDirectory;
-import org.qwh.pms.lookup.local.ValueSstCacheBuilder;
-import org.qwh.pms.lookup.paimon.PaimonKeyValueLookupService;
-import org.qwh.pms.lookup.router.ThresholdFileLookupRouter;
-import org.qwh.pms.lookup.router.ThresholdFileLookupRouterOptions;
-import org.qwh.pms.lookup.router.ThresholdFileLookupRouterStats;
+import org.qwh.pms.lookup.PaimonKeyValueLookupService;
+import org.qwh.pms.lookup.cache.LocalCacheDirectory;
+import org.qwh.pms.lookup.cache.valuesst.ValueSstCacheBuilder;
+import org.qwh.pms.lookup.parquet.PaimonKeyValueParquetLookup;
+import org.qwh.pms.lookup.routing.ThresholdFileLookupRouter;
+import org.qwh.pms.lookup.routing.ThresholdFileLookupRouterOptions;
+import org.qwh.pms.lookup.routing.ThresholdFileLookupRouterStats;
+import org.qwh.pms.lookup.view.CandidatePlanner;
+import org.qwh.pms.lookup.view.LiveFileIndex;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
@@ -370,7 +370,7 @@ public final class PmsTableService implements AutoCloseable {
 
     private LookupStack createLookupStack(
             PmsLookupConfig lookupConfig, RowType rowType, int[] primaryKeyFieldIndexes) {
-        DataFileLookup directLookup = new PaimonKeyValueDirectLookup(
+        DataFileLookup directLookup = new PaimonKeyValueParquetLookup(
             rowType,
             primaryKeyFieldIndexes,
             fileStoreTable.schema().id(),

@@ -31,14 +31,15 @@ pms-server               -> pms-core + pms-codec + pms-sink-paimon + pms-lookup-
 模块迁入 demo 的生产代码，形成以下内部职责：
 
 ```text
-PaimonKeyValueLookupService
-  -> LiveFileIndex / CandidatePlanner
-  -> ThresholdFileLookupRouter
-      -> PaimonKeyValueDirectLookup
-      -> ValueSstCacheBuilder（热点文件的本地 value SST）
+lookup.PaimonKeyValueLookupService（入口）
+  -> view.LiveFileIndex / view.CandidatePlanner
+  -> commit.CommitMessageDeltaExtractor
+  -> routing.ThresholdFileLookupRouter
+      -> parquet.PaimonKeyValueParquetLookup
+      -> cache.valuesst.ValueSstCacheBuilder（热点文件的本地 value SST）
 ```
 
-`LiveFileIndex` 是 PMS 自己拥有的控制面状态；Paimon 不会替 PMS 自动刷新该 view。`ThresholdFileLookupRouter` 负责热度准入、异步 build、超时、退避和本地 cache 的磁盘预算；cache 只是性能层，direct Parquet lookup 仍是其正确性基础。
+`view` 是 PMS 自己拥有的控制面状态；Paimon 不会替 PMS 自动刷新该 view。`commit` 只负责把已成功提交的 Paimon `CommitMessage` 解释为 data-file delta。`routing` 负责热度准入、异步 build、超时、退避和本地 cache 的磁盘预算；cache 只是性能层，`parquet` 单文件点查仍是其正确性基础。
 
 ## 3. 查询语义
 

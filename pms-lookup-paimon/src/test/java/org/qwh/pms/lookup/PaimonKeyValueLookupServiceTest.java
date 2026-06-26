@@ -17,10 +17,10 @@ import org.qwh.pms.lookup.api.FileLookupContext;
 import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
 import org.qwh.pms.lookup.api.SchemaMismatchException;
-import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
-import org.qwh.pms.lookup.live.CandidatePlanner;
-import org.qwh.pms.lookup.live.LiveFileIndex;
-import org.qwh.pms.lookup.paimon.PaimonKeyValueLookupService;
+import org.qwh.pms.lookup.parquet.PaimonKeyValueParquetLookup;
+import org.qwh.pms.lookup.view.CandidatePlanner;
+import org.qwh.pms.lookup.view.LiveFileIndex;
+import org.qwh.pms.lookup.PaimonKeyValueLookupService;
 
 import java.util.Comparator;
 import java.util.List;
@@ -212,7 +212,7 @@ class PaimonKeyValueLookupServiceTest {
                     new PaimonKeyValueLookupService(
                             index,
                             new CandidatePlanner(FILE_KEY_COMPARATOR, 0),
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     KEY_FIELDS,
                                     fixture.schemaId(),
@@ -237,8 +237,8 @@ class PaimonKeyValueLookupServiceTest {
                         ROW_TYPE,
                         List.of("tenant_id", "order_id", "biz_date"))) {
             PaimonTableFixture.WriteResult writeResult = fixture.writeRows(rows(10));
-            PaimonKeyValueDirectLookup lookup =
-                    new PaimonKeyValueDirectLookup(
+            PaimonKeyValueParquetLookup lookup =
+                    new PaimonKeyValueParquetLookup(
                             ROW_TYPE,
                             KEY_FIELDS,
                             fixture.schemaId() + 1,
@@ -268,7 +268,7 @@ class PaimonKeyValueLookupServiceTest {
                     new PaimonKeyValueLookupService(
                             index,
                             new CandidatePlanner(STRING_FILE_KEY_COMPARATOR, 0),
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     STRING_ROW_TYPE,
                                     STRING_KEY_FIELDS,
                                     fixture.schemaId(),
@@ -346,7 +346,7 @@ class PaimonKeyValueLookupServiceTest {
         assertThrows(
                 UnsupportedOperationException.class,
                 () ->
-                        new PaimonKeyValueDirectLookup(
+                        new PaimonKeyValueParquetLookup(
                                 BINARY_ROW_TYPE, new int[] {0}, 0L, (context, ignored) -> null));
     }
 
@@ -354,7 +354,7 @@ class PaimonKeyValueLookupServiceTest {
     void lookupRejectsTimestampInt96KeysInPaimonKeyValueFiles() {
         assertThrows(
                 UnsupportedOperationException.class,
-                () -> new PaimonKeyValueDirectLookup(
+                () -> new PaimonKeyValueParquetLookup(
                         TIMESTAMP_NANOS_ROW_TYPE,
                         new int[] {0},
                         0L,
@@ -366,7 +366,7 @@ class PaimonKeyValueLookupServiceTest {
         assertThrows(
                 UnsupportedOperationException.class,
                 () ->
-                        new PaimonKeyValueDirectLookup(
+                        new PaimonKeyValueParquetLookup(
                                 TIMESTAMP_LTZ_ROW_TYPE,
                                 new int[] {0},
                                 0L,
@@ -378,7 +378,7 @@ class PaimonKeyValueLookupServiceTest {
         return new PaimonKeyValueLookupService(
                 index,
                 new CandidatePlanner(FILE_KEY_COMPARATOR, 0),
-                new PaimonKeyValueDirectLookup(
+                new PaimonKeyValueParquetLookup(
                         ROW_TYPE, KEY_FIELDS, fixture.schemaId(), fixture.dataFileResolver()),
                 fixture.schemaId());
     }
@@ -387,7 +387,7 @@ class PaimonKeyValueLookupServiceTest {
         return new PaimonKeyValueLookupService(
                 new LiveFileIndex(STRING_FILE_KEY_COMPARATOR, 4),
                 new CandidatePlanner(STRING_FILE_KEY_COMPARATOR, 0),
-                new PaimonKeyValueDirectLookup(
+                new PaimonKeyValueParquetLookup(
                         STRING_ROW_TYPE,
                         STRING_KEY_FIELDS,
                         fixture.schemaId(),
@@ -416,7 +416,7 @@ class PaimonKeyValueLookupServiceTest {
                     new PaimonKeyValueLookupService(
                             new LiveFileIndex(keyComparator, 4),
                             new CandidatePlanner(keyComparator, 0),
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     rowType,
                                     new int[] {0},
                                     fixture.schemaId(),

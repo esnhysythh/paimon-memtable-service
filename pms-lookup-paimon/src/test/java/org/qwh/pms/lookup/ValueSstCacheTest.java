@@ -20,11 +20,11 @@ import org.apache.paimon.types.RowType;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
-import org.qwh.pms.lookup.local.LocalCacheBuildContext;
-import org.qwh.pms.lookup.local.LocalCacheDirectory;
-import org.qwh.pms.lookup.local.LocalCacheEntry;
-import org.qwh.pms.lookup.local.LocalCacheMode;
-import org.qwh.pms.lookup.local.ValueSstCacheBuilder;
+import org.qwh.pms.lookup.cache.LocalCacheBuildContext;
+import org.qwh.pms.lookup.cache.LocalCacheDirectory;
+import org.qwh.pms.lookup.cache.LocalCacheEntry;
+import org.qwh.pms.lookup.cache.LocalCacheMode;
+import org.qwh.pms.lookup.cache.valuesst.ValueSstCacheBuilder;
 
 import java.io.IOException;
 import java.nio.file.Files;
