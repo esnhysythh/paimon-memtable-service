@@ -23,12 +23,12 @@ import org.qwh.pms.lookup.api.FileLookupContext;
 import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
 import org.qwh.pms.lookup.api.SchemaMismatchException;
-import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
-import org.qwh.pms.lookup.live.CandidatePlanner;
-import org.qwh.pms.lookup.live.LiveFileIndex;
-import org.qwh.pms.lookup.local.ValueSstCacheBuilder;
-import org.qwh.pms.lookup.paimon.PaimonKeyValueLookupService;
-import org.qwh.pms.lookup.router.ThresholdFileLookupRouter;
+import org.qwh.pms.lookup.parquet.PaimonKeyValueParquetLookup;
+import org.qwh.pms.lookup.view.CandidatePlanner;
+import org.qwh.pms.lookup.view.LiveFileIndex;
+import org.qwh.pms.lookup.cache.valuesst.ValueSstCacheBuilder;
+import org.qwh.pms.lookup.PaimonKeyValueLookupService;
+import org.qwh.pms.lookup.routing.ThresholdFileLookupRouter;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -71,7 +71,7 @@ class ThresholdFileLookupRouterTest {
             ManualExecutor executor = new ManualExecutor();
             CountingDataFileLookup directLookup =
                     new CountingDataFileLookup(
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     KEY_FIELDS,
                                     fixture.schemaId(),
@@ -120,7 +120,7 @@ class ThresholdFileLookupRouterTest {
             ManualExecutor executor = new ManualExecutor();
             CountingDataFileLookup directLookup =
                     new CountingDataFileLookup(
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     KEY_FIELDS,
                                     fixture.schemaId(),
@@ -160,7 +160,7 @@ class ThresholdFileLookupRouterTest {
             ManualExecutor executor = new ManualExecutor();
             CountingDataFileLookup directLookup =
                     new CountingDataFileLookup(
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     KEY_FIELDS,
                                     fixture.schemaId(),
@@ -199,7 +199,7 @@ class ThresholdFileLookupRouterTest {
             ManualExecutor executor = new ManualExecutor();
             CountingDataFileLookup directLookup =
                     new CountingDataFileLookup(
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     KEY_FIELDS,
                                     fixture.schemaId(),
@@ -237,7 +237,7 @@ class ThresholdFileLookupRouterTest {
             ManualExecutor executor = new ManualExecutor();
             CountingDataFileLookup directLookup =
                     new CountingDataFileLookup(
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     KEY_FIELDS,
                                     fixture.schemaId(),

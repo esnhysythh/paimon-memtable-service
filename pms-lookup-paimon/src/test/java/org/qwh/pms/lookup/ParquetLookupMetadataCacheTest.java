@@ -10,9 +10,9 @@ import org.apache.paimon.types.RowType;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.lookup.api.FileLookupContext;
 import org.qwh.pms.lookup.api.ResolvedDataFile;
-import org.qwh.pms.lookup.direct.parquet.ParquetLookupMetadata;
-import org.qwh.pms.lookup.direct.parquet.ParquetLookupMetadataCache;
-import org.qwh.pms.lookup.direct.parquet.ResolvedDataFileKey;
+import org.qwh.pms.lookup.parquet.ParquetLookupMetadata;
+import org.qwh.pms.lookup.parquet.ParquetLookupMetadataCache;
+import org.qwh.pms.lookup.parquet.ResolvedDataFileKey;
 
 import java.util.List;
 

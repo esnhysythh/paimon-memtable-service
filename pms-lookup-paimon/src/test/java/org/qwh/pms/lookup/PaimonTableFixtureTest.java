@@ -15,7 +15,7 @@ import org.qwh.pms.lookup.api.FileLookupContext;
 import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
 import org.qwh.pms.lookup.api.ResolvedDataFile;
-import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
+import org.qwh.pms.lookup.parquet.PaimonKeyValueParquetLookup;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -72,8 +72,8 @@ class PaimonTableFixtureTest {
             PaimonTableFixture.WriteResult deleteResult =
                     fixture.writeRows(List.of(deleteRow(42)));
 
-            PaimonKeyValueDirectLookup lookup =
-                    new PaimonKeyValueDirectLookup(
+            PaimonKeyValueParquetLookup lookup =
+                    new PaimonKeyValueParquetLookup(
                             ROW_TYPE,
                             new int[] {0, 1, 2},
                             fixture.schemaId(),

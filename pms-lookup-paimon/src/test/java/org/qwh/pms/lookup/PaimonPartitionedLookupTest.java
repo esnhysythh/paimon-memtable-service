@@ -12,12 +12,12 @@ import org.apache.paimon.utils.KeyComparatorSupplier;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.lookup.api.LookupRequest;
 import org.qwh.pms.lookup.api.LookupResult;
-import org.qwh.pms.lookup.direct.parquet.PaimonKeyValueDirectLookup;
-import org.qwh.pms.lookup.live.CandidatePlanner;
-import org.qwh.pms.lookup.live.LiveFileIndex;
-import org.qwh.pms.lookup.local.LocalCacheBuildContext;
-import org.qwh.pms.lookup.local.LocalCacheDirectory;
-import org.qwh.pms.lookup.paimon.PaimonKeyValueLookupService;
+import org.qwh.pms.lookup.parquet.PaimonKeyValueParquetLookup;
+import org.qwh.pms.lookup.view.CandidatePlanner;
+import org.qwh.pms.lookup.view.LiveFileIndex;
+import org.qwh.pms.lookup.cache.LocalCacheBuildContext;
+import org.qwh.pms.lookup.cache.LocalCacheDirectory;
+import org.qwh.pms.lookup.PaimonKeyValueLookupService;
 
 import java.nio.file.Files;
 import java.util.Comparator;
@@ -72,7 +72,7 @@ class PaimonPartitionedLookupTest {
                     new PaimonKeyValueLookupService(
                             new LiveFileIndex(FILE_KEY_COMPARATOR, 4),
                             new CandidatePlanner(FILE_KEY_COMPARATOR, 0),
-                            new PaimonKeyValueDirectLookup(
+                            new PaimonKeyValueParquetLookup(
                                     ROW_TYPE,
                                     TRIMMED_KEY_FIELDS,
                                     fixture.schemaId(),
