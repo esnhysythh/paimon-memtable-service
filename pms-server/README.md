@@ -37,6 +37,10 @@ curl http://127.0.0.1:19090/state
 `/getLocal` only reads PMS-local layers and returns `result=HIT|DELETED|MISS`.
 `/prefixLocal` only reads PMS-local layers. `/prefix` is reserved for future full prefix lookup and returns `NOT_SUPPORTED` in V1.
 
+The same port also exposes the binary protocol under `/pms/api/v1/...`.
+Binary endpoints require HTTP/2 by default. For h2c clients, call `/pms/api/v1/handshake`
+first and verify the response protocol before sending write/read bodies.
+
 ## Configuration
 
 `pms-server` reads Java properties. Required values are the local WAL/storage
@@ -47,6 +51,13 @@ directories and the target Paimon table.
 | `pms.server.host` | `127.0.0.1` | HTTP bind host. |
 | `pms.server.port` | `9090` | HTTP bind port. Use `0` in tests for a random port. |
 | `pms.server.commit_user` | `pms-server` | Paimon commit user. |
+| `pms.protocol.strict_http2` | `true` | Rejects non-HTTP/2 requests on binary protocol endpoints. |
+| `pms.protocol.max_key_bytes` | `65536` | Maximum encoded key bytes per protocol request item. |
+| `pms.protocol.max_row_bytes` | `16777216` | Maximum encoded row bytes per protocol request item. |
+| `pms.protocol.max_batch_entries` | `1024` | Maximum records per binary `RecordBatch`. |
+| `pms.protocol.max_concurrent_streams` | `128` | Jetty h2c maximum concurrent streams. |
+| `pms.protocol.max_request_body_bytes` | `33554432` | Maximum binary protocol request body bytes. |
+| `pms.protocol.max_response_body_bytes` | `33554432` | Maximum binary protocol response body bytes. |
 | `pms.server.scheduler.enabled` | `false` | Enables the lightweight background scheduler. |
 | `pms.server.scheduler.flush_interval_ms` | `0` | Scheduled freeze+flush interval. `0` disables scheduled flush. |
 | `pms.server.scheduler.sink_interval_ms` | `pms.sink.interval_ms` | Scheduled sink interval. `0` disables scheduled sink. |

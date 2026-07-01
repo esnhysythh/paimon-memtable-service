@@ -8,6 +8,7 @@ public record PmsServerConfig(
     String database,
     String table,
     String commitUser,
+    PmsProtocolConfig protocol,
     PmsSchedulerConfig scheduler,
     PmsLookupConfig lookup,
     PMSConfig coreConfig
@@ -30,6 +31,9 @@ public record PmsServerConfig(
         }
         if (coreConfig == null) {
             throw new IllegalArgumentException("coreConfig must not be null");
+        }
+        if (protocol == null) {
+            protocol = PmsProtocolConfig.defaults();
         }
         if (scheduler == null) {
             scheduler = PmsSchedulerConfig.disabled(coreConfig.sink().intervalMs());

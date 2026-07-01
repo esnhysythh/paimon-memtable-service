@@ -1,25 +1,48 @@
 package org.qwh.pms.server;
 
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.qwh.pms.codec.PmsPrimaryKeyCodec;
+import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
+import org.qwh.pms.protocol.api.LookupResultType;
+import org.qwh.pms.protocol.api.PmsHandshake;
+import org.qwh.pms.protocol.api.PmsProtocolConstants;
+import org.qwh.pms.protocol.api.PmsStatus;
+import org.qwh.pms.protocol.api.RawKvEntry;
+import org.qwh.pms.protocol.api.RawLookupBatchResult;
+import org.qwh.pms.protocol.api.RawLookupResult;
+import org.qwh.pms.protocol.api.WriteResult;
+import org.qwh.pms.protocol.codec.KeyBatchCodec;
+import org.qwh.pms.protocol.codec.LookupBatchCodec;
+import org.qwh.pms.protocol.codec.RecordBatchCodec;
+import org.qwh.pms.protocol.codec.WriteResultCodec;
 import org.qwh.pms.server.dev.PMSTestServer;
 import org.qwh.pms.server.PmsLocalLookupResult.Type;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
 
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.function.BooleanSupplier;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -425,6 +448,104 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void binaryProtocolDrivesRawWriteBatchAndLookupOverHttp2() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
+            HttpClient client = http2Client();
+            PmsHandshake handshake = requireHttp2Handshake(client, server);
+
+            EncodedRow row1 = encodedRow(server.table().rowType(), 1, "proto-a");
+            EncodedRow row2 = encodedRow(server.table().rowType(), 2, "proto-b");
+            byte[] requestBody = RecordBatchCodec.encodeRequest(List.of(
+                RawKvEntry.put(row1.key(), row1.row()),
+                RawKvEntry.delete(row1.key()),
+                RawKvEntry.put(row2.key(), row2.row())
+            ));
+
+            HttpResponse<byte[]> batchResponse = postBinary(client, server, PmsProtocolConstants.LOCAL_WRITE_BATCH_PATH, requestBody);
+            assertEquals(HttpClient.Version.HTTP_2, batchResponse.version());
+            assertEquals(200, batchResponse.statusCode());
+            WriteResult writeResult = WriteResultCodec.decodeResponse(batchResponse.body());
+            assertEquals(PmsStatus.OK, writeResult.status());
+            assertEquals(3, writeResult.acceptedCount());
+
+            RawLookupResult deleted = singleLookup(postBinary(
+                client,
+                server,
+                PmsProtocolConstants.LOCAL_GET_PATH,
+                KeyBatchCodec.encodeSingle(row1.key())
+            ).body());
+            assertEquals(LookupResultType.DELETED, deleted.type());
+
+            RawLookupResult hit = singleLookup(postBinary(
+                client,
+                server,
+                PmsProtocolConstants.FULL_GET_PATH,
+                KeyBatchCodec.encodeSingle(row2.key())
+            ).body());
+            assertEquals(LookupResultType.HIT, hit.type());
+            assertArrayEquals(row2.row(), hit.row());
+
+            RawLookupBatchResult prefix = LookupBatchCodec.decodeResponse(postBinary(
+                client,
+                server,
+                PmsProtocolConstants.LOCAL_GET_PREFIX_PATH,
+                KeyBatchCodec.encodeSingle(row2.key())
+            ).body());
+            assertEquals(PmsStatus.OK, prefix.status());
+            assertEquals(1, prefix.results().size());
+            assertArrayEquals(row2.row(), prefix.results().get(0).row());
+
+            Map<String, Object> jsonState = server.getJson("/state");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> runtime = (Map<String, Object>) jsonState.get("runtime");
+            assertEquals("RUNNING", runtime.get("status"));
+        }
+    }
+
+    @Test
+    void binaryFullGetFallsThroughToPaimonAfterLocalMiss() throws Exception {
+        Path warehouse = tempDir.resolve("warehouse");
+
+        PmsServerConfig writerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("writer"), warehouse)
+        );
+        try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
+            writer.write(Map.of("id", 1, "marker", "paimon-binary"));
+            writer.flush();
+            writer.sink();
+        }
+
+        PmsServerConfig readerConfig = new ConfigManager().from(
+            baseProperties(tempDir.resolve("reader"), warehouse)
+        );
+        try (PMSTestServer reader = PMSTestServer.create(readerConfig, schema()).start()) {
+            HttpClient client = http2Client();
+            requireHttp2Handshake(client, reader);
+            EncodedRow lookup = encodedRow(reader.table().rowType(), 1, "unused");
+
+            RawLookupResult local = singleLookup(postBinary(
+                client,
+                reader,
+                PmsProtocolConstants.LOCAL_GET_PATH,
+                KeyBatchCodec.encodeSingle(lookup.key())
+            ).body());
+            assertEquals(LookupResultType.MISS, local.type());
+
+            RawLookupResult full = singleLookup(postBinary(
+                client,
+                reader,
+                PmsProtocolConstants.FULL_GET_PATH,
+                KeyBatchCodec.encodeSingle(lookup.key())
+            ).body());
+            assertEquals(LookupResultType.HIT, full.type());
+            assertEquals(
+                "paimon-binary",
+                new PmsRowValueCodec().decode(reader.table().rowType(), full.row()).getString(1).toString()
+            );
+        }
+    }
+
+    @Test
     void schedulerAutomaticallyFlushesAndSinks() throws Exception {
         Properties props = baseProperties();
         props.setProperty("pms.server.scheduler.enabled", "true");
@@ -491,6 +612,13 @@ class PmsServerEndToEndTest {
         assertFalse(config.scheduler().enabled());
         assertEquals(0, config.scheduler().flushIntervalMs());
         assertEquals(30000, config.scheduler().sinkIntervalMs());
+        assertTrue(config.protocol().strictHttp2());
+        assertEquals(PmsProtocolConfig.DEFAULT_MAX_KEY_BYTES, config.protocol().maxKeyBytes());
+        assertEquals(PmsProtocolConfig.DEFAULT_MAX_ROW_BYTES, config.protocol().maxRowBytes());
+        assertEquals(PmsProtocolConfig.DEFAULT_MAX_BATCH_ENTRIES, config.protocol().maxBatchEntries());
+        assertEquals(PmsProtocolConfig.DEFAULT_MAX_CONCURRENT_STREAMS, config.protocol().maxConcurrentStreams());
+        assertEquals(PmsProtocolConfig.DEFAULT_MAX_REQUEST_BODY_BYTES, config.protocol().maxRequestBodyBytes());
+        assertEquals(PmsProtocolConfig.DEFAULT_MAX_RESPONSE_BODY_BYTES, config.protocol().maxResponseBodyBytes());
         assertTrue(config.lookup().cacheEnabled());
         assertEquals(tempDir.resolve("target").resolve("lookup-cache").toAbsolutePath().normalize(), config.lookup().cacheDir());
         assertEquals(3L * 1024 * 1024 * 1024, config.lookup().maxCacheBytes());
@@ -561,6 +689,28 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void configManagerParsesProtocolOverrides() {
+        Properties props = baseProperties();
+        props.setProperty("pms.protocol.strict_http2", "false");
+        props.setProperty("pms.protocol.max_key_bytes", "123");
+        props.setProperty("pms.protocol.max_row_bytes", "456");
+        props.setProperty("pms.protocol.max_batch_entries", "7");
+        props.setProperty("pms.protocol.max_concurrent_streams", "8");
+        props.setProperty("pms.protocol.max_request_body_bytes", "999");
+        props.setProperty("pms.protocol.max_response_body_bytes", "1001");
+
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        assertFalse(config.protocol().strictHttp2());
+        assertEquals(123, config.protocol().maxKeyBytes());
+        assertEquals(456, config.protocol().maxRowBytes());
+        assertEquals(7, config.protocol().maxBatchEntries());
+        assertEquals(8, config.protocol().maxConcurrentStreams());
+        assertEquals(999, config.protocol().maxRequestBodyBytes());
+        assertEquals(1001, config.protocol().maxResponseBodyBytes());
+    }
+
+    @Test
     void testServerMainExpandsTimestampedTargetDirectories() {
         Properties props = new Properties();
         props.setProperty("pms.test.timestamp", "20260526100000");
@@ -605,6 +755,63 @@ class PmsServerEndToEndTest {
 
     private static void assertJson(String json, String expected) {
         assertTrue(json.contains(expected), () -> "Expected " + expected + " in " + json);
+    }
+
+    private static HttpClient http2Client() {
+        return HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_2)
+            .proxy(HttpClient.Builder.NO_PROXY)
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+    }
+
+    private static HttpRequest.Builder request(PMSTestServer server, String path) {
+        return HttpRequest.newBuilder(server.baseUri().resolve(path))
+            .version(HttpClient.Version.HTTP_2);
+    }
+
+    private static PmsHandshake requireHttp2Handshake(HttpClient client, PMSTestServer server) throws Exception {
+        HttpResponse<String> response = client.send(
+            request(server, PmsProtocolConstants.HANDSHAKE_PATH).GET().build(),
+            HttpResponse.BodyHandlers.ofString()
+        );
+        assertEquals(HttpClient.Version.HTTP_2, response.version());
+        assertEquals(200, response.statusCode());
+        PmsHandshake handshake = PmsHandshake.fromJson(response.body());
+        handshake.requireCompatible();
+        assertEquals("pms", handshake.backend());
+        return handshake;
+    }
+
+    private static HttpResponse<byte[]> postBinary(
+            HttpClient client,
+            PMSTestServer server,
+            String path,
+            byte[] body) throws Exception {
+        return client.send(
+            request(server, path)
+                .header("content-type", PmsProtocolConstants.CONTENT_TYPE_BINARY)
+                .header("accept", PmsProtocolConstants.CONTENT_TYPE_BINARY)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .build(),
+            HttpResponse.BodyHandlers.ofByteArray()
+        );
+    }
+
+    private static RawLookupResult singleLookup(byte[] body) {
+        RawLookupBatchResult result = LookupBatchCodec.decodeResponse(body);
+        assertEquals(PmsStatus.OK, result.status());
+        assertEquals(1, result.results().size());
+        return result.results().get(0);
+    }
+
+    private static EncodedRow encodedRow(RowType rowType, int id, String marker) {
+        GenericRow row = new GenericRow(RowKind.INSERT, rowType.getFieldCount());
+        row.setField(0, id);
+        row.setField(1, BinaryString.fromString(marker));
+        PmsPrimaryKeyCodec keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, List.of("id"));
+        PmsRowValueCodec valueCodec = new PmsRowValueCodec();
+        return new EncodedRow(keyCodec.encodeKey(row), valueCodec.encode(rowType, row, 0));
     }
 
     private Properties baseProperties() {
@@ -684,4 +891,6 @@ class PmsServerEndToEndTest {
             throw new RuntimeException("forced commit failure after prepare");
         }
     }
+
+    private record EncodedRow(byte[] key, byte[] row) {}
 }

@@ -39,6 +39,7 @@ import org.qwh.pms.lookup.routing.ThresholdFileLookupRouterStats;
 import org.qwh.pms.lookup.view.CandidatePlanner;
 import org.qwh.pms.lookup.view.LiveFileIndex;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
+import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
 import org.qwh.pms.core.config.StorageConfig;
@@ -48,6 +49,10 @@ import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.sink.paimon.PaimonCommitPayloadCodec;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
+import org.qwh.pms.protocol.api.LookupResultType;
+import org.qwh.pms.protocol.api.RawKvEntry;
+import org.qwh.pms.protocol.api.RawLookupBatchResult;
+import org.qwh.pms.protocol.api.RawLookupResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -163,6 +168,47 @@ public final class PmsTableService implements AutoCloseable {
         LOG.debug("Deleted row from PMS: primaryKeyValues={}", primaryKeyValues);
     }
 
+    public void writeRawBatch(List<RawKvEntry> entries) {
+        if (entries == null || entries.isEmpty()) {
+            throw new IllegalArgumentException("entries must not be empty");
+        }
+        List<WriteOp> ops = entries.stream()
+            .map(entry -> entry.isDelete()
+                ? WriteOp.delete(entry.key())
+                : WriteOp.put(entry.key(), entry.row()))
+            .toList();
+        director.writeBatch(ops);
+        LOG.debug("Wrote raw batch to PMS: recordCount={}", entries.size());
+    }
+
+    public RawLookupResult getLocalRaw(byte[] key) {
+        Optional<Value> local = director.lookup(key);
+        if (local.isEmpty()) {
+            return RawLookupResult.miss();
+        }
+        Value value = local.get();
+        if (value.isTombstone()) {
+            return RawLookupResult.deleted();
+        }
+        return RawLookupResult.hit(value.bytes());
+    }
+
+    public RawLookupResult getFullRaw(byte[] key) {
+        RawLookupResult local = getLocalRaw(key);
+        if (local.type() == LookupResultType.HIT || local.type() == LookupResultType.DELETED) {
+            return local;
+        }
+        GenericRow fullPrimaryKeyRow = rowMapper.fullPrimaryKeyRow((GenericRow) keyCodec.decodeKey(key), primaryKeys);
+        return lookupPaimonRaw(fullPrimaryKeyRow);
+    }
+
+    public RawLookupBatchResult prefixLocalRaw(byte[] prefix) {
+        List<RawLookupResult> rows = director.prefixScan(prefix).stream()
+            .map(entry -> RawLookupResult.hit(entry.value().bytes()))
+            .toList();
+        return RawLookupBatchResult.ok(rows);
+    }
+
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
         GenericRow fullPrimaryKeyRow = rowMapper.fullPrimaryKeyRow(primaryKeyValues, primaryKeys);
         byte[] key = keyCodec.encodeKey(fullPrimaryKeyRow);
@@ -174,6 +220,50 @@ public final class PmsTableService implements AutoCloseable {
             return Optional.empty();
         }
         return lookupPaimon(fullPrimaryKeyRow);
+    }
+
+    private RawLookupResult lookupPaimonRaw(GenericRow fullPrimaryKeyRow) {
+        if (lookupPayloadDecodeFailure != null) {
+            throw new PmsLookupUnavailableException(
+                "Paimon lookup commit delta publishing failed; restart or repair the lookup view",
+                lookupPayloadDecodeFailure
+            );
+        }
+        RowKeyExtractor extractor = rowKeyExtractors.get();
+        extractor.setRecord(fullPrimaryKeyRow);
+        BinaryRow partition = extractor.partition();
+        int bucket = extractor.bucket();
+        LookupRequest request = LookupRequest.fullRow(extractor.trimmedPrimaryKey());
+        LookupResult result;
+        try {
+            result = paimonLookup.lookup(partition, bucket, request);
+        } catch (IOException e) {
+            result = LookupResult.unknown();
+        } catch (SchemaMismatchException e) {
+            throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
+        }
+        if (result.kind() == LookupResult.Kind.UNKNOWN) {
+            try {
+                synchronized (paimonCommitPublishLock) {
+                    installSnapshot(partition, bucket);
+                    result = paimonLookup.lookup(partition, bucket, request);
+                }
+            } catch (IOException e) {
+                throw new PmsLookupUnavailableException(
+                    "Unable to rebuild Paimon lookup view for partition=" + partition + ", bucket=" + bucket,
+                    e
+                );
+            } catch (SchemaMismatchException e) {
+                throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
+            }
+        }
+        return switch (result.kind()) {
+            case HIT -> RawLookupResult.hit(valueCodec.encode(table.rowType(), result.row().orElseThrow(), 0));
+            case DELETED -> RawLookupResult.deleted();
+            case MISS -> RawLookupResult.miss();
+            case UNKNOWN -> throw new PmsLookupUnavailableException(
+                "Paimon lookup is unavailable for partition=" + partition + ", bucket=" + bucket);
+        };
     }
 
     public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
