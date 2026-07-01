@@ -2,6 +2,7 @@ package org.qwh.pms.core.bucket;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.config.*;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
@@ -147,6 +148,50 @@ class PMSBucketDirectorImplTest {
         }
     }
 
+    @Test
+    void writeBatchAppliesPutDeleteAndDuplicateKeysInOrder() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.writeBatch(List.of(
+                WriteOp.put("k1".getBytes(), "v1".getBytes()),
+                WriteOp.put("k2".getBytes(), "v2".getBytes()),
+                WriteOp.put("k1".getBytes(), "v1-new".getBytes()),
+                WriteOp.delete("k2".getBytes()),
+                WriteOp.put("k3".getBytes(), new byte[0])
+            ));
+
+            assertArrayEquals("v1-new".getBytes(), dir.get("k1".getBytes()).orElse(null));
+            assertFalse(dir.get("k2".getBytes()).isPresent());
+            assertTrue(dir.lookup("k2".getBytes()).orElseThrow().isTombstone());
+            assertArrayEquals(new byte[0], dir.get("k3".getBytes()).orElseThrow());
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(5L, snap.lastAssignedSequenceId());
+            assertEquals(1L, snap.curMemTableMinSequenceId());
+            assertEquals(5L, snap.curMemTableMaxSequenceId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void writeBatchRejectsInvalidBatchBeforeWriting() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        dir.init();
+        try {
+            assertThrows(IllegalArgumentException.class, () -> dir.writeBatch(List.of()));
+            assertThrows(NullPointerException.class, () -> dir.writeBatch(null));
+            assertThrows(NullPointerException.class, () -> WriteOp.put("k1".getBytes(), null));
+            assertThrows(IllegalArgumentException.class, () -> WriteOp.put(new byte[0], "v1".getBytes()));
+
+            assertEquals(0L, dir.stateSnapshot().lastAssignedSequenceId());
+            assertFalse(dir.get("k1".getBytes()).isPresent());
+        } finally {
+            dir.close();
+        }
+    }
+
     // ── Freeze ──
 
     @Test
@@ -205,6 +250,31 @@ class PMSBucketDirectorImplTest {
             assertEquals(3L, snap.lastAssignedSequenceId());
             assertEquals(1L, snap.immutableMemTableMinSequenceId());
             assertEquals(3L, snap.immutableMemTableMaxSequenceId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void writeBatchAutoFreezePreservesWholeBatchBoundary() throws IOException {
+        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(3, 256));
+        dir.init();
+        try {
+            dir.writeBatch(List.of(
+                WriteOp.put("k1".getBytes(), "v1".getBytes()),
+                WriteOp.put("k2".getBytes(), "v2".getBytes()),
+                WriteOp.delete("k3".getBytes()),
+                WriteOp.put("k4".getBytes(), "v4".getBytes())
+            ));
+
+            BucketStateSnapshot snap = dir.stateSnapshot();
+            assertEquals(1, snap.immutableMemTableCount());
+            assertEquals(0, snap.curMemTableEstimatedEntryCount());
+            assertEquals(4L, snap.lastAssignedSequenceId());
+            assertEquals(1L, snap.immutableMemTableMinSequenceId());
+            assertEquals(4L, snap.immutableMemTableMaxSequenceId());
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElseThrow());
+            assertFalse(dir.get("k3".getBytes()).isPresent());
         } finally {
             dir.close();
         }
@@ -684,6 +754,33 @@ class PMSBucketDirectorImplTest {
             assertTrue(dir2.get("k2".getBytes()).isPresent(), "k2 should be recovered");
             assertArrayEquals("v2".getBytes(), dir2.get("k2".getBytes()).orElse(null));
             assertEquals(3L, dir2.stateSnapshot().lastAssignedSequenceId());
+        } finally {
+            dir2.close();
+        }
+    }
+
+    @Test
+    void recoverWriteBatchFromWALAfterRestart() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+
+        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        dir1.init();
+        dir1.writeBatch(List.of(
+            WriteOp.put("k1".getBytes(), "v1".getBytes()),
+            WriteOp.put("k2".getBytes(), "v2".getBytes()),
+            WriteOp.delete("k1".getBytes()),
+            WriteOp.put("k3".getBytes(), "v3".getBytes())
+        ));
+        dir1.close();
+
+        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        dir2.init();
+        try {
+            assertFalse(dir2.get("k1".getBytes()).isPresent());
+            assertTrue(dir2.lookup("k1".getBytes()).orElseThrow().isTombstone());
+            assertArrayEquals("v2".getBytes(), dir2.get("k2".getBytes()).orElseThrow());
+            assertArrayEquals("v3".getBytes(), dir2.get("k3".getBytes()).orElseThrow());
+            assertEquals(4L, dir2.stateSnapshot().lastAssignedSequenceId());
         } finally {
             dir2.close();
         }
