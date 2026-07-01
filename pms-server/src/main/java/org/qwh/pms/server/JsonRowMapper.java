@@ -56,6 +56,16 @@ final class JsonRowMapper {
 
     GenericRow fullPrimaryKeyRow(Map<String, Object> values, List<String> primaryKeys) {
         GenericRow keyTuple = keyTuple(values, primaryKeys);
+        return fullPrimaryKeyRow(keyTuple, primaryKeys);
+    }
+
+    GenericRow fullPrimaryKeyRow(GenericRow keyTuple, List<String> primaryKeys) {
+        if (keyTuple.getFieldCount() != primaryKeys.size()) {
+            throw new IllegalArgumentException(
+                "Key tuple arity " + keyTuple.getFieldCount()
+                    + " does not match primary key field count " + primaryKeys.size()
+            );
+        }
         GenericRow row = new GenericRow(RowKind.INSERT, rowType.getFieldCount());
         for (int i = 0; i < primaryKeys.size(); i++) {
             DataField field = rowType.getField(primaryKeys.get(i));

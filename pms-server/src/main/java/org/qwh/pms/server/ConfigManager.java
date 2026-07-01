@@ -46,6 +46,7 @@ public final class ConfigManager {
             database,
             table,
             getString(normalized, "pms.server.commit_user", "pms-server"),
+            protocolConfig(normalized),
             schedulerConfig(normalized, coreConfig),
             lookupConfig(normalized, coreConfig, database, table),
             coreConfig
@@ -71,6 +72,18 @@ public final class ConfigManager {
             getBoolean(props, "pms.server.scheduler.enabled", PmsSchedulerConfig.DEFAULT_ENABLED),
             getInt(props, "pms.server.scheduler.flush_interval_ms", PmsSchedulerConfig.DEFAULT_FLUSH_INTERVAL_MS),
             getInt(props, "pms.server.scheduler.sink_interval_ms", coreConfig.sink().intervalMs())
+        );
+    }
+
+    private static PmsProtocolConfig protocolConfig(Properties props) {
+        return new PmsProtocolConfig(
+            getBoolean(props, "pms.protocol.strict_http2", PmsProtocolConfig.DEFAULT_STRICT_HTTP2),
+            getInt(props, "pms.protocol.max_key_bytes", PmsProtocolConfig.DEFAULT_MAX_KEY_BYTES),
+            getInt(props, "pms.protocol.max_row_bytes", PmsProtocolConfig.DEFAULT_MAX_ROW_BYTES),
+            getInt(props, "pms.protocol.max_batch_entries", PmsProtocolConfig.DEFAULT_MAX_BATCH_ENTRIES),
+            getInt(props, "pms.protocol.max_concurrent_streams", PmsProtocolConfig.DEFAULT_MAX_CONCURRENT_STREAMS),
+            getInt(props, "pms.protocol.max_request_body_bytes", PmsProtocolConfig.DEFAULT_MAX_REQUEST_BODY_BYTES),
+            getInt(props, "pms.protocol.max_response_body_bytes", PmsProtocolConfig.DEFAULT_MAX_RESPONSE_BODY_BYTES)
         );
     }
 

@@ -5,6 +5,9 @@ import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import org.qwh.pms.protocol.api.RawKvEntry;
+import org.qwh.pms.protocol.api.RawLookupBatchResult;
+import org.qwh.pms.protocol.api.RawLookupResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -107,8 +110,21 @@ public final class PmsServerRuntime implements AutoCloseable {
         service().delete(primaryKeyValues);
     }
 
+    public void writeRawBatch(List<RawKvEntry> entries) {
+        requireAcceptingWrites();
+        service().writeRawBatch(entries);
+    }
+
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
         return service().get(primaryKeyValues);
+    }
+
+    public RawLookupResult getLocalRaw(byte[] key) {
+        return service().getLocalRaw(key);
+    }
+
+    public RawLookupResult getFullRaw(byte[] key) {
+        return service().getFullRaw(key);
     }
 
     public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
@@ -121,6 +137,10 @@ public final class PmsServerRuntime implements AutoCloseable {
 
     public List<Map<String, Object>> prefixLocal(Map<String, Object> primaryKeyPrefixValues) {
         return service().prefixLocal(primaryKeyPrefixValues);
+    }
+
+    public RawLookupBatchResult prefixLocalRaw(byte[] prefix) {
+        return service().prefixLocalRaw(prefix);
     }
 
     public void flush() {

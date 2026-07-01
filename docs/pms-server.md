@@ -13,6 +13,14 @@ PMS 对外热路径采用 `pms-protocol` 定义的 HTTP/2 binary raw bytes API�
 server 只解析协议 envelope 和基础限制，不解释 `keyBytes` / `rowBytes` 内部格式。
 JSON 接口只保留为调试、测试或历史兼容路径，不作为高 QPS 写入与点查入口。
 
+当前实现使用 Jetty HTTP/1.1 + h2c connector，在同一监听端口同时暴露：
+
+- 旧根路径 JSON debug API：`/write`、`/get`、`/getLocal`、`/prefixLocal`、`/flush`、`/sink`、`/state`。
+- 新协议 API：`/pms/api/v1/...`，其中 binary endpoint 在 `strictHttp2=true` 时要求最终进入 handler 的请求协议为 HTTP/2。
+
+JDK `HttpClient` h2c 首次请求可能需要 HTTP/1.1 upgrade。client 应先对
+`/pms/api/v1/handshake` 执行一次 HTTP/2 handshake 并确认响应版本，再发送带 body 的热路径请求。
+
 **暴露的服务**：
 
 | 服务 | 请求 | 响应 | 调用核心接口 |
@@ -155,6 +163,13 @@ class ConfigManager {
 | YAML 配置项 | 默认值 | 映射到 PMSConfig 字段 |
 |------------|--------|----------------------|
 | `pms.server.port` | 9090 | server 自有，不在 core 中 |
+| `pms.protocol.strict_http2` | true | binary protocol endpoint 是否拒绝非 HTTP/2 请求 |
+| `pms.protocol.max_key_bytes` | 65536 | 单个 encoded key 最大字节数 |
+| `pms.protocol.max_row_bytes` | 16777216 | 单个 encoded row value 最大字节数 |
+| `pms.protocol.max_batch_entries` | 1024 | 单个 `RecordBatch` 最大 record 数 |
+| `pms.protocol.max_concurrent_streams` | 128 | Jetty h2c 最大并发 stream 数 |
+| `pms.protocol.max_request_body_bytes` | 33554432 | 单个 protocol request body 最大字节数 |
+| `pms.protocol.max_response_body_bytes` | 33554432 | 单个 binary response body 最大字节数 |
 | `pms.memtable.max_entries` | 1000000 | `memtableMaxEntries` |
 | `pms.memtable.max_size_mb` | 256 | `memtableMaxSizeMb` |
 | `pms.wal.dir` | - | `walDir` |

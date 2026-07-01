@@ -210,17 +210,19 @@ key 必须非空；prefix 查询可以允许空 prefix，但 server 可基于配
 - `local/getPrefix` v1 只返回 `HIT` result，且不分页；server 必须限制结果数量或
   response body 大小。
 
-## 9. 本阶段落地边界
+## 9. 当前落地状态
 
-第一阶段只新增 `pms-protocol` 模块和协议文档，包含 DTO、handshake model、
-binary codec 与 golden tests。
+当前 PMS 主项目已落地：
 
-不在本阶段实现：
+- `pms-protocol` 模块：DTO、handshake model、binary codec、`RawKvStore` 边界与 golden tests。
+- `pms-server` HTTP/2 binary endpoint：基于 Jetty h2c，在同一监听端口上同时保留旧 JSON debug API。
+- server raw adapter：`RecordBatch` 映射为一次 `PMSBucketDirector.writeBatch()`；local/full/prefix 查询返回 raw row bytes。
+- full get：local miss 后穿透 `pms-lookup-paimon`，lookup UNKNOWN 映射为 `LOOKUP_UNAVAILABLE`。
 
-- Jetty HTTP/2 server transport。
-- PMS server runtime adapter。
+尚未实现：
+
 - raw HTTP/2 client 与 batching client。
 - row-aware client facade。
 - benchmark。
 
-这些内容分别进入后续 server、client 和 benchmark 阶段。
+这些内容分别进入后续 client 和 benchmark 阶段。
