@@ -23,6 +23,7 @@ import org.qwh.pms.core.storage.SSTState;
 import org.qwh.pms.core.wal.ReplayCallback;
 import org.qwh.pms.core.wal.WALManager.DataWrite;
 import org.qwh.pms.core.wal.WALManagerImpl;
+import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,10 +67,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
     private final Object writeMutex = new Object();
     private final Object writeQueueMutex = new Object();
-    private final ArrayDeque<WriteRequest> pendingWrites = new ArrayDeque<>();
+    private final ArrayDeque<WriteBatchRequest> pendingWrites = new ArrayDeque<>();
     private final Object sstMaintenanceMutex = new Object();
     private boolean writeLeaderActive;
     private volatile boolean closed = false;
+    private volatile RuntimeException fatalFailure;
 
     public PMSBucketDirectorImpl(PMSConfig config) {
         this(config, new MockSinkManager());
@@ -162,22 +164,21 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     @Override
     public void put(byte[] key, byte[] value) {
-        Objects.requireNonNull(key, "key must not be null");
-        Objects.requireNonNull(value, "value must not be null; use delete(key) for tombstones or byte[0] for empty values");
-        submitWrite(key, value);
+        writeBatch(List.of(WriteOp.put(key, value)));
     }
 
     @Override
     public void delete(byte[] key) {
-        Objects.requireNonNull(key, "key must not be null");
-        submitWrite(key, null);
+        writeBatch(List.of(WriteOp.delete(key)));
     }
 
-    private void submitWrite(byte[] key, byte[] value) {
+    @Override
+    public void writeBatch(List<WriteOp> ops) {
+        List<WriteOp> batch = validateWriteBatch(ops);
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
-            WriteRequest request = new WriteRequest(key, value);
+            WriteBatchRequest request = new WriteBatchRequest(batch);
             boolean leader = enqueueWriteRequest(request);
             if (leader) {
                 runWriteLeader();
@@ -186,6 +187,25 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         } finally {
             lifecycleLock.readLock().unlock();
         }
+    }
+
+    private List<WriteOp> validateWriteBatch(List<WriteOp> ops) {
+        Objects.requireNonNull(ops, "ops must not be null");
+        if (ops.isEmpty()) {
+            throw new IllegalArgumentException("ops must not be empty");
+        }
+        if (ops.size() > MAX_WRITE_BATCH_COUNT) {
+            throw new IllegalArgumentException(
+                "ops size exceeds max write batch count: " + ops.size() + " > " + MAX_WRITE_BATCH_COUNT
+            );
+        }
+        for (WriteOp op : ops) {
+            Objects.requireNonNull(op, "write op must not be null");
+            if (op.key().length == 0) {
+                throw new IllegalArgumentException("write op key must not be empty");
+            }
+        }
+        return List.copyOf(ops);
     }
 
     @Override
@@ -487,7 +507,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return Optional.empty();
     }
 
-    private boolean enqueueWriteRequest(WriteRequest request) {
+    private boolean enqueueWriteRequest(WriteBatchRequest request) {
         synchronized (writeQueueMutex) {
             pendingWrites.addLast(request);
             if (!writeLeaderActive) {
@@ -500,7 +520,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private void runWriteLeader() {
         while (true) {
-            List<WriteRequest> batch = drainWriteBatch();
+            List<WriteBatchRequest> batch = drainWriteBatch();
             if (batch.isEmpty()) {
                 synchronized (writeQueueMutex) {
                     if (pendingWrites.isEmpty()) {
@@ -514,51 +534,84 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
-    private List<WriteRequest> drainWriteBatch() {
+    private List<WriteBatchRequest> drainWriteBatch() {
         synchronized (writeQueueMutex) {
             if (pendingWrites.isEmpty()) {
                 return List.of();
             }
-            List<WriteRequest> batch = new ArrayList<>();
-            int batchBytes = 0;
-            while (!pendingWrites.isEmpty() && batch.size() < MAX_WRITE_BATCH_COUNT) {
-                WriteRequest next = pendingWrites.peekFirst();
-                int nextBytes = next.estimatedWalBytes();
-                if (!batch.isEmpty() && batchBytes + nextBytes > MAX_WRITE_BATCH_BYTES) {
+            List<WriteBatchRequest> batch = new ArrayList<>();
+            int batchOpCount = 0;
+            long batchBytes = 0;
+            while (!pendingWrites.isEmpty()) {
+                WriteBatchRequest next = pendingWrites.peekFirst();
+                int nextOpCount = next.opCount();
+                long nextBytes = next.estimatedWalBytes();
+                boolean wouldExceedCount = batchOpCount + nextOpCount > MAX_WRITE_BATCH_COUNT;
+                boolean wouldExceedBytes = batchBytes + nextBytes > MAX_WRITE_BATCH_BYTES;
+                if (!batch.isEmpty() && (wouldExceedCount || wouldExceedBytes)) {
                     break;
                 }
                 batch.add(pendingWrites.removeFirst());
+                batchOpCount += nextOpCount;
                 batchBytes += nextBytes;
             }
             return batch;
         }
     }
 
-    private void processWriteBatch(List<WriteRequest> batch) {
+    private void processWriteBatch(List<WriteBatchRequest> batch) {
         Throwable failure = null;
+        boolean walAppended = false;
         try {
             synchronized (writeMutex) {
-                List<DataWrite> writes = new ArrayList<>(batch.size());
-                for (WriteRequest request : batch) {
-                    writes.add(new DataWrite(request.key(), request.value()));
-                }
+                List<DataWrite> writes = flattenWrites(batch);
                 long sequenceBegin = walManager.appendDataRecords(writes);
-                for (int i = 0; i < batch.size(); i++) {
-                    WriteRequest request = batch.get(i);
-                    long sequenceId = sequenceBegin + i;
-                    Value value = request.value() != null
-                        ? new Value(request.value(), sequenceId)
-                        : Value.tombstone(sequenceId);
-                    curMemTable.put(new Key(request.key()), value);
+                walAppended = true;
+                int sequenceOffset = 0;
+                for (WriteBatchRequest request : batch) {
+                    for (WriteOp op : request.ops()) {
+                        long sequenceId = sequenceBegin + sequenceOffset++;
+                        Value value = op.value() != null
+                            ? new Value(op.value(), sequenceId)
+                            : Value.tombstone(sequenceId);
+                        curMemTable.put(new Key(op.key()), value);
+                    }
                 }
                 maybeFreezeLocked();
             }
         } catch (Throwable t) {
-            failure = t;
+            failure = walAppended ? markFatalAfterWalAppend(t) : t;
         }
-        for (WriteRequest request : batch) {
+        for (WriteBatchRequest request : batch) {
             request.complete(failure);
         }
+    }
+
+    private List<DataWrite> flattenWrites(List<WriteBatchRequest> batch) {
+        List<DataWrite> writes = new ArrayList<>(totalOpCount(batch));
+        for (WriteBatchRequest request : batch) {
+            for (WriteOp op : request.ops()) {
+                writes.add(new DataWrite(op.key(), op.value()));
+            }
+        }
+        return writes;
+    }
+
+    private static int totalOpCount(List<WriteBatchRequest> batch) {
+        int count = 0;
+        for (WriteBatchRequest request : batch) {
+            count += request.opCount();
+        }
+        return count;
+    }
+
+    private RuntimeException markFatalAfterWalAppend(Throwable failure) {
+        RuntimeException fatal = new IllegalStateException(
+            "WAL append succeeded but MemTable apply failed; PMSBucketDirector must be restarted",
+            failure
+        );
+        fatalFailure = fatal;
+        return fatal;
     }
 
     private void collectLatestFromSSTs(TreeMap<Key, Value> latest, SSTReadSnapshot snapshot, Key start, Optional<Key> end) {
@@ -699,6 +752,9 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     private void ensureNotClosed() {
+        if (fatalFailure != null) {
+            throw fatalFailure;
+        }
         if (closed) throw new IllegalStateException("PMSBucketDirector is closed");
     }
 
@@ -744,27 +800,32 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return new SSTStats(totalBytes, totalRows, minSequenceId, maxSequenceId);
     }
 
-    private static final class WriteRequest {
-        private final byte[] key;
-        private final byte[] value;
+    private static final class WriteBatchRequest {
+        private final List<WriteOp> ops;
         private final CountDownLatch done = new CountDownLatch(1);
         private Throwable failure;
 
-        private WriteRequest(byte[] key, byte[] value) {
-            this.key = key;
-            this.value = value;
+        private WriteBatchRequest(List<WriteOp> ops) {
+            this.ops = ops;
         }
 
-        private byte[] key() {
-            return key;
+        private List<WriteOp> ops() {
+            return ops;
         }
 
-        private byte[] value() {
-            return value;
+        private int opCount() {
+            return ops.size();
         }
 
-        private int estimatedWalBytes() {
-            return 8 + key.length + (value != null ? value.length : 0);
+        private long estimatedWalBytes() {
+            long bytes = 1L + Long.BYTES + Integer.BYTES;
+            for (WriteOp op : ops) {
+                bytes += Integer.BYTES + op.key().length + Integer.BYTES;
+                if (op.value() != null) {
+                    bytes += op.value().length;
+                }
+            }
+            return bytes;
         }
 
         private void complete(Throwable failure) {

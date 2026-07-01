@@ -141,6 +141,12 @@ interface PMSBucketDirector {
     // ── 写入 ──
     void put(byte[] key, byte[] value);
     void delete(byte[] key);  // 删除记录（写入墓碑标记）
+    void writeBatch(List<WriteOp> ops);
+
+    record WriteOp(byte[] key, byte[] value) {
+        static WriteOp put(byte[] key, byte[] value);
+        static WriteOp delete(byte[] key); // value == null 表示 tombstone
+    }
 
     // ── 查询 ──
     Optional<byte[]> get(byte[] key);
@@ -170,13 +176,28 @@ interface PMSBucketDirector {
 
 ### 5.1 写入 Value 语义
 
-`put(byte[] key, byte[] value)` 中的 `value` 不是通用 KV value，而是 Paimon `InternalRow` 的序列化结果。长期设计中，普通写入应由 RowCodec/序列化管理器把行数据编码成非空 byte payload 后再进入 BucketDirector。
+`put(byte[] key, byte[] value)` 和 `writeBatch(List<WriteOp> ops)` 中的 `value` 不是通用 KV value，而是 Paimon `InternalRow` 的序列化结果。长期设计中，普通写入应由 RowCodec/序列化管理器把行数据编码成非空 byte payload 后再进入 BucketDirector。
 
 - `value == null` 不表示业务层 NULL，而是内部 delete/tombstone 语义；对外删除应使用 `delete(key)`。
 - 非删除写入的 `value` 应表示完整 serialized `InternalRow`。即使一行中所有业务列都是 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 等元信息，设计语义上不应为空 `byte[]`。
 - 当前 V1 BucketDirector 仍是底层字节接口，不负责校验 payload 是否符合未来 RowCodec 格式。RowCodec 接入后，空 payload、损坏 payload、schema 不匹配等问题应在序列化/反序列化边界被拒绝。
 
-### 5.2 BucketStateSnapshot
+### 5.2 Batch 写入语义
+
+`writeBatch` 是 PMS core 的一等写入提交边界，不是 server 层循环调用单条 `put/delete` 的语法糖。单条 `put/delete` 只是 size=1 batch 的便捷入口，内部仍复用同一套提交路径。
+
+V1 batch 语义：
+
+- 入参 batch 必须非空；每条 `WriteOp` 必须有非空 key。
+- `WriteOp.put` 的 value 必须非空；`WriteOp.delete` 使用 `value == null` 表示 tombstone。
+- 一个 external batch 在 core 中作为一个整体提交：一次 WAL batch append，一段连续 sequence，按 batch 内顺序写入 curMemTable。
+- 同一 batch 内允许重复 key，后出现的 op 分配更大的 sequenceId 并覆盖前面的 op；WAL replay 后必须得到同样结果。
+- `writeBatch` 返回时，整批已经完成 WAL append 且对本地查询可见。V1 不返回 per-record status，也不表达部分成功。
+- 若在 WAL append 前发现参数非法或 batch 超出限制，整批失败且不改变本地状态。
+- 若 WAL append 成功后 MemTable apply 失败，PMS 进入不可恢复错误路径；server 不应把该场景映射为普通的 `acceptedCount=0` 失败响应。
+- auto-freeze 只在完整 batch apply 后触发，避免一个 WAL batch 被 freeze 切成不可解释的半批边界。
+
+### 5.3 BucketStateSnapshot
 
 ```java
 record BucketStateSnapshot(

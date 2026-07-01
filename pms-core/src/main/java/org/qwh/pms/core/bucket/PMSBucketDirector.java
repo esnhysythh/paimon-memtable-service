@@ -13,6 +13,8 @@ public interface PMSBucketDirector {
 
     void delete(byte[] key);
 
+    void writeBatch(List<WriteOp> ops);
+
     Optional<byte[]> get(byte[] key);
 
     Optional<Value> lookup(byte[] key);
@@ -37,4 +39,31 @@ public interface PMSBucketDirector {
     BucketStateSnapshot stateSnapshot();
 
     void close();
+
+    record WriteOp(byte[] key, byte[] value) {
+
+        public WriteOp {
+            if (key == null) {
+                throw new NullPointerException("key must not be null");
+            }
+            if (key.length == 0) {
+                throw new IllegalArgumentException("key must not be empty");
+            }
+        }
+
+        public static WriteOp put(byte[] key, byte[] value) {
+            if (value == null) {
+                throw new NullPointerException("value must not be null; use delete(key) for tombstones");
+            }
+            return new WriteOp(key, value);
+        }
+
+        public static WriteOp delete(byte[] key) {
+            return new WriteOp(key, null);
+        }
+
+        public boolean isDelete() {
+            return value == null;
+        }
+    }
 }

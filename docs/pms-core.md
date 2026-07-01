@@ -360,7 +360,7 @@ interface SinkManager {
 - 管理 `curMemTable → ImmutableMemTable → newSST → sinkedSST` 的状态机流转。
 - 编排查询路径的多层穿透。
 - 协调 Freeze、Flush、Sink、Evict 各阶段。
-- 向上层暴露统一的 `put` / `get` 接口。
+- 向上层暴露统一的 byte-oriented `put` / `delete` / `writeBatch` / `get` 接口；`writeBatch` 是写入提交边界，单条写入是 size=1 batch 的便捷入口。
 
 ### 3.6 Statistic
 

@@ -122,14 +122,16 @@ PMS 的写入边界应接近这个锁粒度，而不是为了避免锁而牺牲�
 
 ### 4.1 V1 推荐模型
 
-PMS Bucket 内部应引入写入提交锁，保护以下路径：
+PMS Bucket 内部应以 `writeBatch` 作为一等写入提交边界，单条 `put/delete` 只是 size=1 batch 的便捷入口。写入提交锁保护以下路径：
 
 ```text
-put/delete:
+writeBatch:
   lock writeMutex
     ensureNotClosed
-    append DATA to WAL and get sequenceId
-    write curMemTable with Value(sequenceId)
+    append DATA batch to WAL and get sequenceBegin
+    for op in batch order:
+      sequenceId = sequenceBegin + opIndex
+      write curMemTable with Value(sequenceId)
     maybeFreezeLocked()
   unlock
 ```
@@ -144,7 +146,7 @@ freezeCurMemTable:
   unlock
 ```
 
-这与 LevelDB Java 版的锁粒度接近：WAL、sequence、MemTable 可见顺序、freeze 切换同属提交边界。
+这与 LevelDB Java 版的锁粒度接近：WAL、sequence、MemTable 可见顺序、freeze 切换同属提交边界。一个 external batch 在 core 中作为整体提交，不允许被拆成多个独立成功/失败的内部提交；多个 external batch 可以由 writer queue 合并成一个更大的 WAL append。
 
 ### 4.2 不应持锁的路径
 
@@ -179,13 +181,17 @@ PMS 的 `Value` 不是普通 KV 系统里的任意 byte value，而是序列化�
 
 ### 5.1 DATA 记录
 
-PMS 尚未发布，不需要兼容旧 WAL 格式。V1 的 `DATA(type=0x00)` 直接包含 sequence：
+PMS 尚未发布，不需要兼容旧 WAL 格式。V1 的 DATA WAL 记录使用 batch 格式，记录起始 sequence 与记录数：
 
 ```text
-type(1) + sequenceId(8) + keyLen(4) + key + valueLen(4) + value
+type(1 = DATA_BATCH)
+sequenceBegin(8)
+count(4)
+repeated count times:
+  keyLen(4) + key + valueLen(4) + value
 ```
 
-其中 `valueLen = -1` 表示 delete/tombstone；`valueLen > 0` 表示 serialized `InternalRow`；`valueLen = 0` 不表示 tombstone 或业务 NULL，后续 RowCodec 接入后应视为非法或保留编码。
+其中 `valueLen = -1` 表示 delete/tombstone；`valueLen >= 0` 表示 byte-oriented value payload。当前 core 允许空 value bytes 作为底层字节接口能力；后续 RowCodec 接入后，可在 codec/server 边界拒绝不符合 row value format 的 payload。
 
 ### 5.2 WAL 文件头保存 Sequence 水位
 
@@ -263,22 +269,25 @@ PMS 当前阶段接受短提交锁，是为了保证边界正确性。它不应�
 当前实现先采用保守的 `Writer Queue + Natural Group Commit`：
 
 ```text
-put/delete:
-  create WriteRequest
+put/delete/writeBatch:
+  create WriteBatchRequest
   enqueue
   wait request.done
 
 leader:
-  drain 已经排队的请求形成 batch
-  append 一个 WAL batch record
-  按 batch 顺序串行写 curMemTable
-  batch 结束后检查并执行 maybeFreeze
-  唤醒 batch 内所有同步等待的调用方
+  drain 已经排队的 external batch request
+  在不拆分 external batch 的前提下合并为一个 WAL batch record
+  按 external batch 顺序与 batch 内 op 顺序串行写 curMemTable
+  完整 WAL batch apply 后检查并执行 maybeFreeze
+  唤醒本次 WAL batch 覆盖的所有同步等待调用方
 ```
 
 关键决策：
 
-- `put/delete` 仍保持同步语义：调用返回时，该请求已经完成 WAL append 且在 MemTable 中可见。
+- `put/delete/writeBatch` 仍保持同步语义：调用返回时，该请求已经完成 WAL append 且在 MemTable 中可见。
+- `put/delete` 是 size=1 batch 的便捷入口，不拥有独立提交语义。
+- `writeBatch` 是 external batch 边界，V1 不返回 per-record status，也不表达部分成功。
+- 若参数校验在 WAL append 前失败，整批不改变本地状态；若 WAL append 成功后 MemTable apply 失败，PMS 应进入 fatal 路径，不能将该请求伪装成普通 `acceptedCount=0` 失败。
 - 第一版不主动等待 coalesce window；leader 只 drain 当前已经排队的请求。这样单线程循环写不会因为空等聚合窗口而退化。
 - batch 内 MemTable apply 暂时保持串行。PMS 当前 MemTable 是 `userKey -> latest Value`，不是 LevelDB 的 `(userKey, sequenceId)` internal key；若并发 apply，同一 key 的低 sequence 写入可能后完成并覆盖高 sequence，造成旧值复活。
 - freeze 只在完整 batch apply 后触发，避免一个 WAL batch 被 freeze 切成半个可见边界。
