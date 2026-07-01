@@ -39,6 +39,12 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <groupId>org.qwh</groupId>
+            <artifactId>pms-client</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.apache.paimon</groupId>
             <artifactId>paimon-api</artifactId>
             <version>${paimon.version}</version>

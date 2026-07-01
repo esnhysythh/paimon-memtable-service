@@ -8,6 +8,9 @@ import org.apache.paimon.schema.Schema;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.qwh.pms.client.PmsClientConfig;
+import org.qwh.pms.client.PmsRawBatchWriter;
+import org.qwh.pms.client.PmsRawClient;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
 import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
@@ -499,6 +502,35 @@ class PmsServerEndToEndTest {
             @SuppressWarnings("unchecked")
             Map<String, Object> runtime = (Map<String, Object>) jsonState.get("runtime");
             assertEquals("RUNNING", runtime.get("status"));
+        }
+    }
+
+    @Test
+    void rawClientDrivesBatchWriteAndLookupOverHttp2() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start();
+             PmsRawClient client = PmsRawClient.connect(PmsClientConfig.builder(server.baseUri()).build())) {
+            assertEquals("pms", client.handshake().backend());
+
+            EncodedRow row1 = encodedRow(server.table().rowType(), 1, "client-a");
+            EncodedRow row2 = encodedRow(server.table().rowType(), 2, "client-b");
+            try (PmsRawBatchWriter writer = client.newBatchWriter(2)) {
+                writer.put(row1.key(), row1.row());
+                writer.delete(row1.key());
+                writer.put(row2.key(), row2.row());
+                assertEquals(1, writer.pendingCount());
+            }
+
+            RawLookupResult deleted = client.getLocal(row1.key());
+            assertEquals(LookupResultType.DELETED, deleted.type());
+
+            RawLookupResult hit = client.getFull(row2.key());
+            assertEquals(LookupResultType.HIT, hit.type());
+            assertArrayEquals(row2.row(), hit.row());
+
+            RawLookupBatchResult prefix = client.getPrefixLocal(row2.key());
+            assertEquals(PmsStatus.OK, prefix.status());
+            assertEquals(1, prefix.results().size());
+            assertArrayEquals(row2.row(), prefix.results().get(0).row());
         }
     }
 

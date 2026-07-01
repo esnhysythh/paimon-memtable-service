@@ -218,10 +218,10 @@ key 必须非空；prefix 查询可以允许空 prefix，但 server 可基于配
 - `pms-server` HTTP/2 binary endpoint：基于 Jetty h2c，在同一监听端口上同时保留旧 JSON debug API。
 - server raw adapter：`RecordBatch` 映射为一次 `PMSBucketDirector.writeBatch()`；local/full/prefix 查询返回 raw row bytes。
 - full get：local miss 后穿透 `pms-lookup-paimon`，lookup UNKNOWN 映射为 `LOOKUP_UNAVAILABLE`。
+- `pms-client` raw HTTP/2 client：复用本协议的 handshake、DTO 和 binary codec，提供 raw batch 写入、local/full/prefix 查询与轻量 batch writer。
 
 尚未实现：
 
-- raw HTTP/2 client 与 batching client。
 - row-aware client facade。
 - benchmark。
 
