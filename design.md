@@ -41,6 +41,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | Paimon 独占与 Compaction | PMS 独占 Paimon 表写入与合并提交，基于 Paimon `TableWrite.compact(partition, bucket, fullCompaction)` / `prepareCommit` / `TableCommit` 原生 API 触发 Compaction | [pms-core.md](docs/pms-core.md) § 3.4 / [pms-sink-paimon.md](docs/pms-sink-paimon.md) § 10 |
 | Paimon 历史点查 | `pms-lookup-paimon` 维护 partition-bucket live 文件视图；成功 commit 后严格有序地发布 data/compact delta，失效后由完整 snapshot 重建 | [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) |
 | 行编码与 Schema 兼容 | `pms-codec` 负责 Paimon `InternalRow` 与 PMS KV bytes 的转换；delete/tombstone 由 KV 层表达，不写入 row value。 | [pms-codec.md](docs/pms-codec.md) |
+| 外部协议 | `pms-protocol` 定义 HTTP/2 binary hot path 的 raw bytes wire contract、handshake、status 与 batch envelope；不解释 key/value bytes。 | [pms-protocol.md](docs/pms-protocol.md) |
 | 流控 | 两层水位线：NORMAL（正常）/ OVERLOADED（拒绝写入） | [pms-core.md](docs/pms-core.md) § 4 |
 | 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；flush/sink 等慢路径异步执行，初期不做快照读 | [pms-core.md](docs/pms-core.md) § 5 |
 | 优雅停机 | Drain → Quiesce → Shutdown 三阶段 | [pms-server.md](docs/pms-server.md) § 2.5 |
@@ -78,7 +79,7 @@ Paimon 行格式与 PMS KV bytes 的适配层，依赖 Paimon 类型系统，但
 
 ### 4.4 pms-server
 PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC 接口、编排故障恢复流程。它是 pms-core 的消费者。
-- `rpc-server`: 对外暴露写入与点查接口，集成流控水位线。
+- `rpc-server`: 对外暴露写入与点查接口，集成流控水位线；热路径目标为 `pms-protocol` 定义的 HTTP/2 binary raw bytes API。
 - `recovery-manager`: 启动恢复管理器。
 - `config-manager`: 配置管理器，启动时从外部配置源加载配置构造 `PMSConfig`，注入到各核心组件。V1 不支持运行时热更新。
 - `background-task-scheduler`: 定时任务调度，驱动 Freeze/Flush/Sink/Compaction/Evict/WAL 截断。
@@ -93,25 +94,34 @@ Paimon primary-key 历史点查模块。由 `pms-server` 直接创建和调用�
 - 当前只支持固定 hash bucket、Parquet、primary-key + deduplicate 的已验证 profile；UNKNOWN 以可重试错误暴露。
 - 详见 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md)。
 
-### 4.6 pms-client
-Java SDK，负责 Schema 获取、RPC 通信、反压重试，并通过 `pms-codec` 完成行编码。早期可与 server 共用 codec 实现；是否继续保持零依赖客户端包，后续在 client 模块落地时再评估。
+### 4.6 pms-protocol
+PMS 对外协议契约模块，不依赖 `pms-core`、`pms-codec` 或 Paimon runtime。
+- 定义 HTTP/2 binary hot path 的 endpoint、capability、handshake 与 status code。
+- 定义 raw `keyBytes` / `rowBytes` 写入、删除、点查与 prefix 查询的 DTO。
+- 提供 `RecordBatch`、`KeyBatch`、`WriteResult`、`LookupBatchResult` 的 v1 binary codec。
+- 协议层只传输 opaque bytes，不解释 PMS primary key 或 row value 格式。
+- 详见 [pms-protocol.md](docs/pms-protocol.md)。
+
+### 4.7 pms-client
+Java SDK，负责 RPC 通信、batching、反压重试，并在 row-aware facade 中通过 `pms-codec` 完成行编码。落地顺序上先实现 raw bytes HTTP/2 client 与 batching client，再叠加依赖 `pms-codec` 的 row-aware facade。
 - 详见 [pms-client.md](docs/pms-client.md)。
 
-### 4.7 flink-connector-pms
+### 4.8 flink-connector-pms
 Flink Sink 实现，负责对接 Flink 记录格式，调用 `pms-client`。
 - 详见 [flink-connector-pms.md](docs/flink-connector-pms.md)。
 
-### 4.8 依赖方向
+### 4.9 依赖方向
 
-第一阶段先落地父工程和 `pms-core` 子模块；`pms-codec`、`pms-sink-paimon`、`pms-lookup-paimon`、`pms-server`、`pms-client` 后续逐步拆出。
+当前模块按协议契约、core、codec、server/client 外壳和 Paimon 适配层分层，依赖方向如下。
 
 ```text
+pms-protocol    -> JDK + Jackson(handshake JSON)
 pms-codec       -> Paimon
 pms-core        -> 不依赖 pms-codec，不暴露 InternalRow
 pms-sink-paimon -> pms-core + pms-codec + Paimon
 pms-lookup-paimon -> Paimon
-pms-server      -> pms-core + pms-codec + pms-sink-paimon + pms-lookup-paimon
-pms-client      -> pms-codec + RPC client
+pms-server      -> pms-protocol + pms-core + pms-codec + pms-sink-paimon + pms-lookup-paimon
+pms-client      -> pms-protocol + pms-codec(row-aware facade)
 flink-connector -> pms-client
 ```
 
@@ -127,6 +137,7 @@ flink-connector -> pms-client
 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) | SST 当前实现状态、mock 边界与后续 codec 交接说明 |
 | [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) | WAL 只记录数据、SSTMeta/SinkMeta 独立记录恢复边界的设计 |
 | [pms-codec.md](docs/pms-codec.md) | Paimon 行编码、主键编码、RowKind 与 tombstone 边界 |
+| [pms-protocol.md](docs/pms-protocol.md) | PMS HTTP/2 binary 外部协议、handshake、status、batch envelope |
 | [pms-sink-paimon.md](docs/pms-sink-paimon.md) | 真实 Paimon sink、prepare/commit、delete 语义与恢复协作 |
 | [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) | Paimon 历史点查、live 文件视图、commit delta 发布、失败与恢复语义 |
 | [pms-row-codec-format.md](docs/pms-row-codec-format.md) | PMS row value byte layout、字段查找、列值编码规则 |

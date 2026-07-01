@@ -394,7 +394,7 @@ Write Request ──│─►│  NORMAL    │  │ OVERLOADED │  │
 
 **响应策略**：
 - **NORMAL**：正常接受写入，RPC 返回 `OK`。
-- **OVERLOADED**：快速拒绝，RPC 返回 `SERVICE_OVERLOADED`，Client 走反压重试逻辑。不阻塞写入线程。
+- **OVERLOADED**：快速拒绝，RPC 返回 `OVERLOADED`，Client 走反压重试逻辑。不阻塞写入线程。
 
 ### 4.2 实现
 

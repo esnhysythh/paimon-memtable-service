@@ -11,6 +11,7 @@
 
     <modules>
         <module>pms-core</module>
+        <module>pms-protocol</module>
         <module>pms-codec</module>
         <module>pms-sink-paimon</module>
         <module>pms-lookup-paimon</module>
