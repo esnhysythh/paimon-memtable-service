@@ -8,7 +8,10 @@ import org.apache.paimon.schema.Schema;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.qwh.pms.client.PmsClient;
 import org.qwh.pms.client.PmsClientConfig;
+import org.qwh.pms.client.PmsRowLookupBatchResult;
+import org.qwh.pms.client.PmsRowLookupResult;
 import org.qwh.pms.client.PmsRawBatchWriter;
 import org.qwh.pms.client.PmsRawClient;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
@@ -535,6 +538,38 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void rowClientEncodesRowsAndDecodesLookupsOverHttp2() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start();
+             PmsClient client = PmsClient.connect(
+                 PmsClientConfig.builder(server.baseUri()).build(),
+                 server.table().rowType(),
+                 List.of("id"))) {
+            assertEquals("pms", client.handshake().backend());
+
+            WriteResult write = client.writeBatch(List.of(
+                row(RowKind.INSERT, 1, "row-client-a"),
+                row(RowKind.DELETE, 1, "ignored-delete-payload"),
+                row(RowKind.UPDATE_AFTER, 2, "row-client-b")
+            ));
+            assertEquals(PmsStatus.OK, write.status());
+            assertEquals(3, write.acceptedCount());
+
+            PmsRowLookupResult deleted = client.getLocal(GenericRow.of(1));
+            assertEquals(LookupResultType.DELETED, deleted.type());
+
+            PmsRowLookupResult hit = client.get(GenericRow.of(2));
+            assertEquals(LookupResultType.HIT, hit.type());
+            assertEquals(2, hit.row().getInt(0));
+            assertEquals("row-client-b", hit.row().getString(1).toString());
+
+            PmsRowLookupBatchResult prefix = client.prefixLocal(GenericRow.of(2));
+            assertEquals(PmsStatus.OK, prefix.status());
+            assertEquals(1, prefix.results().size());
+            assertEquals("row-client-b", prefix.results().get(0).row().getString(1).toString());
+        }
+    }
+
+    @Test
     void binaryFullGetFallsThroughToPaimonAfterLocalMiss() throws Exception {
         Path warehouse = tempDir.resolve("warehouse");
 
@@ -838,12 +873,17 @@ class PmsServerEndToEndTest {
     }
 
     private static EncodedRow encodedRow(RowType rowType, int id, String marker) {
-        GenericRow row = new GenericRow(RowKind.INSERT, rowType.getFieldCount());
-        row.setField(0, id);
-        row.setField(1, BinaryString.fromString(marker));
+        GenericRow row = row(RowKind.INSERT, id, marker);
         PmsPrimaryKeyCodec keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, List.of("id"));
         PmsRowValueCodec valueCodec = new PmsRowValueCodec();
         return new EncodedRow(keyCodec.encodeKey(row), valueCodec.encode(rowType, row, 0));
+    }
+
+    private static GenericRow row(RowKind kind, int id, String marker) {
+        GenericRow row = new GenericRow(kind, 2);
+        row.setField(0, id);
+        row.setField(1, BinaryString.fromString(marker));
+        return row;
     }
 
     private Properties baseProperties() {

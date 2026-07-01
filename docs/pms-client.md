@@ -28,18 +28,19 @@ Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、b
 **接口**：
 
 ```java
-class PMSClient implements AutoCloseable {
+class PmsClient implements AutoCloseable {
     // 初始化
-    PMSClient(PMSClientConfig config);
+    static PmsClient connect(PmsClientConfig config, RowType rowType, List<String> primaryKeys);
 
     // 写入
-    WriteStatus write(RowData row);
-    WriteStatus write(byte[] primaryKey, byte[] binaryRow);
+    WriteResult write(InternalRow row);
+    WriteResult writeBatch(List<? extends InternalRow> rows);
+    WriteResult delete(InternalRow keyTuple);
 
     // 查询
-    Optional<RowData> get(byte[] primaryKey);
-    Optional<byte[]> getRaw(byte[] primaryKey);
-    LocalLookupResult getLocal(byte[] primaryKey);
+    PmsRowLookupResult get(InternalRow keyTuple);
+    PmsRowLookupResult getLocal(InternalRow keyTuple);
+    PmsRowLookupBatchResult prefixLocal(InternalRow keyPrefixTuple);
 
     // 关闭
     void close();
@@ -65,7 +66,7 @@ raw client 的协议 envelope、status、batch 整批语义与 `LOOKUP_UNAVAILAB
 
 ### 2.2 RowCodec / PrimaryKeyCodec（核心序列化边界）
 
-当前阶段尚未在主项目中实现正式 codec。后续客户端与服务端应复用 `pms-codec` 中定义的行编码和主键编码，详见 [pms-codec.md](pms-codec.md)。
+当前客户端 row-aware facade 复用 `pms-codec` 中定义的行编码和主键编码，详见 [pms-codec.md](pms-codec.md)。
 
 旧的 `[SchemaId + Column Offsets + Column Data]` 草案不再作为后续实现依据。新的 row value format 采用 `metadata + payload` 结构，使用 Paimon `DataField.id()` 作为持久字段标识，并显式区分非 NULL、NULL 和 missing 字段。
 
@@ -169,7 +170,7 @@ class WriteRetryPolicy {
 
 ## 5. 当前落地状态
 
-当前 PMS 主项目已新增 `pms-client` 模块，并先落地 raw bytes 层：
+当前 PMS 主项目已新增 `pms-client` 模块，并落地 raw bytes 层与第一版 row-aware facade：
 
 - `PmsRawClient`：基于 JDK `HttpClient` 使用 HTTP/2/h2c 访问 `/pms/api/v1/...`。
 - 初始化时执行 `/pms/api/v1/handshake`，校验协议名、版本、HTTP/2 要求和必需 capability，并缓存 server 端 key/row/batch/body 限制。
@@ -177,8 +178,11 @@ class WriteRetryPolicy {
 - raw 查询：支持 `getLocal`、`getFull` 和 `getPrefixLocal`，保留 `HIT` / `MISS` / `DELETED` / `LOOKUP_UNAVAILABLE` 等协议语义。
 - 写入重试：对 `OVERLOADED`、`SHUTTING_DOWN` 做有限次数退避重试；非 OK 结果仍按协议状态返回给调用方。
 - `PmsRawBatchWriter`：面向零散 put/delete 的轻量缓冲器，按条数阈值自动 flush，close 时 drain 剩余 batch。
+- `PmsClient`：在 raw client 之上依赖 `pms-codec`，以 Paimon `InternalRow` / `RowType` 为 SDK 数据边界。
+- row-aware 写入：使用 `PmsPrimaryKeyCodec` 编码 primary key，使用 `PmsRowValueCodec` 编码 row value，并将 `INSERT/UPDATE_AFTER` 归一化为 put、`DELETE/UPDATE_BEFORE` 归一化为 delete。
+- row-aware 查询：使用 key tuple 编码查询 key，并将 raw row bytes 解码为 `InternalRow`；`getLocal` 仍保留 `DELETED` 三态语义，`LOOKUP_UNAVAILABLE` 仍以非 OK status 暴露。
 
 尚未实现：
 
-- row-aware facade：基于 `pms-codec` 做 Paimon row/key 编码、RowKind 归一化和 schema 相关能力。
-- 连接池、多节点切换、异步 API 和更完整的运行时指标。
+- POJO / `Map<String, Object>` 等业务对象映射层；当前 row-aware facade 的正式边界是 Paimon `InternalRow`。
+- schema tracker、schema reload、连接池、多节点切换、异步 API 和更完整的运行时指标。

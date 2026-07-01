@@ -219,10 +219,12 @@ key 必须非空；prefix 查询可以允许空 prefix，但 server 可基于配
 - server raw adapter：`RecordBatch` 映射为一次 `PMSBucketDirector.writeBatch()`；local/full/prefix 查询返回 raw row bytes。
 - full get：local miss 后穿透 `pms-lookup-paimon`，lookup UNKNOWN 映射为 `LOOKUP_UNAVAILABLE`。
 - `pms-client` raw HTTP/2 client：复用本协议的 handshake、DTO 和 binary codec，提供 raw batch 写入、local/full/prefix 查询与轻量 batch writer。
+- `pms-client` row-aware facade：在 raw client 之上复用 `pms-codec`，提供 Paimon `InternalRow` 写入、RowKind 归一化和 row 查询解码。
 
 尚未实现：
 
-- row-aware client facade。
+- POJO/Map 等业务对象映射层。
+- schema tracker 与 schema reload。
 - benchmark。
 
 这些内容分别进入后续 client 和 benchmark 阶段。
