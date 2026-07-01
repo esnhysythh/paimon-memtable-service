@@ -166,3 +166,19 @@ class WriteRetryPolicy {
 | `pms.client.write_retry_max` | 10 | 最大重试次数 |
 | `pms.client.write_timeout_ms` | 5000 | 单次写入超时 |
 | `pms.client.read_timeout_ms` | 3000 | 单次查询超时 |
+
+## 5. 当前落地状态
+
+当前 PMS 主项目已新增 `pms-client` 模块，并先落地 raw bytes 层：
+
+- `PmsRawClient`：基于 JDK `HttpClient` 使用 HTTP/2/h2c 访问 `/pms/api/v1/...`。
+- 初始化时执行 `/pms/api/v1/handshake`，校验协议名、版本、HTTP/2 要求和必需 capability，并缓存 server 端 key/row/batch/body 限制。
+- raw 写入：支持 `put`、`delete`、`writeBatch`，批写请求映射为一个 `RecordBatch`，成功时要求 `acceptedCount` 与请求条数一致。
+- raw 查询：支持 `getLocal`、`getFull` 和 `getPrefixLocal`，保留 `HIT` / `MISS` / `DELETED` / `LOOKUP_UNAVAILABLE` 等协议语义。
+- 写入重试：对 `OVERLOADED`、`SHUTTING_DOWN` 做有限次数退避重试；非 OK 结果仍按协议状态返回给调用方。
+- `PmsRawBatchWriter`：面向零散 put/delete 的轻量缓冲器，按条数阈值自动 flush，close 时 drain 剩余 batch。
+
+尚未实现：
+
+- row-aware facade：基于 `pms-codec` 做 Paimon row/key 编码、RowKind 归一化和 schema 相关能力。
+- 连接池、多节点切换、异步 API 和更完整的运行时指标。
