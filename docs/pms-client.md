@@ -1,7 +1,14 @@
 # PMS Client 设计文档
 
 ## 1. 模块定位
-轻量级 Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC 与序列化细节。零依赖设计（仅依赖 JDK），可直接打入用户 JAR 包而不引入依赖冲突。
+Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、batching 与序列化细节。
+
+后续落地按两层推进：
+
+- raw client：依赖 `pms-protocol`，只处理 HTTP/2 binary transport、handshake、raw `byte[] keyBytes` / `byte[] rowBytes`、batching、结果分类和关闭 drain。
+- row-aware facade：在 raw client 之上依赖 `pms-codec`，负责 Paimon row/key 编码、RowKind 归一化和 schema 相关能力。
+
+早期零依赖客户端包不再作为强约束。若后续需要面向用户作业提供更轻的 artifact，可在 raw client 与 row-aware facade 稳定后再评估 shading 或拆包。
 
 ## 2. 核心组件
 
@@ -44,12 +51,15 @@ class PMSClient implements AutoCloseable {
 场景下继续查 Paimon 导致旧值复活。V1 的 prefix 查询只提供 local 语义；完整表 prefix 查询接口
 预留但暂不支持。
 
+raw client 的协议 envelope、status、batch 整批语义与 `LOOKUP_UNAVAILABLE` 可重试查询错误见
+[pms-protocol.md](pms-protocol.md)。
+
 **WriteStatus**：
 
 | 状态 | 含义 | Client 行为 |
 |------|------|------------|
 | `OK` | 写入成功 | 继续 |
-| `SERVICE_OVERLOADED` | 系统过载，被拒绝 | 重试（指数退避） |
+| `OVERLOADED` | 系统过载，被拒绝 | 重试（指数退避） |
 | `SCHEMA_MISMATCH` | Schema 不一致 | 触发 Reload 后重试 |
 | `SHUTTING_DOWN` | 服务停机 | 切换节点或等待 |
 
@@ -127,7 +137,7 @@ class WriteRetryPolicy {
         if (status == SCHEMA_MISMATCH) return 0; // 立即 Reload 后重试
         if (status == SHUTTING_DOWN) return 5000; // 等 5s 再试
 
-        // SERVICE_OVERLOADED: 指数退避
+        // OVERLOADED: 指数退避
         long base = 10; // 10ms
         long delay = base * (1L << Math.min(attempt, 6)); // 10, 20, 40, 80, 160, 320, 640ms
         long jitter = ThreadLocalRandom.current().nextLong(delay / 2);

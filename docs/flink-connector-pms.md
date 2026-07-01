@@ -18,7 +18,7 @@
 
 3. 调用 PMSClient.write() 发送
    └─ 成功 → 继续
-   └─ SERVICE_OVERLOADED → 反压处理（见 § 2.2）
+   └─ OVERLOADED → 反压处理（见 § 2.2）
    └─ SCHEMA_MISMATCH → 自动 Reload 后重试
    └─ SHUTTING_DOWN → 切换到备用 PMS 节点（如配置）
 ```
@@ -32,12 +32,12 @@
 | `flush(boolean endOfInput)` | 等待所有 in-flight 写入完成 |
 | `close()` | 关闭 `PMSClient`，释放连接 |
 
-### 2.2 SERVICE_OVERLOADED 处理
+### 2.2 OVERLOADED 处理
 
 当 PMS Server 处于 OVERLOADED 水位时，写入会被拒绝。Flink Connector 的处理策略：
 
 ```
-收到 SERVICE_OVERLOADED
+收到 OVERLOADED
     │
     ▼
 1. 记录 `flink.write.reject_count` 指标
@@ -59,7 +59,7 @@
    → 触发 Flink 的 Failover 机制
 ```
 
-**不直接抛异常导致 Job 失败的原因**：SERVICE_OVERLOADED 是可恢复的临时状态，PMS 后台任务正在消化积压，短暂等待后即可恢复。直接 Failover 代价更大。
+**不直接抛异常导致 Job 失败的原因**：OVERLOADED 是可恢复的临时状态，PMS 后台任务正在消化积压，短暂等待后即可恢复。直接 Failover 代价更大。
 
 ### 2.3 PmsCommitter (实现 SinkCommitter - 可选)
 
@@ -93,7 +93,7 @@ PmsCommitter.commit()
 |--------|-------|------|
 | `pms.server.host` | localhost | PMS Server 地址 |
 | `pms.server.port` | 9090 | PMS Server 端口 |
-| `pms.write.retry-max` | 10 | SERVICE_OVERLOADED 最大重试次数 |
+| `pms.write.retry-max` | 10 | OVERLOADED 最大重试次数 |
 | `pms.write.retry-base-ms` | 10 | 重试基础延迟 |
 | `pms.write.batch-size` | 1 | 批量写入大小（当前单条，预留批量接口） |
 
@@ -120,7 +120,7 @@ Flink Connector 向 Flink 的 MetricGroup 注册以下指标：
 |--------|------|------|
 | `pms.write.total` | Counter | 总写入次数 |
 | `pms.write.success` | Counter | 成功次数 |
-| `pms.write.reject` | Counter | 被拒绝次数（SERVICE_OVERLOADED） |
+| `pms.write.reject` | Counter | 被拒绝次数（OVERLOADED） |
 | `pms.write.retry` | Counter | 重试次数 |
 | `pms.write.latency_ms` | Histogram | 写入延迟分布 |
 | `pms.schema.reload` | Counter | Schema 热重载次数 |

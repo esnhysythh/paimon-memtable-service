@@ -5,19 +5,24 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 
 ## 2. 核心组件
 
-### 2.1 RPCServer (基于 gRPC 或 Netty)
+### 2.1 RPCServer (HTTP/2 Binary Hot Path)
 
 依赖 `pms-core` 提供的接口。
+
+PMS 对外热路径采用 `pms-protocol` 定义的 HTTP/2 binary raw bytes API：
+server 只解析协议 envelope 和基础限制，不解释 `keyBytes` / `rowBytes` 内部格式。
+JSON 接口只保留为调试、测试或历史兼容路径，不作为高 QPS 写入与点查入口。
 
 **暴露的服务**：
 
 | 服务 | 请求 | 响应 | 调用核心接口 |
 |------|------|------|-------------|
-| `write` | `WriteRequest(key, value)` | `WriteResponse(status)` | `PMSBucketDirector.put()` |
-| `get` | `GetRequest(key)` | `GetResponse(status, found, row?)` | `PMSBucketDirector.lookup()` + `pms-lookup-paimon` |
-| `getLocal` | `GetRequest(key)` | `GetLocalResponse(status, result, row?)` | `PMSBucketDirector.lookup()` |
-| `prefix` | `PrefixRequest(primaryKeyPrefix)` | `NOT_SUPPORTED` | V1 暂不支持完整表 prefix 查询 |
-| `prefixLocal` | `PrefixRequest(primaryKeyPrefix)` | `PrefixResponse(status, rows)` | `PMSBucketDirector.prefixScan()` |
+| `local/put` | `RecordBatch(single PUT)` | `WriteResult(status, acceptedCount)` | `PMSBucketDirector.put()` |
+| `local/delete` | `RecordBatch(single DELETE)` | `WriteResult(status, acceptedCount)` | `PMSBucketDirector.delete()` |
+| `local/writeBatch` | `RecordBatch(PUT/DELETE)` | `WriteResult(status, acceptedCount)` | `PMSBucketDirector.writeBatch()` |
+| `full/get` | `KeyBatch(single key)` | `LookupBatchResult` | `PMSBucketDirector.lookup()` + `pms-lookup-paimon` |
+| `local/get` | `KeyBatch(single key)` | `LookupBatchResult` | `PMSBucketDirector.lookup()` |
+| `local/getPrefix` | `KeyBatch(single prefix)` | `LookupBatchResult` | `PMSBucketDirector.prefixScan()` |
 
 **点查接口语义**：
 
@@ -50,11 +55,13 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 | status | 含义 | Client 行为 |
 |--------|------|------------|
 | `OK` | 写入成功 | 继续写入 |
-| `SERVICE_OVERLOADED` | 系统过载，写入被拒绝 | 反压重试 |
+| `OVERLOADED` | 系统过载，写入被拒绝 | 反压重试 |
 | `SCHEMA_MISMATCH` | Schema 不一致（V1 中视为 Fatal Error） | 停止写入 |
 | `SHUTTING_DOWN` | 服务正在停机 | 切换到其他节点 |
 
-**流控集成**：RPC 层的写入入口处调用 `WriteAdmissionController.evaluate()`，若返回 OVERLOADED 则响应 `SERVICE_OVERLOADED`。详见 [pms-core.md](pms-core.md) § 4。
+完整协议 status、endpoint 和 binary payload 见 [pms-protocol.md](pms-protocol.md)。
+
+**流控集成**：RPC 层的写入入口处调用 `WriteAdmissionController.evaluate()`，若返回 OVERLOADED 则响应 `OVERLOADED`。详见 [pms-core.md](pms-core.md) § 4。
 
 **查询流控**：查询请求一般不流控（读取不消耗内存配额），但在 OVERLOADED 水位下可限制并发查询数（可选，保护磁盘 IO）。
 
