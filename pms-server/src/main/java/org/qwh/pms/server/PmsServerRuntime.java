@@ -8,6 +8,7 @@ import java.util.Optional;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.RawLookupResult;
+import org.qwh.pms.protocol.api.PmsTableSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -98,6 +99,10 @@ public final class PmsServerRuntime implements AutoCloseable {
             throw new IllegalStateException("PMS table service is not started");
         }
         return service;
+    }
+
+    public PmsTableSchema protocolTableSchema() {
+        return service().protocolTableSchema();
     }
 
     public void write(Map<String, Object> rowValues) {

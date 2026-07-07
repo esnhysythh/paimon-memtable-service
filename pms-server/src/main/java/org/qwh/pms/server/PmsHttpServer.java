@@ -225,6 +225,7 @@ public final class PmsHttpServer implements AutoCloseable {
                 protocolConfig.maxConcurrentStreams(),
                 protocolConfig.maxRequestBodyBytes(),
                 protocolConfig.maxResponseBodyBytes(),
+                runtime.protocolTableSchema(),
                 capabilities
             );
             writeJsonBytes(response, HttpStatus.OK_200, handshake.toJson().getBytes(StandardCharsets.UTF_8), callback);

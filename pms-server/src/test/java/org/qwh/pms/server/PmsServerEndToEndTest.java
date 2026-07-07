@@ -51,6 +51,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -540,11 +541,12 @@ class PmsServerEndToEndTest {
     @Test
     void rowClientEncodesRowsAndDecodesLookupsOverHttp2() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start();
-             PmsClient client = PmsClient.connect(
-                 PmsClientConfig.builder(server.baseUri()).build(),
-                 server.table().rowType(),
-                 List.of("id"))) {
+             PmsClient client = PmsClient.connect(PmsClientConfig.builder(server.baseUri()).build())) {
             assertEquals("pms", client.handshake().backend());
+            assertEquals(server.table().rowType(), client.rowType());
+            assertEquals(List.of("id"), client.primaryKeyFieldNames());
+            assertNotNull(client.handshake().tableSchema());
+            assertEquals(client.handshake().tableSchema().schemaId(), client.writerSchemaId());
 
             WriteResult write = client.writeBatch(List.of(
                 row(RowKind.INSERT, 1, "row-client-a"),
@@ -847,6 +849,8 @@ class PmsServerEndToEndTest {
         PmsHandshake handshake = PmsHandshake.fromJson(response.body());
         handshake.requireCompatible();
         assertEquals("pms", handshake.backend());
+        assertNotNull(handshake.tableSchema());
+        handshake.tableSchema().requireHashMatches();
         return handshake;
     }
 

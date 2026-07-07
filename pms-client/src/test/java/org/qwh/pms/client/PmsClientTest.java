@@ -7,11 +7,13 @@ import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
+import org.qwh.pms.codec.PmsRowTypeJson;
 import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.protocol.api.LookupResultType;
 import org.qwh.pms.protocol.api.PmsHandshake;
 import org.qwh.pms.protocol.api.PmsProtocolConstants;
 import org.qwh.pms.protocol.api.PmsStatus;
+import org.qwh.pms.protocol.api.PmsTableSchema;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.RawLookupResult;
@@ -42,6 +44,28 @@ class PmsClientTest {
     );
     private final PmsPrimaryKeyCodec keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, List.of("id"));
     private final PmsRowValueCodec valueCodec = new PmsRowValueCodec();
+
+    @Test
+    void connectFromServerSchemaInitializesRowAwareClient() {
+        FakeTransport transport = new FakeTransport(handshakeWithTableSchema(3), request -> {
+            assertEquals(PmsProtocolConstants.LOCAL_WRITE_BATCH_PATH, request.path());
+            List<RawKvEntry> entries = RecordBatchCodec.decodeRequest(request.body());
+            assertEquals(1, entries.size());
+            assertPut(entries.get(0), row(9, "schema-a"));
+            return okWrite(1);
+        });
+        PmsRawClient rawClient = new PmsRawClient(PmsClientConfig.forUri(URI.create("http://127.0.0.1:9090")), transport);
+
+        try (PmsClient client = PmsClient.connectFromServerSchema(rawClient)) {
+            assertEquals(rowType, client.rowType());
+            assertEquals(List.of("id"), client.primaryKeyFieldNames());
+            assertEquals(3, client.writerSchemaId());
+
+            WriteResult result = client.write(row(9, "schema-a"));
+            assertEquals(PmsStatus.OK, result.status());
+            assertEquals(1, result.acceptedCount());
+        }
+    }
 
     @Test
     void writeBatchNormalizesRowKindsToRawKvEntries() {
@@ -190,6 +214,32 @@ class PmsClientTest {
             8,
             8192,
             8192,
+            PmsProtocolConstants.REQUIRED_HOT_PATH_CAPABILITIES
+        );
+    }
+
+    private PmsHandshake handshakeWithTableSchema(long schemaId) {
+        PmsTableSchema tableSchema = PmsTableSchema.create(
+            schemaId,
+            PmsTableSchema.ROW_TYPE_FORMAT_PAIMON_JSON_V1,
+            PmsRowTypeJson.serialize(rowType),
+            List.of("id"),
+            List.of(),
+            PmsRowValueCodec.FORMAT_VERSION,
+            PmsPrimaryKeyCodec.FORMAT_VERSION
+        );
+        return new PmsHandshake(
+            PmsProtocolConstants.PROTOCOL_NAME,
+            PmsProtocolConstants.PROTOCOL_VERSION,
+            PmsProtocolConstants.REQUIRED_HTTP_VERSION,
+            "pms-test",
+            64,
+            1024,
+            8,
+            8,
+            8192,
+            8192,
+            tableSchema,
             PmsProtocolConstants.REQUIRED_HOT_PATH_CAPABILITIES
         );
     }

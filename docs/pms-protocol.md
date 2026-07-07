@@ -11,6 +11,7 @@
 - 写入、删除、点查、prefix 查询的 raw DTO。
 - HTTP/2 binary hot path 使用的 request/response codec。
 - status code、lookup 三态和 batch 整批语义。
+- handshake 中的固定表 schema snapshot 元数据。
 
 本模块不解释 `keyBytes` 和 `rowBytes` 的内部格式。它们由 `pms-codec`
 产生，对协议层是 opaque bytes。`pms-protocol` 不依赖 `pms-core`、
@@ -74,6 +75,16 @@ client 在调用热路径 endpoint 前必须完成 handshake，并确认协议�
   "maxConcurrentStreams": 512,
   "maxRequestBodyBytes": 33554432,
   "maxResponseBodyBytes": 33554432,
+  "tableSchema": {
+    "schemaId": 0,
+    "schemaHash": "sha256:...",
+    "rowTypeFormat": "paimon-row-type-json-v1",
+    "rowTypeJson": "{\"type\":\"ROW\",...}",
+    "primaryKeys": ["id"],
+    "partitionKeys": [],
+    "rowValueCodecVersion": 1,
+    "primaryKeyCodecVersion": 1
+  },
   "capabilities": [
     "localPut",
     "localDelete",
@@ -88,6 +99,17 @@ client 在调用热路径 endpoint 前必须完成 handshake，并确认协议�
 
 handshake 是非热路径 JSON。`pms-protocol` 提供 model 与 JSON 编解码，server 和
 client 复用该 model，避免 capability 字符串和限制字段漂移。
+
+V1 的 `tableSchema` 是 server 在启动时绑定的单表 schema snapshot。协议层只把
+`rowTypeJson` 当作字符串传输，不依赖 Paimon runtime；server 和 row-aware client 分别在
+各自模块中使用 `pms-codec`/Paimon 类型系统序列化和解析它。
+
+`schemaHash` 是 schema snapshot 的协议级指纹，覆盖 `schemaId`、`rowTypeFormat`、
+`rowTypeJson`、primary keys、partition keys 以及 row/key codec version。client 收到后应
+重新计算并校验该 hash，避免 server/client 对 handshake 内容的理解出现漂移。
+
+V1 不支持运行时 schema 变更，不提供 schema tracker/reload 协议。若表 schema 发生变化，
+server 应按 fatal 配置错误处理；后续版本再扩展增量 schema reload。
 
 ## 5. Status 与查询语义
 
@@ -218,8 +240,10 @@ key 必须非空；prefix 查询可以允许空 prefix，但 server 可基于配
 - `pms-server` HTTP/2 binary endpoint：基于 Jetty h2c，在同一监听端口上同时保留旧 JSON debug API。
 - server raw adapter：`RecordBatch` 映射为一次 `PMSBucketDirector.writeBatch()`；local/full/prefix 查询返回 raw row bytes。
 - full get：local miss 后穿透 `pms-lookup-paimon`，lookup UNKNOWN 映射为 `LOOKUP_UNAVAILABLE`。
+- handshake schema snapshot：server 在 handshake 中返回绑定 Paimon 表的 schema id、RowType JSON、primary keys、partition keys 和 codec version；协议模块保持 Paimon-free。
 - `pms-client` raw HTTP/2 client：复用本协议的 handshake、DTO 和 binary codec，提供 raw batch 写入、local/full/prefix 查询与轻量 batch writer。
 - `pms-client` row-aware facade：在 raw client 之上复用 `pms-codec`，提供 Paimon `InternalRow` 写入、RowKind 归一化和 row 查询解码。
+- `pms-client` schema negotiation：row-aware facade 可通过 `PmsClient.connect(config)` 从 handshake 初始化 `RowType`、primary keys 和 writer schema id，并在 client 侧提前校验 PMS 支持的主键类型。
 
 尚未实现：
 

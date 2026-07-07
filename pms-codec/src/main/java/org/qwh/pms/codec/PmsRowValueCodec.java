@@ -32,6 +32,8 @@ import static org.qwh.pms.codec.ByteUtils.writeU8;
  */
 public final class PmsRowValueCodec {
 
+    public static final int FORMAT_VERSION = ByteUtils.VERSION;
+
     private final ColumnValueCodec columnValueCodec;
 
     public PmsRowValueCodec() {

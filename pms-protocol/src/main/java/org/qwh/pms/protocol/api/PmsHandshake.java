@@ -19,6 +19,7 @@ public record PmsHandshake(
         int maxConcurrentStreams,
         int maxRequestBodyBytes,
         int maxResponseBodyBytes,
+        PmsTableSchema tableSchema,
         List<String> capabilities) {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -35,7 +36,38 @@ public record PmsHandshake(
         requirePositive(maxConcurrentStreams, "maxConcurrentStreams");
         requirePositive(maxRequestBodyBytes, "maxRequestBodyBytes");
         requirePositive(maxResponseBodyBytes, "maxResponseBodyBytes");
+        if (tableSchema != null) {
+            tableSchema.requireHashMatches();
+        }
         capabilities = List.copyOf(capabilities);
+    }
+
+    public PmsHandshake(
+            String protocol,
+            int protocolVersion,
+            String requiredHttpVersion,
+            String backend,
+            int maxKeyBytes,
+            int maxRowBytes,
+            int maxBatchEntries,
+            int maxConcurrentStreams,
+            int maxRequestBodyBytes,
+            int maxResponseBodyBytes,
+            List<String> capabilities) {
+        this(
+            protocol,
+            protocolVersion,
+            requiredHttpVersion,
+            backend,
+            maxKeyBytes,
+            maxRowBytes,
+            maxBatchEntries,
+            maxConcurrentStreams,
+            maxRequestBodyBytes,
+            maxResponseBodyBytes,
+            null,
+            capabilities
+        );
     }
 
     public static PmsHandshake fromJson(String json) {

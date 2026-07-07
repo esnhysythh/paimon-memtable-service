@@ -4,8 +4,10 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
+import org.qwh.pms.codec.PmsRowTypeJson;
 import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.protocol.api.PmsHandshake;
+import org.qwh.pms.protocol.api.PmsTableSchema;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.WriteResult;
@@ -23,6 +25,14 @@ public final class PmsClient implements AutoCloseable {
     private final PmsPrimaryKeyCodec keyCodec;
     private final PmsRowValueCodec valueCodec;
 
+    public static PmsClient connect(PmsClientConfig config) {
+        return connectFromServerSchema(PmsRawClient.connect(config));
+    }
+
+    public static PmsClient connect(URI serverUri) {
+        return connect(PmsClientConfig.forUri(serverUri));
+    }
+
     public static PmsClient connect(
             PmsClientConfig config,
             RowType rowType,
@@ -35,7 +45,7 @@ public final class PmsClient implements AutoCloseable {
             RowType rowType,
             List<String> primaryKeyFieldNames,
             int writerSchemaId) {
-        return new PmsClient(PmsRawClient.connect(config), rowType, primaryKeyFieldNames, writerSchemaId);
+        return connectWithExplicitSchema(PmsRawClient.connect(config), rowType, primaryKeyFieldNames, writerSchemaId);
     }
 
     public static PmsClient connect(
@@ -43,6 +53,31 @@ public final class PmsClient implements AutoCloseable {
             RowType rowType,
             List<String> primaryKeyFieldNames) {
         return connect(PmsClientConfig.forUri(serverUri), rowType, primaryKeyFieldNames);
+    }
+
+    static PmsClient connectFromServerSchema(PmsRawClient rawClient) {
+        Objects.requireNonNull(rawClient, "rawClient must not be null");
+        try {
+            NegotiatedSchema schema = negotiateSchema(rawClient.handshake());
+            return new PmsClient(rawClient, schema.rowType(), schema.primaryKeyFieldNames(), schema.writerSchemaId());
+        } catch (RuntimeException e) {
+            rawClient.close();
+            throw e;
+        }
+    }
+
+    private static PmsClient connectWithExplicitSchema(
+            PmsRawClient rawClient,
+            RowType rowType,
+            List<String> primaryKeyFieldNames,
+            int writerSchemaId) {
+        Objects.requireNonNull(rawClient, "rawClient must not be null");
+        try {
+            return new PmsClient(rawClient, rowType, primaryKeyFieldNames, writerSchemaId);
+        } catch (RuntimeException e) {
+            rawClient.close();
+            throw e;
+        }
     }
 
     PmsClient(
@@ -147,4 +182,43 @@ public final class PmsClient implements AutoCloseable {
             case DELETE, UPDATE_BEFORE -> RawKvEntry.delete(key);
         };
     }
+
+    private static NegotiatedSchema negotiateSchema(PmsHandshake handshake) {
+        PmsTableSchema tableSchema = handshake.tableSchema();
+        if (tableSchema == null) {
+            throw new PmsClientProtocolException("PMS handshake did not include tableSchema");
+        }
+        tableSchema.requireHashMatches();
+        if (!PmsTableSchema.ROW_TYPE_FORMAT_PAIMON_JSON_V1.equals(tableSchema.rowTypeFormat())) {
+            throw new PmsClientProtocolException("Unsupported PMS row type format: " + tableSchema.rowTypeFormat());
+        }
+        if (tableSchema.rowValueCodecVersion() != PmsRowValueCodec.FORMAT_VERSION) {
+            throw new PmsClientProtocolException(
+                "Unsupported PMS row value codec version: " + tableSchema.rowValueCodecVersion());
+        }
+        if (tableSchema.primaryKeyCodecVersion() != PmsPrimaryKeyCodec.FORMAT_VERSION) {
+            throw new PmsClientProtocolException(
+                "Unsupported PMS primary key codec version: " + tableSchema.primaryKeyCodecVersion());
+        }
+        RowType rowType;
+        try {
+            rowType = PmsRowTypeJson.deserialize(tableSchema.rowTypeJson());
+        } catch (IllegalArgumentException e) {
+            throw new PmsClientProtocolException("failed to parse PMS handshake table schema", e);
+        }
+        return new NegotiatedSchema(
+            rowType,
+            tableSchema.primaryKeys(),
+            writerSchemaId(tableSchema.schemaId())
+        );
+    }
+
+    private static int writerSchemaId(long schemaId) {
+        if (schemaId < 0 || schemaId > Integer.MAX_VALUE) {
+            throw new PmsClientProtocolException("PMS schema id is outside row codec range: " + schemaId);
+        }
+        return (int) schemaId;
+    }
+
+    private record NegotiatedSchema(RowType rowType, List<String> primaryKeyFieldNames, int writerSchemaId) {}
 }

@@ -6,6 +6,8 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -27,7 +29,44 @@ class PmsHandshakeTest {
         assertEquals(512, decoded.maxConcurrentStreams());
         assertEquals(33_554_432, decoded.maxRequestBodyBytes());
         assertEquals(33_554_432, decoded.maxResponseBodyBytes());
+        assertNull(decoded.tableSchema());
         assertTrue(decoded.supports(PmsProtocolConstants.CAPABILITY_LOCAL_WRITE_BATCH));
+    }
+
+    @Test
+    void jsonRoundTripPreservesTableSchemaSnapshot() {
+        PmsTableSchema tableSchema = PmsTableSchema.create(
+            7,
+            PmsTableSchema.ROW_TYPE_FORMAT_PAIMON_JSON_V1,
+            "{\"type\":\"ROW\",\"fields\":[]}",
+            List.of("id"),
+            List.of("dt"),
+            1,
+            1
+        );
+        PmsHandshake handshake = new PmsHandshake(
+            PmsProtocolConstants.PROTOCOL_NAME,
+            PmsProtocolConstants.PROTOCOL_VERSION,
+            PmsProtocolConstants.REQUIRED_HTTP_VERSION,
+            "pms",
+            65_536,
+            16_777_216,
+            1_024,
+            512,
+            33_554_432,
+            33_554_432,
+            tableSchema,
+            PmsProtocolConstants.REQUIRED_HOT_PATH_CAPABILITIES
+        );
+
+        PmsHandshake decoded = PmsHandshake.fromJson(handshake.toJson());
+
+        assertNotNull(decoded.tableSchema());
+        decoded.tableSchema().requireHashMatches();
+        assertEquals(7, decoded.tableSchema().schemaId());
+        assertEquals(List.of("id"), decoded.tableSchema().primaryKeys());
+        assertEquals(List.of("dt"), decoded.tableSchema().partitionKeys());
+        assertEquals(tableSchema.schemaHash(), decoded.tableSchema().schemaHash());
     }
 
     @Test

@@ -32,6 +32,26 @@ class PmsRowValueCodecTest {
     private final PmsRowValueCodec codec = new PmsRowValueCodec();
 
     @Test
+    void rowTypeJsonRoundTripPreservesFieldIdsAndTypes() {
+        RowType nestedType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(1, "nested_i", DataTypes.INT()),
+                        DataTypes.FIELD(2, "nested_s", DataTypes.STRING()));
+        RowType rowType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(10, "id", DataTypes.INT().notNull()),
+                        DataTypes.FIELD(20, "marker", DataTypes.STRING()),
+                        DataTypes.FIELD(30, "nested", nestedType));
+
+        RowType decoded = PmsRowTypeJson.deserialize(PmsRowTypeJson.serialize(rowType));
+
+        assertEquals(rowType, decoded);
+        assertEquals(10, decoded.getField("id").id());
+        assertEquals(20, decoded.getField("marker").id());
+        assertEquals(nestedType, decoded.getField("nested").type());
+    }
+
+    @Test
     void roundTripAllJavaApiTypes() {
         RowType nestedType =
                 DataTypes.ROW(
