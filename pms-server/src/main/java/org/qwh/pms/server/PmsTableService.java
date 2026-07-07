@@ -22,6 +22,7 @@ import org.apache.paimon.table.sink.RowKeyExtractor;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
+import org.qwh.pms.codec.PmsRowTypeJson;
 import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.lookup.api.DataFileLookup;
 import org.qwh.pms.lookup.api.FileLookupContext;
@@ -53,6 +54,7 @@ import org.qwh.pms.protocol.api.LookupResultType;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.RawLookupResult;
+import org.qwh.pms.protocol.api.PmsTableSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,6 +84,8 @@ public final class PmsTableService implements AutoCloseable {
     private final PmsRowValueCodec valueCodec;
     private final JsonRowMapper rowMapper;
     private final List<String> primaryKeys;
+    private final int writerSchemaId;
+    private final PmsTableSchema protocolTableSchema;
     private final StorageConfig storageConfig;
     private final ReentrantLock maintenanceLock = new ReentrantLock();
     private final Object paimonCommitPublishLock = new Object();
@@ -113,9 +117,19 @@ public final class PmsTableService implements AutoCloseable {
         this.storageConfig = config.coreConfig().storage();
         RowType rowType = table.rowType();
         this.primaryKeys = List.copyOf(table.primaryKeys());
+        this.writerSchemaId = requireWriterSchemaId(fileStoreTable.schema().id());
         this.keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, primaryKeys);
         this.valueCodec = new PmsRowValueCodec();
         this.rowMapper = new JsonRowMapper(rowType);
+        this.protocolTableSchema = PmsTableSchema.create(
+            fileStoreTable.schema().id(),
+            PmsTableSchema.ROW_TYPE_FORMAT_PAIMON_JSON_V1,
+            PmsRowTypeJson.serialize(rowType),
+            primaryKeys,
+            fileStoreTable.schema().partitionKeys(),
+            PmsRowValueCodec.FORMAT_VERSION,
+            PmsPrimaryKeyCodec.FORMAT_VERSION
+        );
         this.keyValueStore = (KeyValueFileStore) fileStoreTable.store();
         int[] primaryKeyFieldIndexes = primaryKeyFieldIndexes(rowType, primaryKeys);
         LookupStack lookupStack = createLookupStack(config.lookup(), rowType, primaryKeyFieldIndexes);
@@ -159,7 +173,7 @@ public final class PmsTableService implements AutoCloseable {
 
     public void write(Map<String, Object> rowValues) {
         InternalRow row = rowMapper.fullRow(rowValues, RowKind.INSERT);
-        director.put(keyCodec.encodeKey(row), valueCodec.encode(table.rowType(), row, 0));
+        director.put(keyCodec.encodeKey(row), valueCodec.encode(table.rowType(), row, writerSchemaId));
         LOG.debug("Wrote row to PMS: primaryKeys={}", primaryKeys);
     }
 
@@ -258,7 +272,7 @@ public final class PmsTableService implements AutoCloseable {
             }
         }
         return switch (result.kind()) {
-            case HIT -> RawLookupResult.hit(valueCodec.encode(table.rowType(), result.row().orElseThrow(), 0));
+            case HIT -> RawLookupResult.hit(valueCodec.encode(table.rowType(), result.row().orElseThrow(), writerSchemaId));
             case DELETED -> RawLookupResult.deleted();
             case MISS -> RawLookupResult.miss();
             case UNKNOWN -> throw new PmsLookupUnavailableException(
@@ -329,6 +343,10 @@ public final class PmsTableService implements AutoCloseable {
 
     public Map<String, Object> recoverySummary() {
         return recoverySummaryToMap(director.lastRecoverySummary());
+    }
+
+    public PmsTableSchema protocolTableSchema() {
+        return protocolTableSchema;
     }
 
     private Optional<Map<String, Object>> lookupPaimon(GenericRow fullPrimaryKeyRow) {
@@ -456,6 +474,13 @@ public final class PmsTableService implements AutoCloseable {
             .map(rowType::getField)
             .mapToInt(field -> rowType.getFieldIndexByFieldId(field.id()))
             .toArray();
+    }
+
+    private static int requireWriterSchemaId(long schemaId) {
+        if (schemaId < 0 || schemaId > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Paimon schema id is outside PMS row codec range: " + schemaId);
+        }
+        return (int) schemaId;
     }
 
     private LookupStack createLookupStack(

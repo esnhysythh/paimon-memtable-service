@@ -27,6 +27,8 @@ import java.util.Set;
  */
 public final class PmsPrimaryKeyCodec {
 
+    public static final int FORMAT_VERSION = 1;
+
     private static final int FLAG_BYTES = 0x01;
     private static final int FLAG_INT8 = 0x03;
     private static final int FLAG_INT16 = 0x04;

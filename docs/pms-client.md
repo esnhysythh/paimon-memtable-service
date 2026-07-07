@@ -20,9 +20,9 @@ Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、b
 
 ```
 1. 建立 RPC 连接（连接池，默认 1 连接，可配置）
-2. 调用 Server 的 handshake 接口，获取当前 Schema 和 SchemaId
-3. 初始化 RowCodec/PrimaryKeyCodec（命名和实现以后续 codec 阶段为准）
-4. 启动 SchemaTracker 定期检查线程
+2. 调用 Server 的 handshake 接口，获取当前固定表 Schema snapshot
+3. 解析 Server 返回的 RowType JSON、primaryKeys 和 SchemaId
+4. 初始化 RowValueCodec/PrimaryKeyCodec，并在 Client 侧校验 primary key 类型是否受 PMS 支持
 ```
 
 **接口**：
@@ -30,6 +30,7 @@ Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、b
 ```java
 class PmsClient implements AutoCloseable {
     // 初始化
+    static PmsClient connect(PmsClientConfig config);
     static PmsClient connect(PmsClientConfig config, RowType rowType, List<String> primaryKeys);
 
     // 写入
@@ -54,6 +55,11 @@ class PmsClient implements AutoCloseable {
 
 raw client 的协议 envelope、status、batch 整批语义与 `LOOKUP_UNAVAILABLE` 可重试查询错误见
 [pms-protocol.md](pms-protocol.md)。
+
+V1 不处理 Paimon 表 Schema 变更。`PmsClient.connect(config)` 只在连接建立时从 handshake
+获取一次 schema snapshot，并认为该 snapshot 在 client 生命周期内稳定。若后续发现 schema
+变更，server 应进入 fatal 路径或通过后续版本的 schema reload 机制处理；当前版本不在 client
+内部静默切换 codec。
 
 **WriteStatus**：
 
@@ -100,7 +106,9 @@ class PrimaryKeyCodec {
 
 ### 2.3 SchemaTracker
 
-定期检查 Server 端 Schema 是否变更，保持 Client 与 Server 的 Schema 一致性。
+后续版本可引入 SchemaTracker，定期检查 Server 端 Schema 是否变更，保持 Client 与 Server
+的 Schema 一致性。V1 已明确不支持 Paimon 表 Schema 变更，因此当前不实现后台 tracker，
+只保留一次性 handshake schema negotiation。
 
 **工作机制**：
 
@@ -126,6 +134,8 @@ class PrimaryKeyCodec {
 **被动触发**：除定期检查外，当写入收到 `SCHEMA_MISMATCH` 响应时，立即触发 Reload，不等下次定期检查。
 
 **线程安全**：SchemaId 的更新使用 `volatile`，RowCodec/PrimaryKeyCodec 的替换使用 `AtomicReference`，保证序列化过程中不会使用到半更新状态的 codec。
+
+以上 reload/thread-safety 设计属于 schema 变更版本的目标形态，V1 暂不落地。
 
 ## 3. 反压与重试策略
 
@@ -179,6 +189,7 @@ class WriteRetryPolicy {
 - 写入重试：对 `OVERLOADED`、`SHUTTING_DOWN` 做有限次数退避重试；非 OK 结果仍按协议状态返回给调用方。
 - `PmsRawBatchWriter`：面向零散 put/delete 的轻量缓冲器，按条数阈值自动 flush，close 时 drain 剩余 batch。
 - `PmsClient`：在 raw client 之上依赖 `pms-codec`，以 Paimon `InternalRow` / `RowType` 为 SDK 数据边界。
+- `PmsClient.connect(config)`：通过 handshake 获取 server 端固定表 schema snapshot，自动初始化 `RowType`、primary keys、SchemaId 和 codec version 校验。
 - row-aware 写入：使用 `PmsPrimaryKeyCodec` 编码 primary key，使用 `PmsRowValueCodec` 编码 row value，并将 `INSERT/UPDATE_AFTER` 归一化为 put、`DELETE/UPDATE_BEFORE` 归一化为 delete。
 - row-aware 查询：使用 key tuple 编码查询 key，并将 raw row bytes 解码为 `InternalRow`；`getLocal` 仍保留 `DELETED` 三态语义，`LOOKUP_UNAVAILABLE` 仍以非 OK status 暴露。
 
