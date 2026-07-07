@@ -61,6 +61,50 @@ V1 不处理 Paimon 表 Schema 变更。`PmsClient.connect(config)` 只在连接
 变更，server 应进入 fatal 路径或通过后续版本的 schema reload 机制处理；当前版本不在 client
 内部静默切换 codec。
 
+### 2.2 Java SDK 使用示例
+
+row-aware facade 的推荐入口是 `PmsClient.connect(config)`。调用方不需要手动传入
+`RowType` 或 primary keys；client 会从 server handshake 获取固定表 schema snapshot，并在
+本地初始化 row/key codec。
+
+下面示例假设 PMS 绑定的 Paimon 表字段顺序为 `id INT, marker STRING`，主键为 `id`：
+
+```java
+URI serverUri = URI.create("http://127.0.0.1:9090");
+PmsClientConfig config = PmsClientConfig.builder(serverUri).build();
+
+try (PmsClient client = PmsClient.connect(config)) {
+    GenericRow row = new GenericRow(RowKind.INSERT, client.rowType().getFieldCount());
+    row.setField(0, 1001);
+    row.setField(1, BinaryString.fromString("active"));
+
+    WriteResult write = client.write(row);
+    if (write.status() != PmsStatus.OK) {
+        throw new IllegalStateException("PMS write failed: " + write.status());
+    }
+
+    GenericRow keyTuple = GenericRow.of(1001);
+    PmsRowLookupResult lookup = client.get(keyTuple);
+    if (lookup.found()) {
+        InternalRow latest = lookup.row();
+        // 使用 latest 继续业务处理。
+    }
+
+    client.delete(keyTuple);
+}
+```
+
+构造 `InternalRow` 时需要遵循以下约定：
+
+- 完整写入 row 的字段数量和字段顺序必须与 `client.rowType()` 一致。
+- `delete/get/getLocal` 的 key tuple 只包含 primary key 字段，字段顺序为 `client.primaryKeyFieldNames()`。
+- `prefixLocal` 的 key prefix tuple 只适用于复合主键的连续前缀，例如主键为 `[tenant_id, id]` 时可传 `GenericRow.of(tenantId)`。
+- `INSERT` 和 `UPDATE_AFTER` 会被归一化为 PMS KV put；`DELETE` 和 `UPDATE_BEFORE` 会被归一化为 PMS KV delete。
+- 当前边界是 Paimon `InternalRow`，调用方需要使用 Paimon internal value 类型，例如 `STRING` 字段使用 `BinaryString.fromString(...)`，`DECIMAL` 使用 `Decimal`，时间字段使用 Paimon `Timestamp`。
+- 显式传入 `RowType` / primary keys 的 `connect` 重载保留给测试和高级场景；普通外部程序应优先使用 handshake schema 入口。
+
+对应的可编译最小样例见 `pms-client/src/test/java/org/qwh/pms/client/examples/PmsClientUsageExample.java`。
+
 **WriteStatus**：
 
 | 状态 | 含义 | Client 行为 |
@@ -70,7 +114,7 @@ V1 不处理 Paimon 表 Schema 变更。`PmsClient.connect(config)` 只在连接
 | `SCHEMA_MISMATCH` | Schema 不一致 | 触发 Reload 后重试 |
 | `SHUTTING_DOWN` | 服务停机 | 切换节点或等待 |
 
-### 2.2 RowCodec / PrimaryKeyCodec（核心序列化边界）
+### 2.3 RowCodec / PrimaryKeyCodec（核心序列化边界）
 
 当前客户端 row-aware facade 复用 `pms-codec` 中定义的行编码和主键编码，详见 [pms-codec.md](pms-codec.md)。
 
@@ -104,7 +148,7 @@ class PrimaryKeyCodec {
 }
 ```
 
-### 2.3 SchemaTracker
+### 2.4 SchemaTracker
 
 后续版本可引入 SchemaTracker，定期检查 Server 端 Schema 是否变更，保持 Client 与 Server
 的 Schema 一致性。V1 已明确不支持 Paimon 表 Schema 变更，因此当前不实现后台 tracker，
