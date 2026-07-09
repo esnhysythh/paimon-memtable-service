@@ -103,7 +103,8 @@ public final class PmsRawClient implements RawKvStore, AutoCloseable {
         PmsHttpResponse response = transport.postBinary(
             PmsProtocolConstants.LOCAL_GET_PREFIX_PATH,
             body,
-            config.readTimeout()
+            config.readTimeout(),
+            handshake.maxResponseBodyBytes()
         );
         return decodeLookupResponse(response, handshake.maxBatchEntries());
     }
@@ -127,7 +128,12 @@ public final class PmsRawClient implements RawKvStore, AutoCloseable {
     private WriteResult writeWithRetry(String path, byte[] body, int expectedAcceptedCount) {
         int attempt = 0;
         while (true) {
-            PmsHttpResponse response = transport.postBinary(path, body, config.writeTimeout());
+            PmsHttpResponse response = transport.postBinary(
+                path,
+                body,
+                config.writeTimeout(),
+                handshake.maxResponseBodyBytes()
+            );
             WriteResult result = decodeWriteResponse(response, expectedAcceptedCount);
             if (!isRetryableWriteStatus(result.status()) || attempt >= config.writeRetryMax()) {
                 return result;
@@ -146,7 +152,12 @@ public final class PmsRawClient implements RawKvStore, AutoCloseable {
         requireMax(key.length, handshake.maxKeyBytes(), "key bytes");
         byte[] body = KeyBatchCodec.encodeSingle(key);
         requireRequestBodySize(body.length);
-        PmsHttpResponse response = transport.postBinary(path, body, config.readTimeout());
+        PmsHttpResponse response = transport.postBinary(
+            path,
+            body,
+            config.readTimeout(),
+            handshake.maxResponseBodyBytes()
+        );
         RawLookupBatchResult batch = decodeLookupResponse(response, 1);
         if (batch.status() != PmsStatus.OK) {
             return RawLookupResult.failed(batch.status());
@@ -160,6 +171,7 @@ public final class PmsRawClient implements RawKvStore, AutoCloseable {
 
     private WriteResult decodeWriteResponse(PmsHttpResponse response, int expectedAcceptedCount) {
         try {
+            requireResponseBodySize(response.body().length);
             WriteResult result = WriteResultCodec.decodeResponse(response.body());
             requireHttpStatusConsistent(response.statusCode(), result.status());
             if (result.status() == PmsStatus.OK && result.acceptedCount() != expectedAcceptedCount) {
@@ -177,6 +189,7 @@ public final class PmsRawClient implements RawKvStore, AutoCloseable {
 
     private RawLookupBatchResult decodeLookupResponse(PmsHttpResponse response, int maxResults) {
         try {
+            requireResponseBodySize(response.body().length);
             RawLookupBatchResult result = LookupBatchCodec.decodeResponse(
                 response.body(),
                 maxResults,
@@ -208,6 +221,16 @@ public final class PmsRawClient implements RawKvStore, AutoCloseable {
 
     private void requireRequestBodySize(int length) {
         requireMax(length, handshake.maxRequestBodyBytes(), "request body bytes");
+    }
+
+    private void requireResponseBodySize(int length) {
+        if (length > handshake.maxResponseBodyBytes()) {
+            throw new PmsClientProtocolException(
+                "response body bytes exceeds server limit: "
+                    + length
+                    + " > "
+                    + handshake.maxResponseBodyBytes());
+        }
     }
 
     private static void requireMax(int actual, int max, String name) {

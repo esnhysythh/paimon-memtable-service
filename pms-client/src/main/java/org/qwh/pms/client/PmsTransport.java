@@ -8,7 +8,7 @@ interface PmsTransport extends AutoCloseable {
 
     PmsHandshake handshake();
 
-    PmsHttpResponse postBinary(String path, byte[] body, Duration timeout);
+    PmsHttpResponse postBinary(String path, byte[] body, Duration timeout, int maxResponseBodyBytes);
 
     @Override
     default void close() {}

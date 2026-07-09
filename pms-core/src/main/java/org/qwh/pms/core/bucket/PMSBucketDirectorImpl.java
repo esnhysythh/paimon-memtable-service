@@ -47,7 +47,6 @@ import java.util.function.Function;
 public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private static final Logger LOG = LoggerFactory.getLogger(PMSBucketDirectorImpl.class);
-    private static final int MAX_WRITE_BATCH_COUNT = 1024;
     private static final int MAX_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
 
     private final MemTableConfig memTableConfig;
@@ -606,7 +605,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     private RuntimeException markFatalAfterWalAppend(Throwable failure) {
-        RuntimeException fatal = new IllegalStateException(
+        RuntimeException fatal = new PmsFatalWriteException(
             "WAL append succeeded but MemTable apply failed; PMSBucketDirector must be restarted",
             failure
         );

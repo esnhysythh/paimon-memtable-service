@@ -3,7 +3,7 @@
 ## 1. 模块定位
 Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、batching 与序列化细节。
 
-后续落地按两层推进：
+当前实现分为两层：
 
 - raw client：依赖 `pms-protocol`，只处理 HTTP/2 binary transport、handshake、raw `byte[] keyBytes` / `byte[] rowBytes`、batching、结果分类和关闭 drain。
 - row-aware facade：在 raw client 之上依赖 `pms-codec`，负责 Paimon row/key 编码、RowKind 归一化和 schema 相关能力。
@@ -19,10 +19,11 @@ Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、b
 **初始化流程**：
 
 ```
-1. 建立 RPC 连接（连接池，默认 1 连接，可配置）
-2. 调用 Server 的 handshake 接口，获取当前固定表 Schema snapshot
+1. 创建 JDK HttpClient，并对 Server 调用 handshake
+2. 校验协议版本、HTTP/2、capability 与请求/响应大小限制
 3. 解析 Server 返回的 RowType JSON、primaryKeys 和 SchemaId
-4. 初始化 RowValueCodec/PrimaryKeyCodec，并在 Client 侧校验 primary key 类型是否受 PMS 支持
+4. 校验 schema hash 与 codec version
+5. 初始化 RowValueCodec/PrimaryKeyCodec，并校验 primary key 类型是否受 PMS 支持
 ```
 
 **接口**：
@@ -31,7 +32,6 @@ Java SDK，供外部程序（如 Flink Connector）调用，屏蔽底层 RPC、b
 class PmsClient implements AutoCloseable {
     // 初始化
     static PmsClient connect(PmsClientConfig config);
-    static PmsClient connect(PmsClientConfig config, RowType rowType, List<String> primaryKeys);
 
     // 写入
     WriteResult write(InternalRow row);
@@ -101,7 +101,8 @@ try (PmsClient client = PmsClient.connect(config)) {
 - `prefixLocal` 的 key prefix tuple 只适用于复合主键的连续前缀，例如主键为 `[tenant_id, id]` 时可传 `GenericRow.of(tenantId)`。
 - `INSERT` 和 `UPDATE_AFTER` 会被归一化为 PMS KV put；`DELETE` 和 `UPDATE_BEFORE` 会被归一化为 PMS KV delete。
 - 当前边界是 Paimon `InternalRow`，调用方需要使用 Paimon internal value 类型，例如 `STRING` 字段使用 `BinaryString.fromString(...)`，`DECIMAL` 使用 `Decimal`，时间字段使用 Paimon `Timestamp`。
-- 显式传入 `RowType` / primary keys 的 `connect` 重载保留给测试和高级场景；普通外部程序应优先使用 handshake schema 入口。
+- `PmsClient` 不提供绕过 handshake 的公开 schema 重载，避免调用方使用与 server 不一致的
+  `RowType`、primary keys 或 writer schema id 写入 opaque bytes。
 
 对应的可编译最小样例见 `pms-client/src/test/java/org/qwh/pms/client/examples/PmsClientUsageExample.java`。
 
@@ -111,8 +112,13 @@ try (PmsClient client = PmsClient.connect(config)) {
 |------|------|------------|
 | `OK` | 写入成功 | 继续 |
 | `OVERLOADED` | 系统过载，被拒绝 | 重试（指数退避） |
-| `SCHEMA_MISMATCH` | Schema 不一致 | 触发 Reload 后重试 |
-| `SHUTTING_DOWN` | 服务停机 | 切换节点或等待 |
+| `SCHEMA_MISMATCH` | Schema 不一致 | V1 停止写入，不自动 reload |
+| `SHUTTING_DOWN` | 服务停机 | 当前 endpoint 等待恢复或由上层切换 |
+| `INTERNAL_ERROR` | 普通服务端内部错误 | 不自动重试，由调用方处理 |
+
+若 WAL 已成功但 MemTable apply 失败，server 不返回普通 `INTERNAL_ERROR`：连接会失败，
+server runtime 进入 `FAILED` 并停止服务。此时该批写入结果未知，只能在 server 恢复后由
+业务幂等或上层检查机制处理。
 
 ### 2.3 RowCodec / PrimaryKeyCodec（核心序列化边界）
 
@@ -127,26 +133,9 @@ INSERT/UPDATE_AFTER  -> put(primaryKeyBytes, rowValueBytes)
 DELETE/UPDATE_BEFORE -> delete(primaryKeyBytes)
 ```
 
-**接口**：
-
-```java
-class RowCodec {
-    // 序列化
-    byte[] serialize(RowData row);
-    byte[] serialize(byte[] primaryKey, byte[] binaryRow);
-
-    // 反序列化
-    RowData deserialize(byte[] data);
-    byte[] extractColumn(byte[] data, int columnIndex);
-
-    // SchemaId / SchemaVersion
-    int currentSchemaId();
-}
-
-class PrimaryKeyCodec {
-    byte[] encodePrimaryKey(RowData row);
-}
-```
+当前实际实现使用 `PmsRowValueCodec.encode/decode` 与
+`PmsPrimaryKeyCodec.encodeKey/encodeKeyTuple/encodePrefixTuple`。client 不再维护一套独立的
+`RowCodec` 抽象。
 
 ### 2.4 SchemaTracker
 
@@ -185,42 +174,33 @@ class PrimaryKeyCodec {
 
 ### 3.1 重试策略
 
-```java
-class WriteRetryPolicy {
-    // 指数退避 + 抖动
-    long nextRetryDelayMs(int attempt, WriteStatus status) {
-        if (status == SCHEMA_MISMATCH) return 0; // 立即 Reload 后重试
-        if (status == SHUTTING_DOWN) return 5000; // 等 5s 再试
+当前 raw client 只对 server 明确拒绝、因而可以确认未写入的 `OVERLOADED` 与
+`SHUTTING_DOWN` 做有限次数指数退避重试。默认延迟为
+`10, 20, 40, 80, 160, 320, 640ms`，之后保持 640ms，上限默认 10 次。
 
-        // OVERLOADED: 指数退避
-        long base = 10; // 10ms
-        long delay = base * (1L << Math.min(attempt, 6)); // 10, 20, 40, 80, 160, 320, 640ms
-        long jitter = ThreadLocalRandom.current().nextLong(delay / 2);
-        return delay + jitter;
-    }
-
-    int maxRetries() { return 10; } // 最大重试次数
-}
-```
+网络超时、连接中断、`INTERNAL_ERROR` 和 fatal 断连都可能对应未知写入结果，client 不自动
+重试，避免在没有 request id / 幂等协议的 V1 中制造重复提交。
 
 ### 3.2 连接管理
 
-- 单连接模式：适用于 Flink Sink 等单线程写入场景。
-- 连接池模式：适用于多线程并发写入场景，连接数可配置。
-- 连接断开后自动重连（指数退避，最大间隔 30s）。
-- 连接建立时自动触发 Schema 校验。
+- 每个 `PmsRawClient` 持有一个 JDK `HttpClient`，由 JDK 负责 HTTP/2 连接复用与 stream multiplexing。
+- 当前不提供显式连接池大小、多节点切换或 SDK 级自动重连策略。
+- schema handshake 只在 `connect` 时执行一次；底层连接恢复不会触发 schema reload。
+- binary response 按 handshake 的 `maxResponseBodyBytes` 流式限长读取。
 
 ## 4. 配置项
 
-| 配置项 | 默认值 | 说明 |
+当前通过 `PmsClientConfig.builder(serverUri)` 配置：
+
+| Builder 配置 | 默认值 | 说明 |
 |--------|-------|------|
-| `pms.client.server_host` | localhost | PMS Server 地址 |
-| `pms.client.server_port` | 9090 | PMS Server 端口 |
-| `pms.client.connection_pool_size` | 1 | 连接池大小 |
-| `pms.client.schema_check_interval_ms` | 30000 | Schema 检查间隔 |
-| `pms.client.write_retry_max` | 10 | 最大重试次数 |
-| `pms.client.write_timeout_ms` | 5000 | 单次写入超时 |
-| `pms.client.read_timeout_ms` | 3000 | 单次查询超时 |
+| `connectTimeout` | 5s | 建立连接超时，必须大于 0 |
+| `writeTimeout` | 5s | 单次写请求超时，0 表示不设置 request timeout |
+| `readTimeout` | 3s | 单次查询超时，0 表示不设置 request timeout |
+| `writeRetryMax` | 10 | `OVERLOADED/SHUTTING_DOWN` 最大重试次数 |
+| `retryInitialBackoff` | 10ms | 写重试初始退避 |
+| `retryMaxBackoff` | 640ms | 写重试最大退避 |
+| `requireHttp2` | true | 是否拒绝非 HTTP/2 响应 |
 
 ## 5. 当前落地状态
 

@@ -398,26 +398,15 @@ Write Request ──│─►│  NORMAL    │  │ OVERLOADED │  │
 
 ### 4.2 实现
 
-```java
-enum WatermarkLevel { NORMAL, OVERLOADED }
+`pms-core` 通过 `BucketStateSnapshot` 暴露水位所需状态，保持 byte-oriented 存储边界；
+`pms-server` 在所有写入口进入 core 前读取 snapshot 并执行 admission：
 
-class WriteAdmissionController {
-    private final PMSConfig config;
-    private final PMSBucketDirector bucketDirector;
+- `immutableMemTableCount >= overloadedImmutableCount` 时拒绝。
+- `newSSTCount >= overloadedPendingSstCount` 时拒绝。
+- 被拒绝的请求不进入 WAL，binary API 返回 `OVERLOADED`，因此 client 可以安全重试。
 
-    WatermarkLevel evaluate() {
-        BucketStateSnapshot snapshot = bucketDirector.stateSnapshot();
-
-        if (snapshot.immutableMemTableCount() >= config.flowcontrolOverloadedImmutableCount()) {
-            return OVERLOADED;
-        }
-        if (snapshot.newSSTCount() >= config.flowcontrolOverloadedPendingSstCount()) {
-            return OVERLOADED;
-        }
-        return NORMAL;
-    }
-}
-```
+该判断是 admission 时刻的轻量快照，不承诺多个并发请求之间的严格配额预留；其目标是阻止
+持续积压，而不是提供精确的全局内存配额。
 
 ### 4.3 与后台任务的联动
 

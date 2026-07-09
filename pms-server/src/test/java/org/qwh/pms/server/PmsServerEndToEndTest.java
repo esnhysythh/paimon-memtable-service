@@ -16,6 +16,8 @@ import org.qwh.pms.client.PmsRawBatchWriter;
 import org.qwh.pms.client.PmsRawClient;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
 import org.qwh.pms.codec.PmsRowValueCodec;
+import org.qwh.pms.core.bucket.PMSBucketDirector;
+import org.qwh.pms.core.bucket.PmsFatalWriteException;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
@@ -37,6 +39,8 @@ import org.qwh.pms.server.dev.PMSTestServer;
 import org.qwh.pms.server.PmsLocalLookupResult.Type;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -539,6 +543,87 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void writeAdmissionReturnsOverloadedAtConfiguredWatermark() throws Exception {
+        Properties props = baseProperties();
+        props.setProperty("pms.memtable.max_entries", "1");
+        props.setProperty("pms.flowcontrol.overloaded_immutable_count", "1");
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        try (PMSTestServer server = PMSTestServer.create(config, schema()).start();
+             PmsRawClient client = PmsRawClient.connect(
+                 PmsClientConfig.builder(server.baseUri()).writeRetryMax(0).build())) {
+            EncodedRow row1 = encodedRow(server.table().rowType(), 1, "admitted");
+            EncodedRow row2 = encodedRow(server.table().rowType(), 2, "rejected");
+
+            assertEquals(PmsStatus.OK, client.putDetailed(row1.key(), row1.row()).status());
+            assertEquals(PmsStatus.OVERLOADED, client.putDetailed(row2.key(), row2.row()).status());
+            assertEquals(LookupResultType.HIT, client.getLocal(row1.key()).type());
+            assertEquals(LookupResultType.MISS, client.getLocal(row2.key()).type());
+        }
+    }
+
+    @Test
+    void prefixResultCountUsesNegotiatedBatchLimit() throws Exception {
+        Properties props = baseProperties();
+        props.setProperty("pms.protocol.max_batch_entries", "1");
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        try (PMSTestServer server = PMSTestServer.create(config, schema()).start();
+             PmsRawClient client = PmsRawClient.connect(PmsClientConfig.builder(server.baseUri()).build())) {
+            EncodedRow row1 = encodedRow(server.table().rowType(), 1, "prefix-a");
+            EncodedRow row2 = encodedRow(server.table().rowType(), 2, "prefix-b");
+            assertEquals(PmsStatus.OK, client.putDetailed(row1.key(), row1.row()).status());
+            assertEquals(PmsStatus.OK, client.putDetailed(row2.key(), row2.row()).status());
+
+            RawLookupBatchResult result = client.getPrefixLocal(new byte[0]);
+
+            assertEquals(PmsStatus.OVERLOADED, result.status());
+            assertTrue(result.results().isEmpty());
+        }
+    }
+
+    @Test
+    void binaryEndpointRejectsChunkedBodyAboveConfiguredLimit() throws Exception {
+        Properties props = baseProperties();
+        props.setProperty("pms.protocol.max_request_body_bytes", "4");
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
+            HttpClient client = http2Client();
+            requireHttp2Handshake(client, server);
+            HttpResponse<byte[]> response = client.send(
+                request(server, PmsProtocolConstants.LOCAL_WRITE_BATCH_PATH)
+                    .header("content-type", PmsProtocolConstants.CONTENT_TYPE_BINARY)
+                    .POST(HttpRequest.BodyPublishers.ofInputStream(
+                        () -> new ByteArrayInputStream(new byte[5])
+                    ))
+                    .build(),
+                HttpResponse.BodyHandlers.ofByteArray()
+            );
+
+            assertEquals(400, response.statusCode());
+            assertEquals(PmsStatus.BAD_REQUEST, WriteResultCodec.decodeResponse(response.body()).status());
+        }
+    }
+
+    @Test
+    void fatalWriteFailureMarksRuntimeFailedAndStopsServer() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
+            PmsServerRuntime runtime = server.runtime();
+
+            runtime.failFatalAsync(
+                new PmsFatalWriteException("injected fatal write", new IOException("apply failed"))
+            );
+
+            waitUntil(() -> runtime.status() == PmsRuntimeStatus.FAILED && httpServerStopped(runtime));
+            assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> runtimeState = (Map<String, Object>) runtime.state().get("runtime");
+            assertEquals("injected fatal write", runtimeState.get("lastFailureMessage"));
+        }
+    }
+
+    @Test
     void rowClientEncodesRowsAndDecodesLookupsOverHttp2() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start();
              PmsClient client = PmsClient.connect(PmsClientConfig.builder(server.baseUri()).build())) {
@@ -780,6 +865,22 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void configManagerRejectsProtocolBatchLimitAboveCoreLimit() {
+        Properties props = baseProperties();
+        props.setProperty(
+            "pms.protocol.max_batch_entries",
+            Integer.toString(PMSBucketDirector.MAX_WRITE_BATCH_COUNT + 1)
+        );
+
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> new ConfigManager().from(props)
+        );
+
+        assertTrue(error.getMessage().contains("exceeds core limit"));
+    }
+
+    @Test
     void testServerMainExpandsTimestampedTargetDirectories() {
         Properties props = new Properties();
         props.setProperty("pms.test.timestamp", "20260526100000");
@@ -920,6 +1021,15 @@ class PmsServerEndToEndTest {
             Thread.sleep(25);
         }
         assertTrue(condition.getAsBoolean(), "condition did not become true before timeout");
+    }
+
+    private static boolean httpServerStopped(PmsServerRuntime runtime) {
+        try {
+            runtime.port();
+            return false;
+        } catch (IllegalStateException expected) {
+            return true;
+        }
     }
 
     private static long number(Map<String, Object> map, String key) {

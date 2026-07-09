@@ -48,6 +48,8 @@ JDK `HttpClient` h2c 首次请求可能需要 HTTP/1.1 upgrade。client 应先�
 - 至少提供第一个主键字段。
 - 返回行按 PMS primary key encoded bytes 升序排列。
 - 本地多层数据按 sequence 选择最新版本；最新版本为 tombstone 的 key 不返回，避免旧层数据复活。
+- binary `local/getPrefix` 的成功结果数不超过 handshake `maxBatchEntries`；超过时返回
+  `OVERLOADED`，V1 不截断也不分页。
 - V1 仅支持 `prefixLocal`。`prefix` 作为完整表 prefix 查询接口名预留，当前直接返回 `NOT_SUPPORTED`；未来实现时必须合并 PMS 本地层与 Paimon 结果，并用 PMS 本地 tombstone 覆盖 Paimon 旧值。
 
 **点查 Paimon 历史数据语义（pms-lookup-paimon 接入后的目标）**：
@@ -67,9 +69,18 @@ JDK `HttpClient` h2c 首次请求可能需要 HTTP/1.1 upgrade。client 应先�
 | `SCHEMA_MISMATCH` | Schema 不一致（V1 中视为 Fatal Error） | 停止写入 |
 | `SHUTTING_DOWN` | 服务正在停机 | 切换到其他节点 |
 
+WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteException`。RPC 不将其
+包装成普通 `INTERNAL_ERROR`，而是终止当前请求、把 runtime 标记为 `FAILED`，并异步停止
+HTTP server、scheduler 和 table service；该批结果按 unknown outcome 处理，等待进程重启恢复。
+
 完整协议 status、endpoint 和 binary payload 见 [pms-protocol.md](pms-protocol.md)。
 
-**流控集成**：RPC 层的写入入口处调用 `WriteAdmissionController.evaluate()`，若返回 OVERLOADED 则响应 `OVERLOADED`。详见 [pms-core.md](pms-core.md) § 4。
+**流控集成**：server 写入口在进入 core 前读取 `BucketStateSnapshot`。immutable MemTable
+或 newSST 达到配置水位时返回 `OVERLOADED`，请求不会进入 WAL。详见
+[pms-core.md](pms-core.md) § 4。
+
+**body 限制**：即使请求未携带 `Content-Length`，server 也在读取过程中执行
+`maxRequestBodyBytes`；成功 binary response 在发送前执行 `maxResponseBodyBytes`。
 
 **查询流控**：查询请求一般不流控（读取不消耗内存配额），但在 OVERLOADED 水位下可限制并发查询数（可选，保护磁盘 IO）。
 
@@ -166,7 +177,7 @@ class ConfigManager {
 | `pms.protocol.strict_http2` | true | binary protocol endpoint 是否拒绝非 HTTP/2 请求 |
 | `pms.protocol.max_key_bytes` | 65536 | 单个 encoded key 最大字节数 |
 | `pms.protocol.max_row_bytes` | 16777216 | 单个 encoded row value 最大字节数 |
-| `pms.protocol.max_batch_entries` | 1024 | 单个 `RecordBatch` 最大 record 数 |
+| `pms.protocol.max_batch_entries` | 1024 | `RecordBatch` record 数和 prefix 成功结果数上限，不得超过 core batch 上限 |
 | `pms.protocol.max_concurrent_streams` | 128 | Jetty h2c 最大并发 stream 数 |
 | `pms.protocol.max_request_body_bytes` | 33554432 | 单个 protocol request body 最大字节数 |
 | `pms.protocol.max_response_body_bytes` | 33554432 | 单个 binary response body 最大字节数 |

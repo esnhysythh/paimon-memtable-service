@@ -267,7 +267,11 @@ class PmsClientTest {
         }
 
         @Override
-        public PmsHttpResponse postBinary(String path, byte[] body, Duration timeout) {
+        public PmsHttpResponse postBinary(
+                String path,
+                byte[] body,
+                Duration timeout,
+                int maxResponseBodyBytes) {
             Request request = new Request(path, body, timeout);
             requests.add(request);
             if (handler != null) {

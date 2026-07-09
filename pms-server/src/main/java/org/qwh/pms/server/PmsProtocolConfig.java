@@ -1,5 +1,7 @@
 package org.qwh.pms.server;
 
+import org.qwh.pms.core.bucket.PMSBucketDirector;
+
 public record PmsProtocolConfig(
     boolean strictHttp2,
     int maxKeyBytes,
@@ -21,6 +23,13 @@ public record PmsProtocolConfig(
         requirePositive(maxKeyBytes, "maxKeyBytes");
         requirePositive(maxRowBytes, "maxRowBytes");
         requirePositive(maxBatchEntries, "maxBatchEntries");
+        if (maxBatchEntries > PMSBucketDirector.MAX_WRITE_BATCH_COUNT) {
+            throw new IllegalArgumentException(
+                "maxBatchEntries exceeds core limit: "
+                    + maxBatchEntries
+                    + " > "
+                    + PMSBucketDirector.MAX_WRITE_BATCH_COUNT);
+        }
         requirePositive(maxConcurrentStreams, "maxConcurrentStreams");
         requirePositive(maxRequestBodyBytes, "maxRequestBodyBytes");
         requirePositive(maxResponseBodyBytes, "maxResponseBodyBytes");

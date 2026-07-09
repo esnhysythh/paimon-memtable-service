@@ -9,6 +9,8 @@ import org.qwh.pms.core.storage.SSTMeta;
 
 public interface PMSBucketDirector {
 
+    int MAX_WRITE_BATCH_COUNT = 1024;
+
     void put(byte[] key, byte[] value);
 
     void delete(byte[] key);

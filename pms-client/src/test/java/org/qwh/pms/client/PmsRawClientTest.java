@@ -142,6 +142,26 @@ class PmsRawClientTest {
         }
     }
 
+    @Test
+    void rejectsResponseBodyAboveNegotiatedLimit() {
+        FakeTransport transport = new FakeTransport(handshake(8, 4));
+        transport.enqueue(new PmsHttpResponse(200, new byte[5]));
+
+        try (PmsRawClient client = newClient(transport)) {
+            assertThrows(PmsClientProtocolException.class, () -> client.getLocal(new byte[] {1}));
+        }
+    }
+
+    @Test
+    void configRejectsZeroConnectTimeout() {
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> PmsClientConfig.builder(URI.create("http://127.0.0.1:9090"))
+                .connectTimeout(Duration.ZERO)
+                .build()
+        );
+    }
+
     private static PmsRawClient newClient(FakeTransport transport) {
         return newClient(transport, PmsClientConfig.forEndpoint("127.0.0.1", 9090));
     }
@@ -155,6 +175,10 @@ class PmsRawClientTest {
     }
 
     private static PmsHandshake handshake(int maxBatchEntries) {
+        return handshake(maxBatchEntries, 8192);
+    }
+
+    private static PmsHandshake handshake(int maxBatchEntries, int maxResponseBodyBytes) {
         return new PmsHandshake(
             PmsProtocolConstants.PROTOCOL_NAME,
             PmsProtocolConstants.PROTOCOL_VERSION,
@@ -165,7 +189,7 @@ class PmsRawClientTest {
             maxBatchEntries,
             8,
             8192,
-            8192,
+            maxResponseBodyBytes,
             PmsProtocolConstants.REQUIRED_HOT_PATH_CAPABILITIES
         );
     }
@@ -193,7 +217,11 @@ class PmsRawClientTest {
         }
 
         @Override
-        public PmsHttpResponse postBinary(String path, byte[] body, Duration timeout) {
+        public PmsHttpResponse postBinary(
+                String path,
+                byte[] body,
+                Duration timeout,
+                int maxResponseBodyBytes) {
             Request request = new Request(path, body, timeout);
             requests.add(request);
             if (handler != null) {
