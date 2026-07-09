@@ -43,6 +43,7 @@ import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
+import org.qwh.pms.core.config.FlowControlConfig;
 import org.qwh.pms.core.config.StorageConfig;
 import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.SinkCommitResult;
@@ -51,6 +52,7 @@ import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.sink.paimon.PaimonCommitPayloadCodec;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
 import org.qwh.pms.protocol.api.LookupResultType;
+import org.qwh.pms.protocol.api.PmsStatus;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.RawLookupResult;
@@ -87,6 +89,7 @@ public final class PmsTableService implements AutoCloseable {
     private final int writerSchemaId;
     private final PmsTableSchema protocolTableSchema;
     private final StorageConfig storageConfig;
+    private final FlowControlConfig flowControlConfig;
     private final ReentrantLock maintenanceLock = new ReentrantLock();
     private final Object paimonCommitPublishLock = new Object();
     private final PaimonKeyValueLookupService paimonLookup;
@@ -115,6 +118,7 @@ public final class PmsTableService implements AutoCloseable {
         this.fileStoreTable = validateLookupProfile(table);
         this.director = director;
         this.storageConfig = config.coreConfig().storage();
+        this.flowControlConfig = config.coreConfig().flowcontrol();
         RowType rowType = table.rowType();
         this.primaryKeys = List.copyOf(table.primaryKeys());
         this.writerSchemaId = requireWriterSchemaId(fileStoreTable.schema().id());
@@ -195,6 +199,14 @@ public final class PmsTableService implements AutoCloseable {
         LOG.debug("Wrote raw batch to PMS: recordCount={}", entries.size());
     }
 
+    public boolean isWriteOverloaded() {
+        BucketStateSnapshot snapshot = director.stateSnapshot();
+        return snapshot.immutableMemTableCount()
+                >= flowControlConfig.overloadedImmutableCount()
+            || snapshot.newSSTCount()
+                >= flowControlConfig.overloadedPendingSstCount();
+    }
+
     public RawLookupResult getLocalRaw(byte[] key) {
         Optional<Value> local = director.lookup(key);
         if (local.isEmpty()) {
@@ -216,8 +228,12 @@ public final class PmsTableService implements AutoCloseable {
         return lookupPaimonRaw(fullPrimaryKeyRow);
     }
 
-    public RawLookupBatchResult prefixLocalRaw(byte[] prefix) {
-        List<RawLookupResult> rows = director.prefixScan(prefix).stream()
+    public RawLookupBatchResult prefixLocalRaw(byte[] prefix, int maxResults) {
+        var entries = director.prefixScan(prefix);
+        if (entries.size() > maxResults) {
+            return RawLookupBatchResult.failed(PmsStatus.OVERLOADED);
+        }
+        List<RawLookupResult> rows = entries.stream()
             .map(entry -> RawLookupResult.hit(entry.value().bytes()))
             .toList();
         return RawLookupBatchResult.ok(rows);

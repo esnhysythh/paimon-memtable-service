@@ -54,7 +54,7 @@ directories and the target Paimon table.
 | `pms.protocol.strict_http2` | `true` | Rejects non-HTTP/2 requests on binary protocol endpoints. |
 | `pms.protocol.max_key_bytes` | `65536` | Maximum encoded key bytes per protocol request item. |
 | `pms.protocol.max_row_bytes` | `16777216` | Maximum encoded row bytes per protocol request item. |
-| `pms.protocol.max_batch_entries` | `1024` | Maximum records per binary `RecordBatch`. |
+| `pms.protocol.max_batch_entries` | `1024` | Maximum records per `RecordBatch` and successful prefix response; cannot exceed the core batch limit. |
 | `pms.protocol.max_concurrent_streams` | `128` | Jetty h2c maximum concurrent streams. |
 | `pms.protocol.max_request_body_bytes` | `33554432` | Maximum binary protocol request body bytes. |
 | `pms.protocol.max_response_body_bytes` | `33554432` | Maximum binary protocol response body bytes. |

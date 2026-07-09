@@ -23,7 +23,7 @@
 
 ```text
 pms-protocol -> JDK + Jackson(handshake JSON)
-pms-client   -> pms-protocol
+pms-client   -> pms-protocol + pms-codec + Paimon
 pms-server   -> pms-protocol + pms-core + pms-codec + pms-sink-paimon + pms-lookup-paimon
 pms-codec    -> Paimon
 pms-core     -> no protocol, no Paimon, no server
@@ -100,6 +100,13 @@ client 在调用热路径 endpoint 前必须完成 handshake，并确认协议�
 handshake 是非热路径 JSON。`pms-protocol` 提供 model 与 JSON 编解码，server 和
 client 复用该 model，避免 capability 字符串和限制字段漂移。
 
+`maxBatchEntries` 同时约束写入 `RecordBatch` 的 record 数量和 prefix 查询成功响应的
+result 数量，server 配置不得超过 core 的单次 batch 上限。
+
+`maxRequestBodyBytes` / `maxResponseBodyBytes` 是实际聚合边界：server 对无
+`Content-Length` 的请求也在流式读取过程中执行上限；client 读取 binary response 时执行
+协商后的响应上限。
+
 V1 的 `tableSchema` 是 server 在启动时绑定的单表 schema snapshot。协议层只把
 `rowTypeJson` 当作字符串传输，不依赖 Paimon runtime；server 和 row-aware client 分别在
 各自模块中使用 `pms-codec`/Paimon 类型系统序列化和解析它。
@@ -141,7 +148,7 @@ server 应按 fatal 配置错误处理；后续版本再扩展增量 schema relo
 ## 6. Binary 基础类型
 
 ```text
-int32       4 bytes, signed, big-endian
+int32      4 bytes, signed, big-endian
 uvarint32  unsigned varint, base-128, little-endian groups, max 5 bytes
 bytes      raw bytes, length provided by surrounding field
 ```
@@ -187,10 +194,11 @@ v1 采用整批语义：
 - 成功：整批成功，`acceptedCount = recordCount`。
 - v1 不使用 `acceptedCount` 表达部分成功。
 
-PMS core 已提供 `writeBatch(List<WriteOp>)`，server adapter 后续必须将一个
+PMS core 已提供 `writeBatch(List<WriteOp>)`，server adapter 将一个
 `RecordBatch` 映射成一次 core batch 写入：WAL 整体写入，memTable 按 batch 内顺序
 apply。若 WAL 成功后 apply 失败，server 不应返回普通非 `OK` 掩盖状态；当前 PMS
-core 会进入 fatal 路径，client 侧结果按 unknown/failure 策略处理。
+core 抛出专用 fatal 异常，server runtime 进入 `FAILED` 并停止服务，当前请求通过断连暴露
+unknown outcome。
 
 ## 8. KeyBatch 与查询响应
 
@@ -229,8 +237,8 @@ key 必须非空；prefix 查询可以允许空 prefix，但 server 可基于配
 - `status != OK` 时 `resultCount = 0`。
 - `resultType = HIT` 时必须携带 row bytes。
 - `MISS` 与 `DELETED` 不携带 row bytes。
-- `local/getPrefix` v1 只返回 `HIT` result，且不分页；server 必须限制结果数量或
-  response body 大小。
+- `local/getPrefix` v1 只返回 `HIT` result，且不分页；成功结果数量不得超过
+  `maxBatchEntries`。超过条数或 response body 上限时返回 `OVERLOADED`，不返回截断结果。
 
 ## 9. 当前落地状态
 

@@ -19,8 +19,8 @@
 3. 调用 PMSClient.write() 发送
    └─ 成功 → 继续
    └─ OVERLOADED → 反压处理（见 § 2.2）
-   └─ SCHEMA_MISMATCH → 自动 Reload 后重试
-   └─ SHUTTING_DOWN → 切换到备用 PMS 节点（如配置）
+   └─ SCHEMA_MISMATCH → V1 停止写入并触发 Flink failover
+   └─ SHUTTING_DOWN → 当前 endpoint 等待恢复或由 connector 上层策略处理
 ```
 
 **生命周期**：

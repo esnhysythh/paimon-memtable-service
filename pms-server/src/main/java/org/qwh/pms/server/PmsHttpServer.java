@@ -16,6 +16,7 @@ import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.util.Callback;
+import org.qwh.pms.core.bucket.PmsFatalWriteException;
 import org.qwh.pms.protocol.api.PmsHandshake;
 import org.qwh.pms.protocol.api.PmsProtocolConstants;
 import org.qwh.pms.protocol.api.PmsStatus;
@@ -29,7 +30,9 @@ import org.qwh.pms.protocol.codec.WriteResultCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -125,11 +128,15 @@ public final class PmsHttpServer implements AutoCloseable {
                 }
             } catch (ResponseTooLargeException e) {
                 writeErrorStatus(path, response, HttpStatus.SERVICE_UNAVAILABLE_503, PmsStatus.OVERLOADED, callback);
+            } catch (PmsFatalWriteException e) {
+                LOG.error("Fatal PMS write failure: method={}, path={}", request.getMethod(), path, e);
+                callback.failed(e);
+                runtime.failFatalAsync(e);
             } catch (IllegalArgumentException | IOException e) {
                 LOG.warn("Bad PMS protocol request: method={}, path={}, message={}", request.getMethod(), path, e.getMessage());
                 writeErrorStatus(path, response, HttpStatus.BAD_REQUEST_400, PmsStatus.BAD_REQUEST, callback);
-            } catch (Throwable t) {
-                LOG.error("PMS protocol request failed: method={}, path={}", request.getMethod(), path, t);
+            } catch (Exception e) {
+                LOG.error("PMS protocol request failed: method={}, path={}", request.getMethod(), path, e);
                 writeErrorStatus(path, response, HttpStatus.INTERNAL_SERVER_ERROR_500, PmsStatus.INTERNAL_ERROR, callback);
             }
         }
@@ -192,9 +199,13 @@ public final class PmsHttpServer implements AutoCloseable {
                         return false;
                     }
                 }
-            } catch (Throwable t) {
-                LOG.error("PMS JSON debug dispatch failed: method={}, path={}", request.getMethod(), path, t);
-                writeJson(response, HttpStatus.INTERNAL_SERVER_ERROR_500, Map.of("status", "ERROR", "message", t.getMessage()), callback);
+            } catch (PmsFatalWriteException e) {
+                LOG.error("Fatal PMS JSON debug write failure: method={}, path={}", request.getMethod(), path, e);
+                callback.failed(e);
+                runtime.failFatalAsync(e);
+            } catch (Exception e) {
+                LOG.error("PMS JSON debug dispatch failed: method={}, path={}", request.getMethod(), path, e);
+                writeJson(response, HttpStatus.INTERNAL_SERVER_ERROR_500, Map.of("status", "ERROR", "message", e.getMessage()), callback);
             }
             return true;
         }
@@ -297,6 +308,11 @@ public final class PmsHttpServer implements AutoCloseable {
                     return;
                 }
                 writeJson(response, handler.handle(), callback);
+            } catch (PmsFatalWriteException e) {
+                throw e;
+            } catch (PmsOverloadedException e) {
+                LOG.warn("PMS JSON debug write overloaded: method={}, path={}", request.getMethod(), request.getHttpURI());
+                writeJson(response, HttpStatus.SERVICE_UNAVAILABLE_503, Map.of("status", "OVERLOADED"), callback);
             } catch (PmsLookupUnavailableException e) {
                 LOG.warn("PMS JSON debug lookup unavailable: method={}, path={}, message={}", request.getMethod(), request.getHttpURI(), e.getMessage());
                 writeJson(response, HttpStatus.SERVICE_UNAVAILABLE_503, Map.of("status", "LOOKUP_UNAVAILABLE", "message", e.getMessage()), callback);
@@ -333,13 +349,9 @@ public final class PmsHttpServer implements AutoCloseable {
             if (contentLength > protocolConfig.maxRequestBodyBytes()) {
                 throw new IllegalArgumentException("request body too large: " + contentLength);
             }
-            ByteBuffer buffer = Content.Source.asByteBuffer(request);
-            byte[] body = new byte[buffer.remaining()];
-            buffer.get(body);
-            if (body.length > protocolConfig.maxRequestBodyBytes()) {
-                throw new IllegalArgumentException("request body too large: " + body.length);
+            try (InputStream input = Content.Source.asInputStream(request)) {
+                return readLimited(input, protocolConfig.maxRequestBodyBytes());
             }
-            return body;
         }
 
         private List<RawKvEntry> decodeRecordBatch(byte[] body, int maxEntries) {
@@ -479,6 +491,19 @@ public final class PmsHttpServer implements AutoCloseable {
             response.setStatus(httpStatus);
             response.getHeaders().put(HttpHeader.CONTENT_TYPE, contentType);
             response.write(true, ByteBuffer.wrap(bytes), callback);
+        }
+
+        private byte[] readLimited(InputStream input, int maxBytes) throws IOException {
+            ByteArrayOutputStream output = new ByteArrayOutputStream(Math.min(maxBytes, 8192));
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                if ((long) output.size() + read > maxBytes) {
+                    throw new IllegalArgumentException("request body too large: > " + maxBytes);
+                }
+                output.write(buffer, 0, read);
+            }
+            return output.toByteArray();
         }
     }
 

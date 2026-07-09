@@ -32,6 +32,8 @@ final class PmsRuntimeRawKvStore implements RawKvStore {
         try {
             runtime.writeRawBatch(entries);
             return PmsStatus.OK;
+        } catch (PmsOverloadedException e) {
+            return PmsStatus.OVERLOADED;
         } catch (PmsServiceUnavailableException e) {
             return PmsStatus.SHUTTING_DOWN;
         }

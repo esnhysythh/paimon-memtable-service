@@ -33,47 +33,11 @@ public final class PmsClient implements AutoCloseable {
         return connect(PmsClientConfig.forUri(serverUri));
     }
 
-    public static PmsClient connect(
-            PmsClientConfig config,
-            RowType rowType,
-            List<String> primaryKeyFieldNames) {
-        return connect(config, rowType, primaryKeyFieldNames, 0);
-    }
-
-    public static PmsClient connect(
-            PmsClientConfig config,
-            RowType rowType,
-            List<String> primaryKeyFieldNames,
-            int writerSchemaId) {
-        return connectWithExplicitSchema(PmsRawClient.connect(config), rowType, primaryKeyFieldNames, writerSchemaId);
-    }
-
-    public static PmsClient connect(
-            URI serverUri,
-            RowType rowType,
-            List<String> primaryKeyFieldNames) {
-        return connect(PmsClientConfig.forUri(serverUri), rowType, primaryKeyFieldNames);
-    }
-
     static PmsClient connectFromServerSchema(PmsRawClient rawClient) {
         Objects.requireNonNull(rawClient, "rawClient must not be null");
         try {
             NegotiatedSchema schema = negotiateSchema(rawClient.handshake());
             return new PmsClient(rawClient, schema.rowType(), schema.primaryKeyFieldNames(), schema.writerSchemaId());
-        } catch (RuntimeException e) {
-            rawClient.close();
-            throw e;
-        }
-    }
-
-    private static PmsClient connectWithExplicitSchema(
-            PmsRawClient rawClient,
-            RowType rowType,
-            List<String> primaryKeyFieldNames,
-            int writerSchemaId) {
-        Objects.requireNonNull(rawClient, "rawClient must not be null");
-        try {
-            return new PmsClient(rawClient, rowType, primaryKeyFieldNames, writerSchemaId);
         } catch (RuntimeException e) {
             rawClient.close();
             throw e;

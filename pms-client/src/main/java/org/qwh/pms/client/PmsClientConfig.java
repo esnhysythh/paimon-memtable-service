@@ -31,6 +31,9 @@ public record PmsClientConfig(
         requireHttpUri(serverUri);
         requireNonNegative(writeRetryMax, "writeRetryMax");
         requireNonNegative(connectTimeout, "connectTimeout");
+        if (connectTimeout.isZero()) {
+            throw new IllegalArgumentException("connectTimeout must be positive");
+        }
         requireNonNegative(writeTimeout, "writeTimeout");
         requireNonNegative(readTimeout, "readTimeout");
         requireNonNegative(retryInitialBackoff, "retryInitialBackoff");

@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import org.qwh.pms.core.bucket.PmsFatalWriteException;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.RawLookupResult;
@@ -145,7 +146,7 @@ public final class PmsServerRuntime implements AutoCloseable {
     }
 
     public RawLookupBatchResult prefixLocalRaw(byte[] prefix) {
-        return service().prefixLocalRaw(prefix);
+        return service().prefixLocalRaw(prefix, config.protocol().maxBatchEntries());
     }
 
     public void flush() {
@@ -179,6 +180,10 @@ public final class PmsServerRuntime implements AutoCloseable {
     @Override
     public synchronized void close() throws Exception {
         if (status == PmsRuntimeStatus.STOPPED || status == PmsRuntimeStatus.NEW) {
+            return;
+        }
+        if (status == PmsRuntimeStatus.FAILED) {
+            closeAfterFatal();
             return;
         }
         LOG.info("PMS server runtime shutdown requested, status={}", status);
@@ -253,6 +258,9 @@ public final class PmsServerRuntime implements AutoCloseable {
         if (!acceptingWrites()) {
             throw new PmsServiceUnavailableException("PMS server is not accepting writes, status=" + status);
         }
+        if (service().isWriteOverloaded()) {
+            throw new PmsOverloadedException("PMS write backlog reached the configured overload watermark");
+        }
     }
 
     private void requireStarted() {
@@ -261,7 +269,32 @@ public final class PmsServerRuntime implements AutoCloseable {
         }
     }
 
-    private void markFailed(Exception e) {
+    void failFatalAsync(PmsFatalWriteException failure) {
+        synchronized (this) {
+            if (status == PmsRuntimeStatus.FAILED || status == PmsRuntimeStatus.STOPPED) {
+                return;
+            }
+            markFailed(failure);
+        }
+        Thread cleanup = new Thread(this::closeAfterFatal, "pms-fatal-shutdown");
+        cleanup.setDaemon(false);
+        cleanup.start();
+    }
+
+    private synchronized void closeAfterFatal() {
+        if (status != PmsRuntimeStatus.FAILED) {
+            return;
+        }
+        LOG.error("PMS server runtime is stopping after a fatal write failure: {}", lastFailureMessage);
+        closeQuietly(httpServer);
+        httpServer = null;
+        closeQuietly(scheduler);
+        scheduler = null;
+        closeQuietly(service);
+        service = null;
+    }
+
+    private void markFailed(Throwable e) {
         status = PmsRuntimeStatus.FAILED;
         failedAt = now();
         lastFailureMessage = e.getMessage();
