@@ -47,6 +47,8 @@ PMS V1 只支持 Paimon primary-key + deduplicate merge-engine 表。`PaimonSink
 
 - 表必须是 `FileStoreTable`。
 - 表必须包含 primary key。
+- 表必须使用固定 hash bucket，即 `bucketMode == HASH_FIXED`。
+- 如果表存在 partition keys，primary keys 必须包含所有 partition keys，PMS 不接受 Cross Partitions Upsert。
 - 表的 `merge-engine` 必须是 `deduplicate`。
 
 拒绝其他 merge engine 的原因是 PMS 内部存储语义是 latest-state KV：
@@ -57,6 +59,8 @@ PMS V1 只支持 Paimon primary-key + deduplicate merge-engine 表。`PaimonSink
 ```
 
 该语义与 Paimon deduplicate merge engine 对齐，但无法表达 partial-update、aggregation、first-row 等需要更复杂 merge 函数的表。
+
+固定 bucket 与 partition 约束用于保证 PMS 只依赖 primary key 即可确定 delete 应写入的 Paimon 物理范围。Paimon 的动态 bucket / Cross Partitions Upsert 需要额外维护 key 到 bucket 或 partition 的映射；这与 PMS delete 不回查旧数据的设计目标冲突，因此 V1 在 sink 构造阶段直接拒绝。
 
 ## 4. Prepare 流程
 
@@ -95,9 +99,11 @@ SinkBatch.ssts
 | PMS Entry | Paimon Row |
 |-----------|------------|
 | put | `PmsRowValueCodec.decode(rowType, valueBytes)`，并设置 `RowKind.INSERT` |
-| tombstone | `PmsPrimaryKeyCodec.decodeKey(keyBytes)`，构造 `RowKind.DELETE` row，只填 primary key 字段 |
+| tombstone | `DeleteRowFactory.createDeleteRow(keyBytes)`，构造 `RowKind.DELETE` row |
 
 delete/tombstone 不写入 row value bytes；它只由 PMS KV 层表达。
+
+`DeleteRowFactory` 是 Paimon key-only delete 兼容逻辑的唯一集中点。它解码 primary key 字段；nullable 非主键字段保持 null；非主键 `NOT NULL` 字段填入确定性的合成值，避免 Paimon 在处理 `RowKind.DELETE` 之前执行整行 nullability 校验失败。
 
 ### 4.3 Commit Identifier
 
@@ -154,11 +160,9 @@ SinkMetaStore load
 
 ## 7. Delete 语义与 Paimon 已知限制
 
-PMS tombstone 在 Paimon sink 中转换为只填 primary key 字段的 `RowKind.DELETE` row。
+PMS tombstone 的语义是删除指定 primary key 的最新状态。PMS 不会在 delete sink 前回查 Paimon 表，也不提供 delete 前镜像；这保证了 delete 成本仍然是顺序写路径，而不是退化为一次 Paimon 点查后再写入。
 
-在 nullable 非主键字段场景下，该行为已经通过真实 Paimon 集成测试验证。
-
-当前 Paimon 高层 `TableWrite` 路径存在一个已知限制：
+理想情况下，PMS tombstone 应转换为只填 primary key 字段的 key-only `RowKind.DELETE` row。当前 Paimon 高层 `TableWrite` 路径存在一个已知限制，对应社区问题为 [apache/paimon#4702](https://github.com/apache/paimon/issues/4702)：
 
 ```text
 当非主键字段为 NOT NULL 时，key-only DELETE row 会在 prepare 阶段被整行 nullability 校验拒绝。
@@ -170,7 +174,20 @@ PMS tombstone 在 Paimon sink 中转换为只填 primary key 字段的 `RowKind.
 Cannot write null to non-null column(...)
 ```
 
-PMS 暂不通过填充占位值的方式绕过该限制，以免污染 delete 语义。该问题应优先反馈给 Paimon 社区处理。
+PMS 当前选择在 `DeleteRowFactory` 内做一层最小兼容：
+
+- primary key 字段来自 PMS key bytes。
+- nullable 非主键字段仍保持 null。
+- 非主键 `NOT NULL` 字段写入确定性的合成值。
+- 标量类型使用零值或空值；`ARRAY` 使用空数组，`MAP` / `MULTISET` 使用空映射，`ROW` 对内部 `NOT NULL` 字段递归填充。
+
+这些合成值不是 Paimon schema default value。Paimon 的 schema default value 需要从字符串转换为目标类型，当前复杂类型不支持这种转换；这里的空集合和递归 row 只用于绕过 delete 前的 nullability 校验。
+
+这项兼容只扩大 delete 占位值的覆盖范围，不改变 PMS row codec 的类型边界。`VECTOR`、`VARIANT`、`BLOB` 等尚未被 PMS row codec 支持的类型，不应因为 `DeleteRowFactory` 能否构造占位值而被视为 V1 可用表类型。
+
+该方案不改变 PMS 与 Paimon deduplicate 表的 latest-state 结果：delete 的最终语义仍然是删除该 primary key。需要明确的是，PMS 不保证 delete changelog 中携带 old value；如果下游直接消费 raw changelog、审计 delete 行、保留 delete 文件，或依赖非主键列的 delete 行统计信息，可能看到这些合成值。PMS 使用规范中应将 delete 行视为 key-only delete 语义，不应读取其非主键列作为业务含义。
+
+这部分兼容性被限制在 `DeleteRowFactory`。如果未来 Paimon 支持 key-only `RowKind.DELETE` 并跳过非主键 nullability 校验，删除该工厂中的合成列逻辑后即可回到真正的 key-only delete。
 
 ## 8. 当前测试覆盖
 
@@ -183,16 +200,19 @@ PMS 暂不通过填充占位值的方式绕过该限制，以免污染 delete �
 - tombstone 作为最新 entry 被保留。
 - merge iterator 正常耗尽和提前关闭时释放输入 iterator。
 - row value 转 INSERT row。
-- tombstone 转 key-only DELETE row。
+- tombstone 转 DELETE row，nullable 非主键字段保持 null。
+- 非主键 `NOT NULL` 字段下 tombstone delete 通过合成值写入 Paimon。
+- 复杂类型 `NOT NULL` 字段下 tombstone delete 使用空集合或递归 row，并通过真实 Parquet prepare/commit。
 - 真实 Paimon prepare/commit。
 - WAL prepared payload round-trip 后 commit。
 - 重复 commit 幂等。
 - nullable 非主键字段下 tombstone delete。
-- 非主键 `NOT NULL` 字段下 key-only DELETE 被 Paimon 拒绝。
 - 多 SST merge 后真实写入 Paimon。
 - 分区表 + 复合主键 + delete。
 - prepared data file 缺失时拒绝 commit。
 - 非 primary-key 表拒绝。
+- 非 HASH_FIXED bucket 表拒绝。
+- Cross Partitions Upsert 表拒绝。
 - 非 deduplicate merge-engine 表拒绝。
 - prepare 打开后续 SST iterator 失败时关闭已打开 iterator。
 
