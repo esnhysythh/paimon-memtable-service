@@ -11,6 +11,7 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.ReadBuilder;
@@ -97,7 +98,7 @@ class PaimonSinkManagerIntegrationTest {
     }
 
     @Test
-    void rejectsKeyOnlyDeleteRowWhenNonPrimaryKeyFieldIsNotNull() throws Exception {
+    void deletesNotNullNonPrimaryKeyRowsWithSyntheticPayload() throws Exception {
         try (TestTable testTable = createTable(notNullSchema())) {
             RowType rowType = testTable.table().rowType();
             FileLocalStorageManager storage = storage();
@@ -109,12 +110,27 @@ class PaimonSinkManagerIntegrationTest {
             assertEquals(Map.of(1, "old-a"), readRows(testTable.table()));
 
             SSTMeta second = storage.flushToSST(immutable(delete(rowType, 1, 2)));
-            RuntimeException error =
-                assertThrows(RuntimeException.class, () -> prepare(sinkManager, "batch-002", second));
+            PreparedSinkCommit preparedSecond = prepare(sinkManager, "batch-002", second);
+            SinkCommitResult secondResult = sinkManager.commit(preparedSecond);
 
-            assertTrue(error.getMessage().contains("Paimon prepare failed for batch batch-002"));
-            assertTrue(error.getCause().getMessage().contains("Cannot write null to non-null column(marker)"));
-            assertEquals(Map.of(1, "old-a"), readRows(testTable.table()));
+            assertEquals(second.maxSequenceId(), secondResult.persistedSequenceId());
+            assertEquals(Map.of(), readRows(testTable.table()));
+        }
+    }
+
+    @Test
+    void writesDeleteWithNotNullComplexSyntheticPayload() throws Exception {
+        try (TestTable testTable = createTable(notNullComplexSchema())) {
+            RowType rowType = testTable.table().rowType();
+            FileLocalStorageManager storage = storage();
+            PaimonSinkManager sinkManager =
+                new PaimonSinkManager(testTable.table(), "pms-test", storage);
+
+            SSTMeta meta = storage.flushToSST(immutable(delete(rowType, 1, 1)));
+            SinkCommitResult result = sinkManager.commit(prepare(sinkManager, "batch-complex", meta));
+
+            assertEquals(meta.maxSequenceId(), result.persistedSequenceId());
+            assertEquals(Map.of(), readRows(testTable.table()));
         }
     }
 
@@ -214,6 +230,21 @@ class PaimonSinkManagerIntegrationTest {
             () -> new PaimonSinkManager(partialUpdateTable, "pms-test", storage())
         );
         assertTrue(error.getMessage().contains("merge-engine=deduplicate"), error::getMessage);
+
+        Table dynamicBucketTable = unsupportedBucketModeTable(BucketMode.HASH_DYNAMIC);
+        RuntimeException dynamicBucketError = assertThrows(
+            RuntimeException.class,
+            () -> new PaimonSinkManager(dynamicBucketTable, "pms-test", storage())
+        );
+        assertTrue(dynamicBucketError.getMessage().contains("HASH_FIXED"), dynamicBucketError::getMessage);
+
+        Table crossPartitionTable = crossPartitionTable();
+        RuntimeException crossPartitionError = assertThrows(
+            RuntimeException.class,
+            () -> new PaimonSinkManager(crossPartitionTable, "pms-test", storage())
+        );
+        assertTrue(crossPartitionError.getMessage().contains("Cross Partitions Upsert"),
+            crossPartitionError::getMessage);
     }
 
     @Test
@@ -284,7 +315,8 @@ class PaimonSinkManagerIntegrationTest {
     }
 
     private TestEntry delete(RowType rowType, int id, long sequenceId) {
-        GenericRow row = row(id, "deleted");
+        GenericRow row = new GenericRow(rowType.getFieldCount());
+        row.setField(0, id);
         PmsPrimaryKeyCodec keyCodec = PmsPrimaryKeyCodec.forFieldNames(rowType, List.of("id"));
         return new TestEntry(new Key(keyCodec.encodeKey(row)), Value.tombstone(sequenceId));
     }
@@ -355,6 +387,29 @@ class PaimonSinkManagerIntegrationTest {
         return Schema.newBuilder()
             .column("id", DataTypes.INT())
             .column("marker", DataTypes.STRING().notNull())
+            .primaryKey("id")
+            .option("bucket", "1")
+            .option("file.format", "parquet")
+            .option("merge-engine", "deduplicate")
+            .build();
+    }
+
+    private static Schema notNullComplexSchema() {
+        return Schema.newBuilder()
+            .column("id", DataTypes.INT())
+            .column("items", DataTypes.ARRAY(DataTypes.STRING().notNull()).notNull())
+            .column(
+                "attributes",
+                DataTypes.MAP(DataTypes.STRING().notNull(), DataTypes.INT().notNull()).notNull()
+            )
+            .column(
+                "details",
+                DataTypes.ROW(
+                    DataTypes.FIELD(31, "required", DataTypes.STRING().notNull()),
+                    DataTypes.FIELD(32, "optional", DataTypes.INT())
+                ).notNull()
+            )
+            .column("amount", DataTypes.DECIMAL(38, 18).notNull())
             .primaryKey("id")
             .option("bucket", "1")
             .option("file.format", "parquet")
@@ -434,8 +489,40 @@ class PaimonSinkManagerIntegrationTest {
             new Class<?>[] {FileStoreTable.class},
             (proxy, method, args) -> switch (method.getName()) {
                 case "primaryKeys" -> List.of("id");
+                case "partitionKeys" -> List.of();
+                case "bucketMode" -> BucketMode.HASH_FIXED;
                 case "coreOptions" -> new CoreOptions(Map.of("merge-engine", "partial-update"));
                 case "toString" -> "partial-update-table";
+                default -> throw new UnsupportedOperationException(method.getName());
+            }
+        );
+    }
+
+    private static Table crossPartitionTable() {
+        return (Table) Proxy.newProxyInstance(
+            PaimonSinkManagerIntegrationTest.class.getClassLoader(),
+            new Class<?>[] {FileStoreTable.class},
+            (proxy, method, args) -> switch (method.getName()) {
+                case "primaryKeys" -> List.of("id");
+                case "partitionKeys" -> List.of("day");
+                case "bucketMode" -> BucketMode.HASH_FIXED;
+                case "coreOptions" -> new CoreOptions(Map.of("merge-engine", "deduplicate"));
+                case "toString" -> "cross-partition-table";
+                default -> throw new UnsupportedOperationException(method.getName());
+            }
+        );
+    }
+
+    private static Table unsupportedBucketModeTable(BucketMode bucketMode) {
+        return (Table) Proxy.newProxyInstance(
+            PaimonSinkManagerIntegrationTest.class.getClassLoader(),
+            new Class<?>[] {FileStoreTable.class},
+            (proxy, method, args) -> switch (method.getName()) {
+                case "primaryKeys" -> List.of("id");
+                case "partitionKeys" -> List.of();
+                case "bucketMode" -> bucketMode;
+                case "coreOptions" -> new CoreOptions(Map.of("merge-engine", "deduplicate"));
+                case "toString" -> "unsupported-bucket-mode-table";
                 default -> throw new UnsupportedOperationException(method.getName());
             }
         );

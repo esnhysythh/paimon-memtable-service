@@ -85,7 +85,7 @@ sst-000001-000001.sst
 - 多 SST 按 key streaming merge 已在 `pms-sink-paimon` 初步落地。
 - RowCodec 已在 `pms-codec` 落地，并已由 `pms-sink-paimon` 在 sink 路径使用。
 - `InternalRow -> byte[]`、`byte[] -> InternalRow`、`InternalRow -> Key` 已具备基础实现。
-- 真实 Paimon sink 已初步接入，支持 prepare/commit、SinkMeta payload round-trip、重复 commit 幂等、nullable 非主键场景下的 tombstone delete、多 SST streaming merge 后写入 Paimon、分区表 + 复合主键 delete、prepared file ref 校验失败拒绝 commit，以及非法表能力拒绝；非主键 `NOT NULL` 场景下，Paimon 高层 `TableWrite` 当前会先做整行 nullability 校验，因此 key-only DELETE row 会被拒绝。
+- 真实 Paimon sink 已初步接入，支持 prepare/commit、SinkMeta payload round-trip、重复 commit 幂等、nullable 非主键场景下的 tombstone delete、非主键 `NOT NULL` 场景下通过合成列兼容 Paimon delete nullability 校验、多 SST streaming merge 后写入 Paimon、分区表 + 复合主键 delete、prepared file ref 校验失败拒绝 commit，以及非法表能力拒绝；当前非法表能力拒绝包括非 primary-key、非 HASH_FIXED bucket、Cross Partitions Upsert 和非 deduplicate merge-engine。
 - `SinkCoordinator` 已抽出，负责 prepare/SinkMeta/commit/SinkMeta 编排；BucketDirector 仍负责选择待 sink SST、推进本地 SST 状态和刷新内存视图。`SinkMetaStore` 已能识别没有匹配 success 的 prepared commit，并在重启初始化时重试 commit。
 - 本地 SST compact 和 sinkedSST evict 已有第一阶段实现；双持 Mem 缓存退化仍未实现。
 - WAL truncate 已切换到 sequence 维度接口；定期调度与最新 `persistedSequenceId` 的完整串联仍需在 server/runtime 层补齐。
