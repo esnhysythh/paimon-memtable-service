@@ -169,10 +169,11 @@ final class SSTReader implements AutoCloseable {
         }
         Key minKey = readKey(in, entryCount);
         Key maxKey = readKey(in, entryCount);
-        byte[] tail = StorageCoding.readExact(in, 8 + 8 + 8 + 3);
+        byte[] tail = StorageCoding.readExact(in, 8 + 8 + 8 + 8 + 3);
         long minSequenceId = StorageCoding.readLongLE(tail, 0);
         long maxSequenceId = StorageCoding.readLongLE(tail, 8);
-        long createdAtMillis = StorageCoding.readLongLE(tail, 16);
+        long oldestWriteAtMillis = StorageCoding.readLongLE(tail, 16);
+        long createdAtMillis = StorageCoding.readLongLE(tail, 24);
         long[] flushRange = parseFlushRange(path);
         return new SSTMeta(
             flushRange[0],
@@ -185,9 +186,9 @@ final class SSTReader implements AutoCloseable {
             maxKey,
             minSequenceId,
             maxSequenceId,
+            oldestWriteAtMillis,
             createdAtMillis,
-            state,
-            0
+            state
         );
     }
 

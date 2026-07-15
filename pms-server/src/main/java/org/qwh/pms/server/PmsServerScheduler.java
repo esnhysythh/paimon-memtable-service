@@ -1,8 +1,8 @@
 package org.qwh.pms.server;
 
-import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -14,8 +14,10 @@ public final class PmsServerScheduler implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(PmsServerScheduler.class);
     private static final AtomicInteger THREAD_ID = new AtomicInteger();
 
-    private final PmsTableService service;
+    private final Runnable flushAction;
+    private final Runnable sinkAction;
     private final PmsSchedulerConfig config;
+    private final SchedulerTimeSource timeSource;
     private final ScheduledExecutorService executor;
 
     private volatile boolean running;
@@ -36,16 +38,42 @@ public final class PmsServerScheduler implements AutoCloseable {
     private volatile String lastErrorMessage;
 
     public PmsServerScheduler(PmsTableService service, PmsSchedulerConfig config) {
-        if (service == null) {
-            throw new IllegalArgumentException("service must not be null");
-        }
-        this.service = service;
+        this(requireService(service), config, SchedulerTimeSource.SYSTEM);
+    }
+
+    private PmsServerScheduler(
+            PmsTableService service,
+            PmsSchedulerConfig config,
+            SchedulerTimeSource timeSource) {
+        this(
+            service::flush,
+            service::sink,
+            config,
+            timeSource
+        );
+    }
+
+    PmsServerScheduler(
+            Runnable flushAction,
+            Runnable sinkAction,
+            PmsSchedulerConfig config,
+            SchedulerTimeSource timeSource) {
+        this.flushAction = Objects.requireNonNull(flushAction, "flushAction must not be null");
+        this.sinkAction = Objects.requireNonNull(sinkAction, "sinkAction must not be null");
         this.config = config == null ? PmsSchedulerConfig.disabled(0) : config;
+        this.timeSource = Objects.requireNonNull(timeSource, "timeSource must not be null");
         this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "pms-server-scheduler-" + THREAD_ID.incrementAndGet());
             thread.setDaemon(true);
             return thread;
         });
+    }
+
+    private static PmsTableService requireService(PmsTableService service) {
+        if (service == null) {
+            throw new IllegalArgumentException("service must not be null");
+        }
+        return service;
     }
 
     public synchronized void start() {
@@ -137,12 +165,12 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private void flush() {
-        long startedNanos = System.nanoTime();
+        long startedNanos = timeSource.monotonicNanos();
         flushRunning = true;
         lastFlushStartedAt = now();
         LOG.debug("Scheduled PMS flush started");
         try {
-            service.flush();
+            flushAction.run();
             flushSuccessCount++;
             LOG.debug("Scheduled PMS flush completed");
         } finally {
@@ -153,12 +181,12 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private void sink() {
-        long startedNanos = System.nanoTime();
+        long startedNanos = timeSource.monotonicNanos();
         sinkRunning = true;
         lastSinkStartedAt = now();
         LOG.debug("Scheduled PMS sink started");
         try {
-            service.sink();
+            sinkAction.run();
             sinkSuccessCount++;
             LOG.debug("Scheduled PMS sink completed");
         } finally {
@@ -168,11 +196,11 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
     }
 
-    private static String now() {
-        return Instant.now().toString();
+    private String now() {
+        return timeSource.wallClockNow().toString();
     }
 
-    private static long elapsedMillis(long startedNanos) {
-        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
+    private long elapsedMillis(long startedNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(timeSource.monotonicNanos() - startedNanos);
     }
 }

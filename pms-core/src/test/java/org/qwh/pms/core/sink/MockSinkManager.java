@@ -1,11 +1,11 @@
 package org.qwh.pms.core.sink;
 
-import org.qwh.pms.core.storage.SSTMeta;
-
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import org.qwh.pms.core.storage.SSTMeta;
 
+/** Deterministic test-only SinkManager. Production code must inject its real implementation. */
 public class MockSinkManager implements SinkManager {
     private final AtomicLong nextSnapshotId = new AtomicLong(1);
 

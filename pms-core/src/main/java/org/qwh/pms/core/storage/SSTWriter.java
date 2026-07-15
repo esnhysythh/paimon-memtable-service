@@ -38,13 +38,18 @@ final class SSTWriter {
             memTable.iterator(),
             Math.max(1, memTable.estimatedEntryCount()),
             memTable.minSequenceId(),
-            memTable.maxSequenceId()
+            memTable.maxSequenceId(),
+            memTable.oldestWriteAtMillis()
         );
     }
 
     SSTMeta write(long runId, long minFlushId, long maxFlushId, SSTState state, Iterator<Entry> entries,
-                  long expectedEntryCount, long expectedMinSequenceId, long expectedMaxSequenceId)
+                  long expectedEntryCount, long expectedMinSequenceId, long expectedMaxSequenceId,
+                  long oldestWriteAtMillis)
             throws IOException {
+        if (oldestWriteAtMillis <= 0) {
+            throw new IllegalArgumentException("oldestWriteAtMillis must be positive");
+        }
         Files.createDirectories(dir);
         Path target = pathFor(minFlushId, maxFlushId, state);
         Path tmp = target.resolveSibling(target.getFileName() + ".tmp-" + runId);
@@ -98,6 +103,7 @@ final class SSTWriter {
                 maxKey,
                 entryCount == 0 ? expectedMinSequenceId : minSequenceId,
                 entryCount == 0 ? expectedMaxSequenceId : maxSequenceId,
+                oldestWriteAtMillis,
                 createdAtMillis,
                 hasTombstone
             );
@@ -121,9 +127,9 @@ final class SSTWriter {
                 maxKey,
                 entryCount == 0 ? expectedMinSequenceId : minSequenceId,
                 entryCount == 0 ? expectedMaxSequenceId : maxSequenceId,
+                oldestWriteAtMillis,
                 createdAtMillis,
-                state,
-                0
+                state
             );
         } catch (IOException | RuntimeException e) {
             Files.deleteIfExists(tmp);
@@ -169,8 +175,8 @@ final class SSTWriter {
     }
 
     private static byte[] encodeProperties(long entryCount, long dataBlockCount, Key minKey, Key maxKey,
-                                           long minSequenceId, long maxSequenceId, long createdAtMillis,
-                                           boolean hasTombstone) {
+                                           long minSequenceId, long maxSequenceId, long oldestWriteAtMillis,
+                                           long createdAtMillis, boolean hasTombstone) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         StorageCoding.writeIntLE(out, SSTFormat.VERSION);
         StorageCoding.writeLongLE(out, entryCount);
@@ -179,6 +185,7 @@ final class SSTWriter {
         writeKey(out, maxKey);
         StorageCoding.writeLongLE(out, minSequenceId);
         StorageCoding.writeLongLE(out, maxSequenceId);
+        StorageCoding.writeLongLE(out, oldestWriteAtMillis);
         StorageCoding.writeLongLE(out, createdAtMillis);
         StorageCoding.writeByte(out, hasTombstone ? 1 : 0);
         StorageCoding.writeByte(out, 0); // compressionType = NONE

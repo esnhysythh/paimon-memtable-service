@@ -1,11 +1,14 @@
 package org.qwh.pms.core.bucket;
 
-import java.util.Optional;
 import java.util.List;
+import java.util.Optional;
+import org.qwh.pms.core.bucket.operation.CompactionResult;
+import org.qwh.pms.core.bucket.operation.EvictionResult;
+import org.qwh.pms.core.bucket.operation.FlushResult;
+import org.qwh.pms.core.bucket.operation.FreezeResult;
+import org.qwh.pms.core.bucket.operation.SinkOperationResult;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Value;
-import org.qwh.pms.core.sink.SinkCommitResult;
-import org.qwh.pms.core.storage.SSTMeta;
 
 public interface PMSBucketDirector {
 
@@ -25,18 +28,15 @@ public interface PMSBucketDirector {
 
     List<Entry> prefixScan(byte[] prefix);
 
-    void freezeCurMemTable();
+    FreezeResult freezeCurMemTable();
 
-    void flushImmutableMemTable();
+    FlushResult flushImmutableMemTable();
 
-    Optional<SinkCommitResult> sinkToPaimon();
+    SinkOperationResult sinkToPaimon();
 
-    Optional<SSTMeta> evictOldestSinkedSST();
+    EvictionResult evictOldestSinkedSST();
 
-    void compactLocalSSTs();
-
-    // TODO: 待 Mem 缓存退化模块实现后补充以下方法
-    // void degradeMemCache();
+    CompactionResult compactLocalSSTs();
 
     BucketStateSnapshot stateSnapshot();
 

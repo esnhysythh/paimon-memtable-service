@@ -15,9 +15,9 @@ public record SSTMeta(
     Key maxKey,
     long minSequenceId,
     long maxSequenceId,
+    long oldestWriteAtMillis,
     long createdAtMillis,
-    SSTState state,
-    long refCount
+    SSTState state
 ) {
     public SSTMeta {
         if (runId <= 0) {
@@ -42,6 +42,9 @@ public record SSTMeta(
             if (minSequenceId <= 0 || maxSequenceId <= 0 || minSequenceId > maxSequenceId) {
                 throw new IllegalArgumentException("invalid sequence bounds");
             }
+            if (oldestWriteAtMillis <= 0) {
+                throw new IllegalArgumentException("oldestWriteAtMillis must be positive when entryCount > 0");
+            }
         }
         if (state == null) {
             state = SSTState.NEW;
@@ -60,9 +63,9 @@ public record SSTMeta(
             maxKey,
             minSequenceId,
             maxSequenceId,
+            oldestWriteAtMillis,
             createdAtMillis,
-            state,
-            refCount
+            state
         );
     }
 }

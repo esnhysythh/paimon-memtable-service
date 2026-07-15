@@ -14,8 +14,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 public class SkipListCurMemTable implements CurMemTable {
 
     private final MemTableConfig config;
-    // volatile: freeze() swaps the map reference, other threads must see the new map immediately
-    private volatile ConcurrentSkipListMap<Key, Value> map;
+    private final ConcurrentSkipListMap<Key, Value> map;
     // Not AtomicLong: estimatedSize is for flush threshold heuristics only, not precise accounting.
     // Concurrent updates may lose small deltas, but the 64B per-node overhead estimate already has
     // far larger error margin. Making it precise (e.g. AtomicLong) doesn't fix the real race
@@ -29,6 +28,8 @@ public class SkipListCurMemTable implements CurMemTable {
     private volatile int estimatedEntryCount;
     private volatile long minSequenceId;
     private volatile long maxSequenceId;
+    private volatile long oldestWriteAtMillis;
+    private volatile boolean frozen;
 
     public SkipListCurMemTable(MemTableConfig config) {
         this.config = config;
@@ -37,11 +38,23 @@ public class SkipListCurMemTable implements CurMemTable {
         this.estimatedEntryCount = 0;
         this.minSequenceId = 0;
         this.maxSequenceId = 0;
+        this.oldestWriteAtMillis = 0;
+        this.frozen = false;
     }
 
     @Override
     public void put(Key key, Value value) {
+        if (frozen) {
+            throw new IllegalStateException("frozen CurMemTable cannot accept writes");
+        }
+        // PMSBucketDirectorImpl serializes put/freeze with its write boundary lock. The
+        // volatile field keeps diagnostic reads visible without adding an AtomicLong or
+        // another lock to every write. Concurrent direct puts remain safe for map content;
+        // exact boundary metadata requires the documented director serialization.
         Value old = map.put(key, value);
+        if (oldestWriteAtMillis == 0) {
+            oldestWriteAtMillis = System.currentTimeMillis();
+        }
         updateEstimatedSize(key, value, old);
         updateSequenceBounds(value.sequenceId());
         if (old == null) {
@@ -56,23 +69,21 @@ public class SkipListCurMemTable implements CurMemTable {
 
     @Override
     public ImmutableMemTable freeze() {
-        // Capture current state, then swap in a fresh map — no data copied, only reference reassignment.
-        // The caller must serialize put/delete/freeze with the same write boundary lock
-        // (PMSBucketDirectorImpl.writeMutex). That guarantees the frozen map and its
-        // sequence bounds describe the same committed write set.
-        ConcurrentSkipListMap<Key, Value> oldMap = this.map;
-        long oldSize = this.estimatedSize;
-        int oldCount = this.estimatedEntryCount;
-        long oldMinSequenceId = this.minSequenceId;
-        long oldMaxSequenceId = this.maxSequenceId;
-
-        this.map = new ConcurrentSkipListMap<>();
-        this.estimatedSize = 0;
-        this.estimatedEntryCount = 0;
-        this.minSequenceId = 0;
-        this.maxSequenceId = 0;
-
-        return new SkipListImmutableMemTable(oldMap, oldSize, oldCount, oldMinSequenceId, oldMaxSequenceId);
+        // The director serializes put/freeze and publishes a newly allocated active table.
+        // Keep this backing map intact so a query holding the previous MemTableState can
+        // safely finish without taking the write boundary lock.
+        if (frozen) {
+            throw new IllegalStateException("CurMemTable is already frozen");
+        }
+        frozen = true;
+        return new SkipListImmutableMemTable(
+            map,
+            estimatedSize,
+            estimatedEntryCount,
+            minSequenceId,
+            maxSequenceId,
+            oldestWriteAtMillis
+        );
     }
 
     /**
@@ -101,6 +112,11 @@ public class SkipListCurMemTable implements CurMemTable {
     @Override
     public long maxSequenceId() {
         return maxSequenceId;
+    }
+
+    @Override
+    public long oldestWriteAtMillis() {
+        return oldestWriteAtMillis;
     }
 
     @Override

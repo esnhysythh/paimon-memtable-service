@@ -18,7 +18,7 @@ import java.util.List;
 import java.util.zip.CRC32;
 
 final class SSTMetaStore {
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
     private static final String SUFFIX = ".meta.json";
 
     private final Path dir;
@@ -70,9 +70,9 @@ final class SSTMetaStore {
             keyField(content, "maxKeyBase64"),
             readLongField(content, "minSequenceId"),
             readLongField(content, "maxSequenceId"),
+            readLongField(content, "oldestWriteAtMillis"),
             readLongField(content, "createdAtMillis"),
-            SSTState.valueOf(readStringField(content, "state")),
-            readLongField(content, "refCount")
+            SSTState.valueOf(readStringField(content, "state"))
         );
     }
 
@@ -126,8 +126,8 @@ final class SSTMetaStore {
         field(out, "maxKeyBase64", encodeKey(meta.maxKey()), true);
         field(out, "minSequenceId", meta.minSequenceId(), true);
         field(out, "maxSequenceId", meta.maxSequenceId(), true);
-        field(out, "createdAtMillis", meta.createdAtMillis(), true);
-        field(out, "refCount", meta.refCount(), false);
+        field(out, "oldestWriteAtMillis", meta.oldestWriteAtMillis(), true);
+        field(out, "createdAtMillis", meta.createdAtMillis(), false);
         out.append("}\n");
         return out.toString();
     }

@@ -37,11 +37,15 @@ class SkipListCurMemTableTest {
         return new Value(s.getBytes(), sequenceId);
     }
 
+    private void put(Key key, Value value) {
+        table.put(key, value);
+    }
+
     // ── put / get ──
 
     @Test
     void putAndGet() {
-        table.put(key("k1"), value("v1"));
+        put(key("k1"), value("v1"));
         Value result = table.get(key("k1"));
         assertNotNull(result);
         assertArrayEquals("v1".getBytes(), result.bytes());
@@ -54,8 +58,8 @@ class SkipListCurMemTableTest {
 
     @Test
     void putOverwritesExisting() {
-        table.put(key("k1"), value("v1"));
-        table.put(key("k1"), value("v2"));
+        put(key("k1"), value("v1"));
+        put(key("k1"), value("v2"));
         assertArrayEquals("v2".getBytes(), table.get(key("k1")).bytes());
     }
 
@@ -63,8 +67,8 @@ class SkipListCurMemTableTest {
 
     @Test
     void deleteSetsTombstone() {
-        table.put(key("k1"), value("v1"));
-        table.put(key("k1"), Value.tombstone(1));
+        put(key("k1"), value("v1"));
+        put(key("k1"), Value.tombstone(1));
         Value result = table.get(key("k1"));
         assertNotNull(result);
         assertTrue(result.isTombstone());
@@ -73,7 +77,7 @@ class SkipListCurMemTableTest {
 
     @Test
     void deleteOnNonExistentKeyCreatesTombstone() {
-        table.put(key("k1"), Value.tombstone(1));
+        put(key("k1"), Value.tombstone(1));
         Value result = table.get(key("k1"));
         assertNotNull(result);
         assertTrue(result.isTombstone());
@@ -81,9 +85,9 @@ class SkipListCurMemTableTest {
 
     @Test
     void putAfterDeleteOverwrites() {
-        table.put(key("k1"), value("v1"));
-        table.put(key("k1"), Value.tombstone(1));
-        table.put(key("k1"), value("v2"));
+        put(key("k1"), value("v1"));
+        put(key("k1"), Value.tombstone(1));
+        put(key("k1"), value("v2"));
         Value result = table.get(key("k1"));
         assertFalse(result.isTombstone());
         assertArrayEquals("v2".getBytes(), result.bytes());
@@ -94,24 +98,24 @@ class SkipListCurMemTableTest {
     @Test
     void entryCountTracksInsertions() {
         assertEquals(0, table.estimatedEntryCount());
-        table.put(key("k1"), value("v1"));
+        put(key("k1"), value("v1"));
         assertEquals(1, table.estimatedEntryCount());
-        table.put(key("k2"), value("v2"));
+        put(key("k2"), value("v2"));
         assertEquals(2, table.estimatedEntryCount());
     }
 
     @Test
     void entryCountUnchangedOnOverwrite() {
-        table.put(key("k1"), value("v1"));
+        put(key("k1"), value("v1"));
         assertEquals(1, table.estimatedEntryCount());
-        table.put(key("k1"), value("v2"));
+        put(key("k1"), value("v2"));
         assertEquals(1, table.estimatedEntryCount());
     }
 
     @Test
     void estimatedSizeGrowsWithPuts() {
         long size0 = table.estimatedSize();
-        table.put(key("k1"), value("v1"));
+        put(key("k1"), value("v1"));
         long size1 = table.estimatedSize();
         assertTrue(size1 > size0);
     }
@@ -119,9 +123,9 @@ class SkipListCurMemTableTest {
     // ── freeze ──
 
     @Test
-    void freezeReturnsImmutableAndResetsCurrent() {
-        table.put(key("k1"), value("v1"));
-        table.put(key("k2"), value("v2"));
+    void freezeReturnsImmutableAndSealsCurrent() {
+        put(key("k1"), value("v1"));
+        put(key("k2"), value("v2"));
 
         ImmutableMemTable frozen = table.freeze();
 
@@ -130,60 +134,58 @@ class SkipListCurMemTableTest {
         assertNotNull(frozen.get(key("k2")));
         assertEquals(2, frozen.estimatedEntryCount());
 
-        // Current should be empty
-        assertEquals(0, table.estimatedEntryCount());
-        assertNull(table.get(key("k1")));
+        // Queries holding the old active reference must keep seeing its data.
+        assertEquals(2, table.estimatedEntryCount());
+        assertNotNull(table.get(key("k1")));
+        assertThrows(IllegalStateException.class, () -> put(key("k3"), value("v3")));
     }
 
     @Test
     void tracksSequenceBoundsAndTransfersThemToImmutable() {
-        table.put(key("k1"), value("v1", 10));
-        table.put(key("k2"), value("v2", 12));
+        put(key("k1"), value("v1", 10));
+        put(key("k2"), value("v2", 12));
 
         assertEquals(10L, table.minSequenceId());
         assertEquals(12L, table.maxSequenceId());
+        long oldestWriteAtMillis = table.oldestWriteAtMillis();
+        assertTrue(oldestWriteAtMillis > 0);
 
         ImmutableMemTable frozen = table.freeze();
 
         assertEquals(10L, frozen.minSequenceId());
         assertEquals(12L, frozen.maxSequenceId());
-        assertEquals(0L, table.minSequenceId());
-        assertEquals(0L, table.maxSequenceId());
+        assertEquals(oldestWriteAtMillis, frozen.oldestWriteAtMillis());
+        assertEquals(10L, table.minSequenceId());
+        assertEquals(12L, table.maxSequenceId());
+        assertEquals(oldestWriteAtMillis, table.oldestWriteAtMillis());
     }
 
     @Test
-    void freezeThenWriteToCurrentDoesNotAffectFrozen() {
-        table.put(key("k1"), value("v1"));
+    void frozenCurrentRejectsFurtherWrites() {
+        put(key("k1"), value("v1"));
         ImmutableMemTable frozen = table.freeze();
 
-        table.put(key("k1"), value("v2"));
-        // Frozen should still have v1
+        assertThrows(IllegalStateException.class, () -> put(key("k1"), value("v2")));
         assertArrayEquals("v1".getBytes(), frozen.get(key("k1")).bytes());
     }
 
     @Test
-    void multipleFreezesProduceIndependentTables() {
-        table.put(key("k1"), value("v1"));
+    void frozenCurrentRejectsSecondFreeze() {
+        put(key("k1"), value("v1"));
         ImmutableMemTable frozen1 = table.freeze();
 
-        table.put(key("k2"), value("v2"));
-        ImmutableMemTable frozen2 = table.freeze();
-
         assertEquals(1, frozen1.estimatedEntryCount());
-        assertEquals(1, frozen2.estimatedEntryCount());
         assertNotNull(frozen1.get(key("k1")));
-        assertNull(frozen1.get(key("k2")));
-        assertNull(frozen2.get(key("k1")));
-        assertNotNull(frozen2.get(key("k2")));
+        assertThrows(IllegalStateException.class, table::freeze);
     }
 
     // ── iterator ──
 
     @Test
     void iteratorReturnsAllEntries() {
-        table.put(key("k1"), value("v1"));
-        table.put(key("k2"), value("v2"));
-        table.put(key("k3"), value("v3"));
+        put(key("k1"), value("v1"));
+        put(key("k2"), value("v2"));
+        put(key("k3"), value("v3"));
 
         List<Entry> entries = new ArrayList<>();
         table.iterator().forEachRemaining(entries::add);
@@ -193,9 +195,9 @@ class SkipListCurMemTableTest {
 
     @Test
     void iteratorReturnsEntriesInKeyOrder() {
-        table.put(key("k3"), value("v3"));
-        table.put(key("k1"), value("v1"));
-        table.put(key("k2"), value("v2"));
+        put(key("k3"), value("v3"));
+        put(key("k1"), value("v1"));
+        put(key("k2"), value("v2"));
 
         List<Entry> entries = new ArrayList<>();
         table.iterator().forEachRemaining(entries::add);
@@ -239,7 +241,7 @@ class SkipListCurMemTableTest {
             final int tid = t;
             threads.add(new Thread(() -> {
                 for (int i = 0; i < opsPerThread; i++) {
-                    table.put(new Key(("t" + tid + "-" + i).getBytes()), new Value(("v" + tid + "-" + i).getBytes()));
+                    put(new Key(("t" + tid + "-" + i).getBytes()), new Value(("v" + tid + "-" + i).getBytes()));
                 }
             }));
         }
@@ -262,7 +264,7 @@ class SkipListCurMemTableTest {
         // Pre-populate with stable data that readers will verify
         int preCount = 1000;
         for (int i = 0; i < preCount; i++) {
-            table.put(new Key(("key-" + i).getBytes()), new Value(("val-" + i).getBytes()));
+            put(new Key(("key-" + i).getBytes()), new Value(("val-" + i).getBytes()));
         }
 
         int writerCount = 4;
@@ -279,7 +281,7 @@ class SkipListCurMemTableTest {
             threads.add(new Thread(() -> {
                 try { barrier.await(); } catch (Exception e) { return; }
                 for (int i = 0; i < opsPerThread; i++) {
-                    table.put(new Key(("w-" + tid + "-" + i).getBytes()),
+                    put(new Key(("w-" + tid + "-" + i).getBytes()),
                               new Value(("wv-" + tid + "-" + i).getBytes()));
                 }
             }));

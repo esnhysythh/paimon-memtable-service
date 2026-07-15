@@ -8,8 +8,8 @@ import java.util.Iterator;
 import java.util.Optional;
 
 /**
- * 冻结后的只读 MemTable。不接受写入，支持查询和引用计数管理。
- * 引用计数用于控制内存释放时机：查询持有引用期间不会被退役。
+ * 冻结后的只读 MemTable。不接受写入。Flush 发布后由 SST 接管查询，
+ * ImmutableMemTable 随即退出查询路径，不承担长期 cache 职责。
  */
 public interface ImmutableMemTable {
 
@@ -27,9 +27,5 @@ public interface ImmutableMemTable {
 
     long maxSequenceId();
 
-    void incrementRef();
-
-    void decrementRef();
-
-    long refCount();
+    long oldestWriteAtMillis();
 }

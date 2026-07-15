@@ -3,18 +3,24 @@ package org.qwh.pms.core.bucket;
 import org.qwh.pms.core.config.MemTableConfig;
 import org.qwh.pms.core.config.PMSConfig;
 import org.qwh.pms.core.config.StorageConfig;
+import org.qwh.pms.core.bucket.operation.CompactionResult;
+import org.qwh.pms.core.bucket.operation.EvictionResult;
+import org.qwh.pms.core.bucket.operation.FlushResult;
+import org.qwh.pms.core.bucket.operation.FreezeResult;
+import org.qwh.pms.core.bucket.operation.OperationStatus;
+import org.qwh.pms.core.bucket.operation.SinkOperationResult;
 import org.qwh.pms.core.memtable.CurMemTable;
 import org.qwh.pms.core.memtable.ImmutableMemTable;
 import org.qwh.pms.core.memtable.SkipListCurMemTable;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
-import org.qwh.pms.core.sink.MockSinkManager;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkCoordinator;
 import org.qwh.pms.core.sink.SinkMetaStore;
 import org.qwh.pms.core.sink.SinkManager;
+import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkRecoveryState;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
 import org.qwh.pms.core.storage.SSTMeta;
@@ -55,30 +61,44 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private final FileLocalStorageManager storageManager;
     private final SinkMetaStore sinkMetaStore;
     private final SinkCoordinator sinkCoordinator;
-
-    private volatile CurMemTable curMemTable;
-    private volatile List<ImmutableMemTable> immutableMemTables = List.of();
-    private volatile List<SSTMeta> newSSTs = List.of();
-    private volatile List<SSTMeta> sinkedSSTs = List.of();
+    private volatile MemTableState memTables;
+    private volatile List<LocalRun> newRuns = List.of();
+    private volatile List<LocalRun> sinkedRuns = List.of();
+    private volatile SinkFlightSnapshot sinkFlight = SinkFlightSnapshot.idle();
+    private volatile long recoveredUnpersistedMaxSequenceId;
+    private volatile long lastFlushedSequenceId;
+    private volatile long lastPersistedSequenceId;
     private volatile long lastSinkedSnapshotId;
     private volatile RecoverySummary lastRecoverySummary = RecoverySummary.empty();
 
+    /*
+     * Nested lock order is flushMutex/sstMaintenanceMutex -> lifecycleLock -> writeMutex.
+     * writeQueueMutex is never held while performing WAL, storage, or sink work.
+     */
+    /**
+     * Operation lease: public operations hold the read side for their full duration, including
+     * slow I/O; close() takes the write side before closing WAL and local storage.
+     * This lock does not protect bucket data consistency.
+     */
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+    /**
+     * Serializes the WAL append -> MemTable apply -> freeze boundary and short MemTable/run
+     * publication updates. Queries and state snapshots never acquire this lock.
+     */
     private final Object writeMutex = new Object();
+    /** Serializes Flush selection and publication so one immutable cannot be flushed twice. */
+    private final Object flushMutex = new Object();
     private final Object writeQueueMutex = new Object();
     private final ArrayDeque<WriteBatchRequest> pendingWrites = new ArrayDeque<>();
+    /**
+     * V1 permits one SST maintenance operation at a time. A Sink may leave a durable prepared
+     * flight after failure; its logical flush fence then excludes the selected NEW prefix from
+     * later compaction until recovery completes.
+     */
     private final Object sstMaintenanceMutex = new Object();
     private boolean writeLeaderActive;
     private volatile boolean closed = false;
     private volatile RuntimeException fatalFailure;
-
-    public PMSBucketDirectorImpl(PMSConfig config) {
-        this(config, new MockSinkManager());
-    }
-
-    public PMSBucketDirectorImpl(PMSConfig config, SinkManager sinkManager) {
-        this(config, storageManager -> sinkManager);
-    }
 
     public PMSBucketDirectorImpl(PMSConfig config, Function<FileLocalStorageManager, SinkManager> sinkManagerFactory) {
         Objects.requireNonNull(config, "config must not be null");
@@ -93,7 +113,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             "sinkManagerFactory must not return null"
         );
         this.sinkCoordinator = new SinkCoordinator(sinkManager, sinkMetaStore);
-        this.curMemTable = new SkipListCurMemTable(memTableConfig);
+        this.memTables = new MemTableState(new SkipListCurMemTable(memTableConfig), List.of());
     }
 
     public void init() throws IOException {
@@ -102,10 +122,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         walManager.init();
         RecoveryState recoveryState = recoverFromWAL();
         SinkRecoveryState initialSink = sinkMetaStore.load();
+        validateSinglePendingPrepare(initialSink);
+        sinkFlight = sinkFlightFromRecovery(initialSink);
         SinkRecoveryState recoveredSink = recoverPreparedSinks(initialSink);
         storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds(), recoveredSink.lastPersistedSequenceId());
         walManager.truncate(recoveredSink.lastPersistedSequenceId());
-        refreshSSTLists();
+        sinkFlight = SinkFlightSnapshot.idle();
+        refreshRunLists();
+        lastFlushedSequenceId = recoveryState.lastFlushedSequenceId();
+        lastPersistedSequenceId = recoveredSink.lastPersistedSequenceId();
+        recoveredUnpersistedMaxSequenceId = Math.max(
+            recoveryState.maxRecoveredSequenceId(),
+            maxSequenceId(metas(newRuns))
+        );
         lastSinkedSnapshotId = recoveredSink.lastSinkedSnapshotId();
         lastRecoverySummary = new RecoverySummary(
             recoveryState.recoveredDataRecords(),
@@ -115,12 +144,12 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             recoveredSink.sinkedSSTIds().size() - initialSink.sinkedSSTIds().size(),
             recoveredSink.sinkedSSTIds().size(),
             lastSinkedSnapshotId,
-            newSSTs.size(),
-            sinkedSSTs.size(),
-            curMemTable.estimatedEntryCount()
+            newRuns.size(),
+            sinkedRuns.size(),
+            memTables.current().estimatedEntryCount()
         );
         LOG.info("PMS recovery summary: {}", lastRecoverySummary);
-        LOG.info("PMSBucketDirector initialized, curMemTable entries={}", curMemTable.estimatedEntryCount());
+        LOG.info("PMSBucketDirector initialized, curMemTable entries={}", memTables.current().estimatedEntryCount());
     }
 
     private RecoveryState recoverFromWAL() {
@@ -133,18 +162,24 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             Value value = record.value != null
                 ? new Value(record.value, record.sequenceId)
                 : Value.tombstone(record.sequenceId);
-            curMemTable.put(key, value);
+            memTables.current().put(key, value);
         }
+        long maxRecoveredSequenceId = cb.dataRecords.stream()
+            .mapToLong(record -> record.sequenceId)
+            .max()
+            .orElse(0);
         LOG.info(
-            "Recovered {} data records from WAL, skippedFlushedRecords={}, lastFlushedSequenceId={}",
+            "Recovered {} data records from WAL, skippedFlushedRecords={}, lastFlushedSequenceId={}, maxRecoveredSequenceId={}",
             cb.dataRecords.size(),
             cb.skippedFlushedRecords,
-            lastFlushedSequenceId
+            lastFlushedSequenceId,
+            maxRecoveredSequenceId
         );
         return new RecoveryState(
             cb.dataRecords.size(),
             cb.skippedFlushedRecords,
-            lastFlushedSequenceId
+            lastFlushedSequenceId,
+            maxRecoveredSequenceId
         );
     }
 
@@ -219,13 +254,13 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         try {
             ensureNotClosed();
             Key k = new Key(key);
-
-            Value v = curMemTable.get(k);
+            MemTableState memView = memTables;
+            Value v = memView.current().get(k);
             if (v != null) {
                 return Optional.of(v);
             }
 
-            List<ImmutableMemTable> immutables = immutableMemTables;
+            List<ImmutableMemTable> immutables = memView.immutables();
             for (int i = immutables.size() - 1; i >= 0; i--) {
                 v = immutables.get(i).get(k);
                 if (v != null) {
@@ -233,14 +268,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 }
             }
 
-            try (SSTReadSnapshot newSSTSnapshot = acquireNewSSTSnapshot()) {
-                Optional<Value> newSSTValue = lookupSSTs(newSSTSnapshot, k);
-                if (newSSTValue.isPresent()) {
-                    return newSSTValue;
-                }
-            }
-            try (SSTReadSnapshot sinkedSSTSnapshot = acquireSinkedSSTSnapshot()) {
-                return lookupSSTs(sinkedSSTSnapshot, k);
+            // Storage captures its visible meta view and enters the read epoch atomically.
+            // A Flush publishes the SST before removing its immutable source, so the query
+            // always observes at least one side of that handoff.
+            try (SSTReadSnapshot snapshot = storageManager.readVisibleSnapshot()) {
+                return lookupSSTs(snapshot, k);
             }
         } finally {
             lifecycleLock.readLock().unlock();
@@ -260,17 +292,23 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 return List.of();
             }
 
-            TreeMap<Key, Value> latest = new TreeMap<>();
-            collectLatest(latest, curMemTable.iterator(start, end));
+            // The immutable MemTableState keeps the old active object alive across Freeze.
+            // Iteration remains weakly consistent with later writes; V1 does not promise an
+            // MVCC or batch-atomic scan.
+            MemTableState memView = memTables;
+            Iterator<Entry> curIterator = memView.current().iterator(start, end);
+            List<Iterator<Entry>> immutableIterators = memView.immutables().stream()
+                .map(immutable -> immutable.iterator(start, end))
+                .toList();
 
-            List<ImmutableMemTable> immutables = immutableMemTables;
-            for (ImmutableMemTable immutable : immutables) {
-                collectLatest(latest, immutable.iterator(start, end));
+            TreeMap<Key, Value> latest = new TreeMap<>();
+            collectLatest(latest, curIterator);
+            for (Iterator<Entry> immutableIterator : immutableIterators) {
+                collectLatest(latest, immutableIterator);
             }
 
-            try (SSTSnapshotPair snapshots = acquireSSTSnapshotPair()) {
-                collectLatestFromSSTs(latest, snapshots.newSSTs(), start, end);
-                collectLatestFromSSTs(latest, snapshots.sinkedSSTs(), start, end);
+            try (SSTReadSnapshot snapshot = storageManager.readVisibleSnapshot()) {
+                collectLatestFromSSTs(latest, snapshot, start, end);
             }
 
             List<Entry> result = new ArrayList<>();
@@ -292,12 +330,12 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public void freezeCurMemTable() {
+    public FreezeResult freezeCurMemTable() {
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
             synchronized (writeMutex) {
-                doFreezeLocked();
+                return doFreezeLocked();
             }
         } finally {
             lifecycleLock.readLock().unlock();
@@ -305,114 +343,169 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public void flushImmutableMemTable() {
-        ImmutableMemTable toFlush;
-        lifecycleLock.readLock().lock();
-        try {
-            ensureNotClosed();
-            synchronized (writeMutex) {
-                if (immutableMemTables.isEmpty()) {
-                    return;
-                }
-                toFlush = immutableMemTables.get(0);
-            }
-        } finally {
-            lifecycleLock.readLock().unlock();
-        }
-
-        SSTMeta meta = storageManager.flushToSST(toFlush);
-        storageManager.persistFlushedSequenceId(meta.maxSequenceId());
-
-        lifecycleLock.readLock().lock();
-        try {
-            ensureNotClosed();
-            synchronized (writeMutex) {
-                List<ImmutableMemTable> immutableList = new ArrayList<>(immutableMemTables);
-                immutableList.remove(toFlush);
-                immutableMemTables = List.copyOf(immutableList);
-
-                List<SSTMeta> sstList = new ArrayList<>(newSSTs);
-                sstList.add(meta);
-                newSSTs = List.copyOf(sstList);
-                LOG.debug("Flush: immutable count={}, newSST count={}", immutableList.size(), sstList.size());
-            }
-        } finally {
-            lifecycleLock.readLock().unlock();
-        }
-    }
-
-    @Override
-    public Optional<SinkCommitResult> sinkToPaimon() {
-        synchronized (sstMaintenanceMutex) {
-            List<SSTMeta> toSink;
+    public FlushResult flushImmutableMemTable() {
+        synchronized (flushMutex) {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
+                ImmutableMemTable toFlush;
                 synchronized (writeMutex) {
-                    if (newSSTs.isEmpty()) {
-                        return Optional.empty();
+                    if (memTables.immutables().isEmpty()) {
+                        return FlushResult.noop();
                     }
-                    toSink = List.copyOf(newSSTs);
+                    toFlush = memTables.immutables().get(0);
+                }
+
+                // Keep the lifecycle lease across I/O. close() must not close storage while an
+                // operation selected under the lease is still using it.
+                SSTMeta meta = storageManager.flushToSST(toFlush);
+                storageManager.persistFlushedSequenceId(meta.maxSequenceId());
+
+                synchronized (writeMutex) {
+                    MemTableState currentState = memTables;
+                    List<ImmutableMemTable> immutableList = new ArrayList<>(currentState.immutables());
+                    if (!immutableList.remove(toFlush)) {
+                        throw new IllegalStateException("selected immutable MemTable is no longer visible");
+                    }
+                    memTables = new MemTableState(currentState.current(), immutableList);
+                    lastFlushedSequenceId = Math.max(lastFlushedSequenceId, meta.maxSequenceId());
+
+                    List<LocalRun> runList = new ArrayList<>(newRuns);
+                    // A concurrent maintenance refresh may already have observed the durable SST
+                    // after flushToSST() but before this in-memory publication point.
+                    Optional<LocalRun> alreadyPublished = runList.stream()
+                        .filter(run -> run.runId() == meta.runId())
+                        .findFirst();
+                    LocalRun output = alreadyPublished.orElseGet(() -> new LocalRun(meta));
+                    if (alreadyPublished.isEmpty()) {
+                        runList.add(output);
+                    }
+                    newRuns = List.copyOf(runList);
+                    LOG.debug("Flush: immutable count={}, newSST count={}", immutableList.size(), runList.size());
+                    return new FlushResult(
+                        OperationStatus.PROGRESSED,
+                        Optional.of(output.snapshot(nowMillis()))
+                    );
                 }
             } finally {
                 lifecycleLock.readLock().unlock();
             }
+        }
+    }
 
-            SinkBatch batch = new SinkBatch(nextBatchId(toSink), toSink, minSequenceId(toSink), maxSequenceId(toSink));
-            SinkCommitResult result = sinkCoordinator.sink(batch);
-            storageManager.markSinked(toSink);
-            walManager.truncate(result.persistedSequenceId());
-
+    @Override
+    public SinkOperationResult sinkToPaimon() {
+        synchronized (sstMaintenanceMutex) {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
+                List<LocalRun> toSink;
+                synchronized (writeMutex) {
+                    if (sinkFlight.active()) {
+                        throw new IllegalStateException(
+                            "cannot start a new Sink while another Sink is " + sinkFlight.status()
+                        );
+                    }
+                    if (newRuns.isEmpty()) {
+                        return SinkOperationResult.noop();
+                    }
+                    toSink = List.copyOf(newRuns);
+                    validateContinuousRuns(toSink);
+                    List<SSTMeta> selected = metas(toSink);
+                    sinkFlight = new SinkFlightSnapshot(
+                        SinkFlightSnapshot.Status.IN_FLIGHT,
+                        nextBatchId(selected),
+                        maxFlushId(selected),
+                        minSequenceId(selected),
+                        maxSequenceId(selected)
+                    );
+                }
+                List<SSTMeta> toSinkMetas = metas(toSink);
+                SinkBatch batch = new SinkBatch(
+                    sinkFlight.batchId(),
+                    toSinkMetas,
+                    minSequenceId(toSinkMetas),
+                    maxSequenceId(toSinkMetas)
+                );
+                SinkCommitResult result;
+                try {
+                    result = sinkCoordinator.sink(batch);
+                } catch (RuntimeException e) {
+                    refreshSinkFlightAfterFailureUnderLease();
+                    throw e;
+                }
+                storageManager.markSinked(toSinkMetas);
+                walManager.truncate(result.persistedSequenceId());
+
                 synchronized (writeMutex) {
                     Set<Long> sinkedIds = new HashSet<>(result.sstIds());
-                    newSSTs = newSSTs.stream()
-                        .filter(meta -> !sinkedIds.contains(meta.runId()))
-                        .toList();
-                    sinkedSSTs = storageManager.metas(SSTState.SINKED);
+                    refreshRunLists();
+                    lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
                     lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
-                    LOG.debug("Sink: newSST count={}, sinkedSST count={}", newSSTs.size(), sinkedSSTs.size());
+                    sinkFlight = SinkFlightSnapshot.idle();
+                    List<LocalRunSnapshot> sinked = sinkedRuns.stream()
+                        .filter(run -> sinkedIds.contains(run.runId()))
+                        .map(run -> run.snapshot(nowMillis()))
+                        .toList();
+                    LOG.debug("Sink: newSST count={}, sinkedSST count={}", newRuns.size(), sinkedRuns.size());
+                    return new SinkOperationResult(
+                        OperationStatus.PROGRESSED,
+                        Optional.of(result),
+                        sinked
+                    );
                 }
             } finally {
                 lifecycleLock.readLock().unlock();
             }
-            return Optional.of(result);
         }
     }
 
     @Override
-    public Optional<SSTMeta> evictOldestSinkedSST() {
+    public EvictionResult evictOldestSinkedSST() {
         synchronized (sstMaintenanceMutex) {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
                 synchronized (writeMutex) {
-                    if (sinkedSSTs.size() > storageConfig.sinkedMaxCount()) {
-                        Optional<SSTMeta> compacted = compactOneGroupLocked(SSTState.SINKED);
-                        if (compacted.isPresent() && sinkedSSTs.size() <= storageConfig.sinkedMaxCount()) {
+                    CompactionResult compaction = CompactionResult.noop();
+                    if (sinkedRuns.size() > storageConfig.sinkedMaxCount()) {
+                        Optional<CompactionResult.Group> compacted = compactOneGroupLocked(SSTState.SINKED);
+                        if (compacted.isPresent()) {
+                            compaction = new CompactionResult(OperationStatus.PROGRESSED, List.of(compacted.get()));
+                        }
+                        if (compacted.isPresent() && sinkedRuns.size() <= storageConfig.sinkedMaxCount()) {
                             LOG.debug(
                                 "Skip sinked SST eviction after compaction: compactedRun={}, remainingSinkedSSTCount={}",
-                                compacted.get().runId(),
-                                sinkedSSTs.size()
+                                compacted.get().outputRun().runId(),
+                                sinkedRuns.size()
                             );
-                            return Optional.empty();
+                            return new EvictionResult(
+                                OperationStatus.PROGRESSED,
+                                compaction,
+                                Optional.empty()
+                            );
                         }
                     }
                     Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
                     if (evicted.isPresent()) {
                         long evictedRunId = evicted.get().runId();
-                        sinkedSSTs = sinkedSSTs.stream()
-                            .filter(meta -> meta.runId() != evictedRunId)
+                        sinkedRuns = sinkedRuns.stream()
+                            .filter(run -> run.runId() != evictedRunId)
                             .toList();
                         LOG.debug(
                             "Evicted sinked SST: runId={}, remainingSinkedSSTCount={}",
                             evictedRunId,
-                            sinkedSSTs.size()
+                            sinkedRuns.size()
+                        );
+                        return new EvictionResult(
+                            OperationStatus.PROGRESSED,
+                            compaction,
+                            Optional.of(new LocalRun(evicted.get()).snapshot(nowMillis()))
                         );
                     }
-                    return evicted;
+                    return compaction.progressed()
+                        ? new EvictionResult(OperationStatus.PROGRESSED, compaction, Optional.empty())
+                        : EvictionResult.noop();
                 }
             } finally {
                 lifecycleLock.readLock().unlock();
@@ -421,14 +514,18 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public void compactLocalSSTs() {
+    public CompactionResult compactLocalSSTs() {
         synchronized (sstMaintenanceMutex) {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
                 synchronized (writeMutex) {
-                    compactOneGroupLocked(SSTState.NEW);
-                    compactOneGroupLocked(SSTState.SINKED);
+                    List<CompactionResult.Group> groups = new ArrayList<>();
+                    compactOneGroupLocked(SSTState.NEW).ifPresent(groups::add);
+                    compactOneGroupLocked(SSTState.SINKED).ifPresent(groups::add);
+                    return groups.isEmpty()
+                        ? CompactionResult.noop()
+                        : new CompactionResult(OperationStatus.PROGRESSED, groups);
                 }
             } finally {
                 lifecycleLock.readLock().unlock();
@@ -441,36 +538,63 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         lifecycleLock.readLock().lock();
         try {
             ensureNotClosed();
-            CurMemTable cur = curMemTable;
-            List<ImmutableMemTable> immutables = immutableMemTables;
-            List<SSTMeta> newSsts = newSSTs;
-            List<SSTMeta> sinkedSsts = sinkedSSTs;
+            long nowMillis = nowMillis();
+            MemTableState memView = memTables;
+            CurMemTable cur = memView.current();
+            List<ImmutableMemTable> immutables = memView.immutables();
+            List<LocalRun> visibleRuns = localRuns(storageManager.metas());
+            List<LocalRun> newRunSnapshot = visibleRuns.stream()
+                .filter(run -> run.meta().state() == SSTState.NEW)
+                .toList();
+            List<LocalRun> sinkedRunSnapshot = visibleRuns.stream()
+                .filter(run -> run.meta().state() == SSTState.SINKED)
+                .toList();
+            SinkFlightSnapshot sinkFlightView = sinkFlight;
 
+            // MemTable metrics may include or exclude a truly concurrent write. Structural
+            // Freeze/Flush transitions are observed through immutable MemTableState and the
+            // storage-owned meta view, so snapshot construction never blocks write/query paths.
             SequenceStats immutableStats = sequenceStats(immutables);
-            SSTStats newStats = sstStats(newSsts);
-            SSTStats sinkedStats = sstStats(sinkedSsts);
+            RunStats newStats = runStats(newRunSnapshot);
+            RunStats sinkedStats = runStats(sinkedRunSnapshot);
+            List<LocalRunSnapshot> localRuns = visibleRuns.stream()
+                .map(run -> run.snapshot(nowMillis))
+                .toList();
 
             return new BucketStateSnapshot(
+                nowMillis,
                 cur.estimatedEntryCount(),
                 cur.estimatedSize(),
-                immutables.size(),
-                immutableStats.totalBytes(),
-                walManager.lastSequenceId(),
                 cur.minSequenceId(),
                 cur.maxSequenceId(),
+                cur.oldestWriteAtMillis(),
+                ageMillis(nowMillis, cur.oldestWriteAtMillis()),
+                immutables.size(),
+                immutableStats.totalBytes(),
                 immutableStats.minSequenceId(),
                 immutableStats.maxSequenceId(),
-                storageManager.lastFlushedSequenceId(),
-                newSsts.size(),
+                immutableStats.oldestWriteAtMillis(),
+                ageMillis(nowMillis, immutableStats.oldestWriteAtMillis()),
+                walManager.lastSequenceId(),
+                lastFlushedSequenceId,
+                lastPersistedSequenceId,
+                newRunSnapshot.size(),
                 newStats.totalBytes(),
                 newStats.totalRows(),
                 newStats.minSequenceId(),
                 newStats.maxSequenceId(),
-                sinkedSsts.size(),
+                newStats.oldestWriteAtMillis(),
+                ageMillis(nowMillis, newStats.oldestWriteAtMillis()),
+                sinkedRunSnapshot.size(),
                 sinkedStats.totalBytes(),
                 sinkedStats.totalRows(),
-                0,
-                0L,
+                sinkedStats.minSequenceId(),
+                sinkedStats.maxSequenceId(),
+                sinkedStats.oldestWriteAtMillis(),
+                ageMillis(nowMillis, sinkedStats.oldestWriteAtMillis()),
+                localRuns,
+                sinkFlightView,
+                recoveredUnpersistedMaxSequenceId > lastPersistedSequenceId,
                 lastSinkedSnapshotId
             );
         } finally {
@@ -573,7 +697,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                         Value value = op.value() != null
                             ? new Value(op.value(), sequenceId)
                             : Value.tombstone(sequenceId);
-                        curMemTable.put(new Key(op.key()), value);
+                        memTables.current().put(new Key(op.key()), value);
                     }
                 }
                 maybeFreezeLocked();
@@ -621,35 +745,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
-    private SSTReadSnapshot acquireNewSSTSnapshot() {
-        synchronized (writeMutex) {
-            return storageManager.readSnapshot(newSSTs);
-        }
-    }
-
-    private SSTReadSnapshot acquireSinkedSSTSnapshot() {
-        synchronized (writeMutex) {
-            return storageManager.readSnapshot(sinkedSSTs);
-        }
-    }
-
-    private SSTSnapshotPair acquireSSTSnapshotPair() {
-        synchronized (writeMutex) {
-            SSTReadSnapshot newSnapshot = storageManager.readSnapshot(newSSTs);
-            try {
-                SSTReadSnapshot sinkedSnapshot = storageManager.readSnapshot(sinkedSSTs);
-                return new SSTSnapshotPair(newSnapshot, sinkedSnapshot);
-            } catch (RuntimeException e) {
-                try {
-                    newSnapshot.close();
-                } catch (RuntimeException closeFailure) {
-                    e.addSuppressed(closeFailure);
-                }
-                throw e;
-            }
-        }
-    }
-
     private static void collectLatest(TreeMap<Key, Value> latest, Iterator<Entry> iterator) {
         while (iterator.hasNext()) {
             Entry entry = iterator.next();
@@ -679,19 +774,49 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return Optional.of(value.bytes());
     }
 
-    private void refreshSSTLists() {
-        newSSTs = storageManager.metas(SSTState.NEW);
-        sinkedSSTs = storageManager.metas(SSTState.SINKED);
+    private void refreshRunLists() {
+        newRuns = localRuns(storageManager.metas(SSTState.NEW));
+        sinkedRuns = localRuns(storageManager.metas(SSTState.SINKED));
     }
 
-    private Optional<SSTMeta> compactOneGroupLocked(SSTState state) {
-        List<SSTMeta> source = state == SSTState.NEW ? newSSTs : sinkedSSTs;
-        Optional<List<SSTMeta>> group = selectCompactionGroup(source);
+    /** Caller must hold a lifecycle read lease. */
+    private void refreshSinkFlightAfterFailureUnderLease() {
+        SinkRecoveryState recovery = sinkMetaStore.load();
+        validateSinglePendingPrepare(recovery);
+        sinkFlight = sinkFlightFromRecovery(recovery);
+    }
+
+    private static List<LocalRun> localRuns(List<SSTMeta> metas) {
+        return metas.stream()
+            .map(LocalRun::new)
+            .toList();
+    }
+
+    private static List<SSTMeta> metas(List<LocalRun> runs) {
+        return runs.stream().map(LocalRun::meta).toList();
+    }
+
+    private static long nowMillis() {
+        return System.currentTimeMillis();
+    }
+
+    private static long ageMillis(long nowMillis, long oldestWriteAtMillis) {
+        return oldestWriteAtMillis <= 0 ? 0 : Math.max(0, nowMillis - oldestWriteAtMillis);
+    }
+
+    private Optional<CompactionResult.Group> compactOneGroupLocked(SSTState state) {
+        List<LocalRun> source = state == SSTState.NEW ? newRuns : sinkedRuns;
+        Optional<List<LocalRun>> group = selectCompactionGroup(state, source);
         if (group.isEmpty()) {
             return Optional.empty();
         }
-        SSTMeta compacted = storageManager.compactSSTs(group.get());
-        refreshSSTLists();
+        List<Long> inputRunIds = group.get().stream().map(LocalRun::runId).toList();
+        SSTMeta compacted = storageManager.compactSSTs(metas(group.get()));
+        refreshRunLists();
+        LocalRun output = (state == SSTState.NEW ? newRuns : sinkedRuns).stream()
+            .filter(run -> run.runId() == compacted.runId())
+            .findFirst()
+            .orElseThrow(() -> new IllegalStateException("compaction output run is not visible"));
         LOG.debug(
             "Compacted local SSTs: state={}, inputCount={}, outputRunId={}, flushRange=[{},{}]",
             state,
@@ -700,18 +825,38 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             compacted.minFlushId(),
             compacted.maxFlushId()
         );
-        return Optional.of(compacted);
+        return Optional.of(new CompactionResult.Group(
+            state,
+            inputRunIds,
+            output.snapshot(nowMillis())
+        ));
     }
 
-    private Optional<List<SSTMeta>> selectCompactionGroup(List<SSTMeta> ssts) {
-        if (ssts.size() < storageConfig.compactMinFiles()) {
+    private Optional<List<LocalRun>> selectCompactionGroup(SSTState state, List<LocalRun> runs) {
+        if (runs.size() < storageConfig.compactMinFiles()) {
             return Optional.empty();
         }
+        long sinkFenceFlushId = state == SSTState.NEW && sinkFlight.active()
+            ? sinkFlight.sinkFenceFlushId()
+            : 0;
         long maxGroupBytes = storageConfig.compactThresholdMb() * 1024L * 1024L;
-        List<SSTMeta> group = new ArrayList<>();
+        List<LocalRun> group = new ArrayList<>();
         long groupBytes = 0;
         long previousMaxFlushId = -1;
-        for (SSTMeta sst : ssts) {
+        for (LocalRun run : runs) {
+            SSTMeta sst = run.meta();
+            if (sinkFenceFlushId > 0) {
+                if (sst.minFlushId() <= sinkFenceFlushId && sst.maxFlushId() > sinkFenceFlushId) {
+                    throw new IllegalStateException(
+                        "NEW run crosses active Sink fence: run=" + sst.runId()
+                            + ", range=[" + sst.minFlushId() + "," + sst.maxFlushId() + "]"
+                            + ", fence=" + sinkFenceFlushId
+                    );
+                }
+                if (sst.maxFlushId() <= sinkFenceFlushId) {
+                    continue;
+                }
+            }
             boolean continuous = group.isEmpty() || previousMaxFlushId + 1 == sst.minFlushId();
             boolean fits = sst.fileSize() <= maxGroupBytes && groupBytes + sst.fileSize() <= maxGroupBytes;
             if (!continuous || !fits) {
@@ -723,7 +868,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 previousMaxFlushId = -1;
             }
             if (sst.fileSize() <= maxGroupBytes) {
-                group.add(sst);
+                group.add(run);
                 groupBytes += sst.fileSize();
                 previousMaxFlushId = sst.maxFlushId();
             }
@@ -734,20 +879,34 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     private void maybeFreezeLocked() {
-        if (curMemTable.shouldFreeze()) {
+        if (memTables.current().shouldFreeze()) {
             doFreezeLocked();
         }
     }
 
-    private void doFreezeLocked() {
-        if (curMemTable.estimatedEntryCount() == 0) {
-            return;
+    /** Caller must hold writeMutex so the WAL fence and MemTable publication are one boundary. */
+    private FreezeResult doFreezeLocked() {
+        long fenceSequenceId = walManager.lastSequenceId();
+        MemTableState currentState = memTables;
+        CurMemTable current = currentState.current();
+        if (current.estimatedEntryCount() == 0) {
+            return FreezeResult.noop(fenceSequenceId);
         }
-        ImmutableMemTable frozen = curMemTable.freeze();
-        List<ImmutableMemTable> newList = new ArrayList<>(immutableMemTables);
+        CurMemTable replacement = new SkipListCurMemTable(memTableConfig);
+        ImmutableMemTable frozen = current.freeze();
+        List<ImmutableMemTable> newList = new ArrayList<>(currentState.immutables());
         newList.add(frozen);
-        immutableMemTables = List.copyOf(newList);
+        memTables = new MemTableState(replacement, newList);
         LOG.debug("Freeze: immutable count={}", newList.size());
+        return new FreezeResult(
+            OperationStatus.PROGRESSED,
+            fenceSequenceId,
+            frozen.minSequenceId(),
+            frozen.maxSequenceId(),
+            frozen.oldestWriteAtMillis(),
+            frozen.estimatedEntryCount(),
+            frozen.estimatedSize()
+        );
     }
 
     private void ensureNotClosed() {
@@ -769,34 +928,95 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return ssts.stream().mapToLong(SSTMeta::maxSequenceId).max().orElse(0);
     }
 
+    private static long maxFlushId(List<SSTMeta> ssts) {
+        return ssts.stream().mapToLong(SSTMeta::maxFlushId).max().orElse(0);
+    }
+
+    private static void validateContinuousRuns(List<LocalRun> runs) {
+        long previousMaxFlushId = -1;
+        for (LocalRun run : runs) {
+            SSTMeta meta = run.meta();
+            if (previousMaxFlushId >= 0 && previousMaxFlushId + 1 != meta.minFlushId()) {
+                throw new IllegalStateException(
+                    "Sink requires a continuous NEW prefix: previousMaxFlushId=" + previousMaxFlushId
+                        + ", nextRange=[" + meta.minFlushId() + "," + meta.maxFlushId() + "]"
+                );
+            }
+            previousMaxFlushId = meta.maxFlushId();
+        }
+    }
+
+    private static void validateSinglePendingPrepare(SinkRecoveryState recovery) {
+        if (recovery.pendingPrepares().size() > 1) {
+            throw new IllegalStateException(
+                "V1 supports at most one pending prepared Sink, found " + recovery.pendingPrepares().size()
+            );
+        }
+    }
+
+    private SinkFlightSnapshot sinkFlightFromRecovery(SinkRecoveryState recovery) {
+        if (recovery.pendingPrepares().isEmpty()) {
+            return SinkFlightSnapshot.idle();
+        }
+        PreparedSinkCommit prepared = recovery.pendingPrepares().get(0);
+        Set<Long> selectedIds = Set.copyOf(prepared.sstIds());
+        List<SSTMeta> selected = storageManager.metas().stream()
+            .filter(meta -> selectedIds.contains(meta.runId()))
+            .toList();
+        if (selected.size() != selectedIds.size()) {
+            throw new IllegalStateException(
+                "pending prepared Sink references missing or replaced local runs: batch=" + prepared.batchId()
+            );
+        }
+        validateContinuousRuns(localRuns(selected));
+        return new SinkFlightSnapshot(
+            SinkFlightSnapshot.Status.PREPARED_RETRY,
+            prepared.batchId(),
+            maxFlushId(selected),
+            prepared.minSequenceId(),
+            prepared.maxSequenceId()
+        );
+    }
+
     private static SequenceStats sequenceStats(List<ImmutableMemTable> immutables) {
         long totalBytes = 0;
         long minSequenceId = 0;
         long maxSequenceId = 0;
+        long oldestWriteAtMillis = 0;
         for (ImmutableMemTable im : immutables) {
             totalBytes += im.estimatedSize();
             if (im.minSequenceId() > 0 && (minSequenceId == 0 || im.minSequenceId() < minSequenceId)) {
                 minSequenceId = im.minSequenceId();
             }
             maxSequenceId = Math.max(maxSequenceId, im.maxSequenceId());
+            if (im.oldestWriteAtMillis() > 0
+                    && (oldestWriteAtMillis == 0 || im.oldestWriteAtMillis() < oldestWriteAtMillis)) {
+                oldestWriteAtMillis = im.oldestWriteAtMillis();
+            }
         }
-        return new SequenceStats(totalBytes, minSequenceId, maxSequenceId);
+        return new SequenceStats(totalBytes, minSequenceId, maxSequenceId, oldestWriteAtMillis);
     }
 
-    private static SSTStats sstStats(List<SSTMeta> ssts) {
+    private static RunStats runStats(List<LocalRun> runs) {
         long totalBytes = 0;
         long totalRows = 0;
         long minSequenceId = 0;
         long maxSequenceId = 0;
-        for (SSTMeta sst : ssts) {
+        long oldestWriteAtMillis = 0;
+        for (LocalRun run : runs) {
+            SSTMeta sst = run.meta();
             totalBytes += sst.fileSize();
             totalRows += sst.entryCount();
             if (sst.minSequenceId() > 0 && (minSequenceId == 0 || sst.minSequenceId() < minSequenceId)) {
                 minSequenceId = sst.minSequenceId();
             }
             maxSequenceId = Math.max(maxSequenceId, sst.maxSequenceId());
+            if (run.oldestWriteAtMillis() > 0
+                    && (oldestWriteAtMillis == 0 || run.oldestWriteAtMillis() < oldestWriteAtMillis)) {
+                oldestWriteAtMillis = run.oldestWriteAtMillis();
+            }
         }
-        return new SSTStats(totalBytes, totalRows, minSequenceId, maxSequenceId);
+        return new RunStats(totalBytes, totalRows, minSequenceId, maxSequenceId, oldestWriteAtMillis);
     }
 
     private static final class WriteBatchRequest {
@@ -887,35 +1107,30 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private record RecoveryState(
         long recoveredDataRecords,
         long skippedFlushedRecords,
-        long lastFlushedSequenceId
+        long lastFlushedSequenceId,
+        long maxRecoveredSequenceId
     ) {}
 
-    private record SequenceStats(long totalBytes, long minSequenceId, long maxSequenceId) {}
+    private record SequenceStats(
+        long totalBytes,
+        long minSequenceId,
+        long maxSequenceId,
+        long oldestWriteAtMillis
+    ) {}
 
-    private record SSTStats(long totalBytes, long totalRows, long minSequenceId, long maxSequenceId) {}
+    private record RunStats(
+        long totalBytes,
+        long totalRows,
+        long minSequenceId,
+        long maxSequenceId,
+        long oldestWriteAtMillis
+    ) {}
 
-    private record SSTSnapshotPair(SSTReadSnapshot newSSTs, SSTReadSnapshot sinkedSSTs) implements AutoCloseable {
-
-        @Override
-        public void close() {
-            RuntimeException failure = null;
-            try {
-                newSSTs.close();
-            } catch (RuntimeException e) {
-                failure = e;
-            }
-            try {
-                sinkedSSTs.close();
-            } catch (RuntimeException e) {
-                if (failure == null) {
-                    failure = e;
-                } else {
-                    failure.addSuppressed(e);
-                }
-            }
-            if (failure != null) {
-                throw failure;
-            }
+    private record MemTableState(CurMemTable current, List<ImmutableMemTable> immutables) {
+        private MemTableState {
+            Objects.requireNonNull(current, "current must not be null");
+            Objects.requireNonNull(immutables, "immutables must not be null");
+            immutables = List.copyOf(immutables);
         }
     }
 }
