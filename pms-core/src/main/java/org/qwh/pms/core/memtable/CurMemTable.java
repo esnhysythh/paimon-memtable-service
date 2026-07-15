@@ -19,7 +19,8 @@ public interface CurMemTable {
 
     /**
      * 冻结当前 MemTable，返回一个只读的 ImmutableMemTable。
-     * 调用后当前实例内部切换为空的 Map，可继续接受新写入。
+     * 调用后当前实例被封存，不再接受新写入；调用方必须创建并发布新的
+     * CurMemTable。冻结实例继续保留原数据，确保并发查询持有的旧引用有效。
      * schemaId 校验由上层 BucketDirector 处理，不在此接口传递。
      */
     ImmutableMemTable freeze();
@@ -31,6 +32,8 @@ public interface CurMemTable {
     long minSequenceId();
 
     long maxSequenceId();
+
+    long oldestWriteAtMillis();
 
     /**
      * Check whether this MemTable has reached its capacity threshold

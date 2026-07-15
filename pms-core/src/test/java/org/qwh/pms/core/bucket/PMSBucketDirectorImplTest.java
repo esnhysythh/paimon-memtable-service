@@ -3,13 +3,21 @@ package org.qwh.pms.core.bucket;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
+import org.qwh.pms.core.bucket.operation.CompactionResult;
+import org.qwh.pms.core.bucket.operation.EvictionResult;
+import org.qwh.pms.core.bucket.operation.FlushResult;
+import org.qwh.pms.core.bucket.operation.FreezeResult;
+import org.qwh.pms.core.bucket.operation.SinkOperationResult;
 import org.qwh.pms.core.config.*;
 import org.qwh.pms.core.memtable.model.Entry;
+import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkManager;
+import org.qwh.pms.core.sink.MockSinkManager;
 import org.qwh.pms.core.storage.SSTMeta;
+import org.qwh.pms.core.storage.SSTState;
 
 import java.nio.charset.StandardCharsets;
 import java.io.IOException;
@@ -19,7 +27,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -48,11 +59,19 @@ class PMSBucketDirectorImplTest {
         );
     }
 
+    private PMSBucketDirectorImpl newDirector(PMSConfig config) {
+        return newDirector(config, new MockSinkManager());
+    }
+
+    private PMSBucketDirectorImpl newDirector(PMSConfig config, SinkManager sinkManager) {
+        return new PMSBucketDirectorImpl(config, storage -> sinkManager);
+    }
+
     // ── Write path ──
 
     @Test
     void putAndGet() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -66,7 +85,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void putSupportsEmptyValue() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), new byte[0]);
@@ -81,7 +100,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void putRejectsNullValue() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             assertThrows(NullPointerException.class, () -> dir.put("k1".getBytes(), null));
@@ -92,7 +111,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void deleteMakesKeyInvisible() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -106,7 +125,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void lookupPreservesTombstoneAsThreeStateResult() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -125,7 +144,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void getMissingKeyReturnsEmpty() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             Optional<byte[]> result = dir.get("nonexistent".getBytes());
@@ -137,7 +156,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void putOverwritesExisting() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -150,7 +169,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void writeBatchAppliesPutDeleteAndDuplicateKeysInOrder() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.writeBatch(List.of(
@@ -177,7 +196,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void writeBatchRejectsInvalidBatchBeforeWriting() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             assertThrows(IllegalArgumentException.class, () -> dir.writeBatch(List.of()));
@@ -196,11 +215,16 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void freezeMovesDataToImmutable() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
-            dir.freezeCurMemTable();
+            FreezeResult freeze = dir.freezeCurMemTable();
+
+            assertTrue(freeze.progressed());
+            assertEquals(1L, freeze.fenceSequenceId());
+            assertEquals(1L, freeze.frozenMinSequenceId());
+            assertEquals(1L, freeze.frozenMaxSequenceId());
 
             // k1 should still be visible (from immutable layer)
             Optional<byte[]> result = dir.get("k1".getBytes());
@@ -220,8 +244,149 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void maintenanceOperationsReportNoopWithoutEligibleData() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        try {
+            FreezeResult freeze = dir.freezeCurMemTable();
+
+            assertFalse(freeze.progressed());
+            assertEquals(0L, freeze.fenceSequenceId());
+            assertFalse(dir.flushImmutableMemTable().progressed());
+            assertFalse(dir.sinkToPaimon().progressed());
+            assertFalse(dir.compactLocalSSTs().progressed());
+            assertFalse(dir.evictOldestSinkedSST().progressed());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void freezeReturnsAtomicFenceForConcurrentWriteBoundary() throws Exception {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        int writerCount = 8;
+        CyclicBarrier barrier = new CyclicBarrier(writerCount + 1);
+        List<Throwable> errors = new CopyOnWriteArrayList<>();
+        List<Thread> writers = new ArrayList<>();
+        AtomicReference<FreezeResult> freezeRef = new AtomicReference<>();
+        try {
+            dir.put("before".getBytes(), "v".getBytes());
+            for (int i = 0; i < writerCount; i++) {
+                int writerId = i;
+                writers.add(new Thread(() -> {
+                    try {
+                        barrier.await();
+                        dir.put(("concurrent-" + writerId).getBytes(), "v".getBytes());
+                    } catch (Throwable error) {
+                        errors.add(error);
+                    }
+                }));
+            }
+            writers.forEach(Thread::start);
+
+            barrier.await();
+            freezeRef.set(dir.freezeCurMemTable());
+            for (Thread writer : writers) {
+                writer.join();
+            }
+
+            assertTrue(errors.isEmpty(), "Concurrent writes failed: " + errors);
+            FreezeResult freeze = freezeRef.get();
+            assertTrue(freeze.progressed());
+            assertEquals(freeze.fenceSequenceId(), freeze.frozenMaxSequenceId());
+
+            BucketStateSnapshot snapshot = dir.stateSnapshot();
+            assertEquals(freeze.fenceSequenceId(), snapshot.immutableMemTableMaxSequenceId());
+            assertTrue(
+                snapshot.curMemTableMinSequenceId() == 0
+                    || snapshot.curMemTableMinSequenceId() > freeze.fenceSequenceId(),
+                "The active MemTable must contain only writes after the freeze fence"
+            );
+            assertEquals(1L + writerCount, snapshot.lastAssignedSequenceId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void oldestWriteTimePropagatesAcrossAllLocalLayers() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256, 100, 32, 2));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            long oldestWriteAtMillis = dir.stateSnapshot().curMemTableOldestWriteAtMillis();
+            assertTrue(oldestWriteAtMillis > 0);
+            dir.put("k2".getBytes(), "v2".getBytes());
+
+            BucketStateSnapshot cur = dir.stateSnapshot();
+            assertEquals(oldestWriteAtMillis, cur.curMemTableOldestWriteAtMillis());
+            assertEquals(
+                Math.max(0, cur.observedAtMillis() - oldestWriteAtMillis),
+                cur.curMemTableAgeMillis()
+            );
+
+            FreezeResult freeze = dir.freezeCurMemTable();
+            assertEquals(oldestWriteAtMillis, freeze.oldestWriteAtMillis());
+            BucketStateSnapshot immutable = dir.stateSnapshot();
+            assertEquals(oldestWriteAtMillis, immutable.immutableMemTableOldestWriteAtMillis());
+
+            LocalRunSnapshot firstRun = dir.flushImmutableMemTable().outputRun().orElseThrow();
+            assertEquals(oldestWriteAtMillis, firstRun.oldestWriteAtMillis());
+
+            dir.put("k3".getBytes(), "v3".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            LocalRunSnapshot compacted = dir.compactLocalSSTs()
+                .groups().get(0).outputRun();
+            assertEquals(oldestWriteAtMillis, compacted.oldestWriteAtMillis());
+
+            LocalRunSnapshot sinked = dir.sinkToPaimon().sinkedRuns().get(0);
+            assertEquals(oldestWriteAtMillis, sinked.oldestWriteAtMillis());
+            assertEquals(SSTState.SINKED, sinked.state());
+
+            BucketStateSnapshot finalState = dir.stateSnapshot();
+            assertEquals(oldestWriteAtMillis, finalState.sinkedSSTOldestWriteAtMillis());
+            assertEquals(3L, finalState.lastPersistedSequenceId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void oldestWriteTimeSurvivesLocalSSTRestart() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
+        dir1.init();
+        dir1.put("k1".getBytes(), "v1".getBytes());
+        dir1.freezeCurMemTable();
+        long oldestWriteAtMillis = dir1.flushImmutableMemTable()
+            .outputRun().orElseThrow().oldestWriteAtMillis();
+        dir1.close();
+
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
+        dir2.init();
+        try {
+            BucketStateSnapshot recovered = dir2.stateSnapshot();
+            assertEquals(oldestWriteAtMillis, recovered.newSSTOldestWriteAtMillis());
+            assertEquals(oldestWriteAtMillis, recovered.localRuns().get(0).oldestWriteAtMillis());
+            assertEquals(0L, recovered.lastPersistedSequenceId());
+            assertTrue(recovered.recoveredUnpersistedData());
+
+            dir2.sinkToPaimon();
+            BucketStateSnapshot persisted = dir2.stateSnapshot();
+            assertEquals(1L, persisted.lastPersistedSequenceId());
+            assertFalse(persisted.recoveredUnpersistedData());
+        } finally {
+            dir2.close();
+        }
+    }
+
+    @Test
     void autoFreezeOnEntryThreshold() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(5, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(5, 256));
         dir.init();
         try {
             // Write 6 entries — threshold is 5, should auto-freeze
@@ -238,7 +403,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void autoFreezePreservesSequenceBoundary() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(3, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(3, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -257,7 +422,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void writeBatchAutoFreezePreservesWholeBatchBoundary() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(3, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(3, 256));
         dir.init();
         try {
             dir.writeBatch(List.of(
@@ -283,7 +448,7 @@ class PMSBucketDirectorImplTest {
     @Test
     void autoFreezeOnSizeThreshold() throws IOException {
         // 1 MB size limit
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 1));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 1));
         dir.init();
         try {
             byte[] largeValue = new byte[200 * 1024];
@@ -301,7 +466,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void getAfterFreezeAndNewWrite() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -318,7 +483,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void operationsAfterCloseThrow() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         dir.close();
 
@@ -334,7 +499,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void immutableLayerOverriddenByCurMemTable() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -352,12 +517,17 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void flushMovesImmutableToNewSSTAndGetReadsFromSST() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
             dir.freezeCurMemTable();
-            dir.flushImmutableMemTable();
+            FlushResult flush = dir.flushImmutableMemTable();
+
+            assertTrue(flush.progressed());
+            LocalRunSnapshot output = flush.outputRun().orElseThrow();
+            assertEquals(1L, output.runId());
+            assertEquals(SSTState.NEW, output.state());
 
             assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
 
@@ -375,7 +545,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void sstTombstoneStopsLookup() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -400,7 +570,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void curMemTableOverridesFlushedSST() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -416,7 +586,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void scanMergesAllLocalLayersByLatestSequenceAndFiltersTombstones() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("p/1".getBytes(), "old-1".getBytes());
@@ -445,7 +615,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void scanUsesEndExclusiveAndReturnsKeyOrder() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("a".getBytes(), "va".getBytes());
@@ -463,7 +633,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void compactLocalSSTsMergesNewRunsWithoutChangingLookupOrder() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256, 100, 32, 2));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256, 100, 32, 2));
         dir.init();
         try {
             dir.put("k1".getBytes(), "old".getBytes());
@@ -474,7 +644,13 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            dir.compactLocalSSTs();
+            CompactionResult compaction = dir.compactLocalSSTs();
+
+            assertTrue(compaction.progressed());
+            assertEquals(1, compaction.groups().size());
+            assertEquals(List.of(1L, 2L), compaction.groups().get(0).inputRunIds());
+            assertEquals(1L, compaction.groups().get(0).outputRun().minFlushId());
+            assertEquals(2L, compaction.groups().get(0).outputRun().maxFlushId());
 
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertEquals(1, snap.newSSTCount());
@@ -491,7 +667,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void sinkMovesNewSSTsToSinkedAndKeepsDataReadable() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -501,7 +677,12 @@ class PMSBucketDirectorImplTest {
             Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
             assertTrue(Files.exists(sstFile));
 
-            dir.sinkToPaimon();
+            SinkOperationResult sink = dir.sinkToPaimon();
+
+            assertTrue(sink.progressed());
+            assertEquals(1L, sink.commitResult().orElseThrow().snapshotId());
+            assertEquals(1, sink.sinkedRuns().size());
+            assertEquals(SSTState.SINKED, sink.sinkedRuns().get(0).state());
 
             assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
             BucketStateSnapshot snap = dir.stateSnapshot();
@@ -517,7 +698,7 @@ class PMSBucketDirectorImplTest {
     @Test
     void sinkUsesInjectedSinkManager() throws IOException {
         RecordingSinkManager sinkManager = new RecordingSinkManager(99);
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256), sinkManager);
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -540,7 +721,7 @@ class PMSBucketDirectorImplTest {
     void compactedSinkedRunRecoversAsSinkedAfterRestart() throws IOException {
         PMSConfig cfg = config(1_000_000, 256, 100, 32, 2);
 
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         try {
             dir1.put("k1".getBytes(), "v1".getBytes());
@@ -561,7 +742,7 @@ class PMSBucketDirectorImplTest {
             dir1.close();
         }
 
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             BucketStateSnapshot recovered = dir2.stateSnapshot();
@@ -576,7 +757,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void evictCompactsFirstWhenOnlySinkedCountExceedsLimit() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256, 1, 32, 2));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256, 1, 32, 2));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -587,9 +768,11 @@ class PMSBucketDirectorImplTest {
             dir.flushImmutableMemTable();
             dir.sinkToPaimon();
 
-            Optional<SSTMeta> evicted = dir.evictOldestSinkedSST();
+            EvictionResult eviction = dir.evictOldestSinkedSST();
 
-            assertTrue(evicted.isEmpty());
+            assertTrue(eviction.progressed());
+            assertTrue(eviction.compaction().progressed());
+            assertTrue(eviction.evictedRun().isEmpty());
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertEquals(1, snap.sinkedSSTCount());
             assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
@@ -602,7 +785,7 @@ class PMSBucketDirectorImplTest {
 
     @Test
     void evictOldestSinkedSSTDeletesOnlyOldestSinkedFile() throws IOException {
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(1_000_000, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
         try {
             dir.put("k1".getBytes(), "v1".getBytes());
@@ -630,10 +813,10 @@ class PMSBucketDirectorImplTest {
             assertTrue(Files.exists(newerSinked));
             assertTrue(Files.exists(unsinked));
 
-            Optional<SSTMeta> evicted = dir.evictOldestSinkedSST();
+            EvictionResult eviction = dir.evictOldestSinkedSST();
 
-            assertTrue(evicted.isPresent());
-            assertEquals(1L, evicted.get().runId());
+            assertTrue(eviction.progressed());
+            assertEquals(1L, eviction.evictedRun().orElseThrow().runId());
             assertFalse(Files.exists(oldestSinked));
             assertTrue(Files.exists(newerSinked));
             assertTrue(Files.exists(unsinked));
@@ -655,7 +838,7 @@ class PMSBucketDirectorImplTest {
     void restartRecoversSinkedSSTFromSuccessMetadata() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         dir1.put("k1".getBytes(), "v1".getBytes());
         dir1.freezeCurMemTable();
@@ -666,7 +849,7 @@ class PMSBucketDirectorImplTest {
         Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
         assertTrue(Files.exists(sstFile));
 
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             assertArrayEquals("v1".getBytes(), dir2.get("k1".getBytes()).orElse(null));
@@ -685,7 +868,7 @@ class PMSBucketDirectorImplTest {
         PMSConfig cfg = config(1_000_000, 256);
 
         FailingCommitSinkManager failingSink = new FailingCommitSinkManager();
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg, failingSink);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg, failingSink);
         dir1.init();
         try {
             dir1.put("k1".getBytes(), "v1".getBytes());
@@ -696,6 +879,11 @@ class PMSBucketDirectorImplTest {
             assertTrue(error.getMessage().contains("commit failed after prepare"));
             assertEquals(1, failingSink.prepareCalls);
             assertEquals(1, failingSink.commitCalls);
+
+            BucketStateSnapshot failedSink = dir1.stateSnapshot();
+            assertEquals(SinkFlightSnapshot.Status.PREPARED_RETRY, failedSink.sinkFlight().status());
+            assertEquals("sink-1-1", failedSink.sinkFlight().batchId());
+            assertEquals(1L, failedSink.sinkFlight().sinkFenceFlushId());
         } finally {
             dir1.close();
         }
@@ -704,7 +892,7 @@ class PMSBucketDirectorImplTest {
         assertTrue(Files.exists(sstFile));
 
         RecordingSinkManager recoveringSink = new RecordingSinkManager(77);
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg, recoveringSink);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg, recoveringSink);
         dir2.init();
         try {
             assertEquals(0, recoveringSink.prepareCalls);
@@ -715,13 +903,14 @@ class PMSBucketDirectorImplTest {
             assertEquals(0, snap.newSSTCount());
             assertEquals(1, snap.sinkedSSTCount());
             assertEquals(77L, snap.lastSinkedSnapshotId());
+            assertEquals(SinkFlightSnapshot.Status.IDLE, snap.sinkFlight().status());
             assertTrue(Files.exists(sstFile));
         } finally {
             dir2.close();
         }
 
         RecordingSinkManager alreadyRecoveredSink = new RecordingSinkManager(88);
-        PMSBucketDirectorImpl dir3 = new PMSBucketDirectorImpl(cfg, alreadyRecoveredSink);
+        PMSBucketDirectorImpl dir3 = newDirector(cfg, alreadyRecoveredSink);
         dir3.init();
         try {
             assertEquals(0, alreadyRecoveredSink.prepareCalls);
@@ -732,6 +921,43 @@ class PMSBucketDirectorImplTest {
         }
     }
 
+    @Test
+    void preparedSinkFenceProtectsSelectedPrefixButAllowsNewerCompaction() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256, 100, 32, 2);
+        FailingCommitSinkManager failingSink = new FailingCommitSinkManager();
+        PMSBucketDirectorImpl dir = newDirector(cfg, failingSink);
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            assertThrows(RuntimeException.class, dir::sinkToPaimon);
+            assertEquals(1L, dir.stateSnapshot().sinkFlight().sinkFenceFlushId());
+            assertThrows(IllegalStateException.class, dir::sinkToPaimon);
+
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.put("k3".getBytes(), "v3".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            CompactionResult compaction = dir.compactLocalSSTs();
+
+            assertTrue(compaction.progressed());
+            assertEquals(1, compaction.groups().size());
+            assertEquals(List.of(2L, 3L), compaction.groups().get(0).inputRunIds());
+            assertEquals(2L, compaction.groups().get(0).outputRun().minFlushId());
+            assertEquals(3L, compaction.groups().get(0).outputRun().maxFlushId());
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000001.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000003.sst")));
+            assertEquals(SinkFlightSnapshot.Status.PREPARED_RETRY, dir.stateSnapshot().sinkFlight().status());
+        } finally {
+            dir.close();
+        }
+    }
+
     // ── Recovery ──
 
     @Test
@@ -739,7 +965,7 @@ class PMSBucketDirectorImplTest {
         PMSConfig cfg = config(1_000_000, 256);
 
         // Write data, close
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         dir1.put("k1".getBytes(), "v1".getBytes());
         dir1.put("k2".getBytes(), "v2".getBytes());
@@ -747,13 +973,16 @@ class PMSBucketDirectorImplTest {
         dir1.close();
 
         // Re-open and verify recovery
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             assertFalse(dir2.get("k1".getBytes()).isPresent(), "k1 was deleted");
             assertTrue(dir2.get("k2".getBytes()).isPresent(), "k2 should be recovered");
             assertArrayEquals("v2".getBytes(), dir2.get("k2".getBytes()).orElse(null));
-            assertEquals(3L, dir2.stateSnapshot().lastAssignedSequenceId());
+            BucketStateSnapshot snapshot = dir2.stateSnapshot();
+            assertEquals(3L, snapshot.lastAssignedSequenceId());
+            assertEquals(0L, snapshot.lastPersistedSequenceId());
+            assertTrue(snapshot.recoveredUnpersistedData());
         } finally {
             dir2.close();
         }
@@ -763,7 +992,7 @@ class PMSBucketDirectorImplTest {
     void recoverWriteBatchFromWALAfterRestart() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         dir1.writeBatch(List.of(
             WriteOp.put("k1".getBytes(), "v1".getBytes()),
@@ -773,7 +1002,7 @@ class PMSBucketDirectorImplTest {
         ));
         dir1.close();
 
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             assertFalse(dir2.get("k1".getBytes()).isPresent());
@@ -790,14 +1019,14 @@ class PMSBucketDirectorImplTest {
     void recoverWithFreezeAndOverwrite() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         dir1.put("k1".getBytes(), "v1".getBytes());
         dir1.freezeCurMemTable();
         dir1.put("k1".getBytes(), "v2".getBytes());
         dir1.close();
 
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             // After recovery, k1=v2 (WAL replays all, latest wins)
@@ -811,7 +1040,7 @@ class PMSBucketDirectorImplTest {
     void recoverSkipsWalRecordsCoveredByFlushedSST() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         dir1.put("k1".getBytes(), "v1".getBytes());
         dir1.freezeCurMemTable();
@@ -819,7 +1048,7 @@ class PMSBucketDirectorImplTest {
         dir1.put("k2".getBytes(), "v2".getBytes());
         dir1.close();
 
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             assertArrayEquals("v1".getBytes(), dir2.get("k1".getBytes()).orElse(null));
@@ -839,7 +1068,7 @@ class PMSBucketDirectorImplTest {
     @Test
     void concurrentPutTriggersAutoFreeze() throws Exception {
         // Low threshold to trigger frequent freezes
-        PMSBucketDirectorImpl dir = new PMSBucketDirectorImpl(config(10, 256));
+        PMSBucketDirectorImpl dir = newDirector(config(10, 256));
         dir.init();
 
         int threadCount = 4;
@@ -891,10 +1120,174 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void lookupRemainsVisibleAcrossConcurrentFreezePublication() throws Exception {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        int rounds = 1_000;
+        CyclicBarrier startRound = new CyclicBarrier(2);
+        CyclicBarrier endRound = new CyclicBarrier(2);
+        List<Throwable> errors = new CopyOnWriteArrayList<>();
+
+        Thread freezer = new Thread(() -> {
+            try {
+                for (int i = 0; i < rounds; i++) {
+                    dir.put(("freeze-key-" + i).getBytes(), ("value-" + i).getBytes());
+                    startRound.await();
+                    dir.freezeCurMemTable();
+                    endRound.await();
+                }
+            } catch (Throwable failure) {
+                errors.add(failure);
+            }
+        });
+        Thread reader = new Thread(() -> {
+            try {
+                for (int i = 0; i < rounds; i++) {
+                    startRound.await();
+                    Optional<byte[]> value = dir.get(("freeze-key-" + i).getBytes());
+                    if (value.isEmpty()) {
+                        errors.add(new AssertionError("lookup missed key during freeze round " + i));
+                    }
+                    endRound.await();
+                }
+            } catch (Throwable failure) {
+                errors.add(failure);
+            }
+        });
+
+        freezer.start();
+        reader.start();
+        freezer.join(TimeUnit.SECONDS.toMillis(30));
+        reader.join(TimeUnit.SECONDS.toMillis(30));
+        boolean freezerTimedOut = freezer.isAlive();
+        boolean readerTimedOut = reader.isAlive();
+        if (freezerTimedOut || readerTimedOut) {
+            startRound.reset();
+            endRound.reset();
+            freezer.interrupt();
+            reader.interrupt();
+            freezer.join(TimeUnit.SECONDS.toMillis(5));
+            reader.join(TimeUnit.SECONDS.toMillis(5));
+        }
+        try {
+            assertFalse(freezerTimedOut, "freeze test thread did not finish");
+            assertFalse(readerTimedOut, "lookup test thread did not finish");
+            assertTrue(errors.isEmpty(), "Errors during concurrent lookup+freeze: " + errors);
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void tombstoneRemainsVisibleAcrossConcurrentFreezePublication() throws Exception {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        int rounds = 500;
+        CyclicBarrier startRound = new CyclicBarrier(2);
+        CyclicBarrier endRound = new CyclicBarrier(2);
+        List<Throwable> errors = new CopyOnWriteArrayList<>();
+
+        Thread freezer = new Thread(() -> {
+            try {
+                for (int i = 0; i < rounds; i++) {
+                    dir.delete(("deleted-key-" + i).getBytes());
+                    startRound.await();
+                    dir.freezeCurMemTable();
+                    endRound.await();
+                }
+            } catch (Throwable failure) {
+                errors.add(failure);
+            }
+        });
+        Thread reader = new Thread(() -> {
+            try {
+                for (int i = 0; i < rounds; i++) {
+                    startRound.await();
+                    Optional<Value> value = dir.lookup(("deleted-key-" + i).getBytes());
+                    if (value.isEmpty() || !value.get().isTombstone()) {
+                        errors.add(new AssertionError("lookup missed tombstone during freeze round " + i));
+                    }
+                    endRound.await();
+                }
+            } catch (Throwable failure) {
+                errors.add(failure);
+            }
+        });
+
+        freezer.start();
+        reader.start();
+        freezer.join(TimeUnit.SECONDS.toMillis(30));
+        reader.join(TimeUnit.SECONDS.toMillis(30));
+        boolean freezerTimedOut = freezer.isAlive();
+        boolean readerTimedOut = reader.isAlive();
+        if (freezerTimedOut || readerTimedOut) {
+            startRound.reset();
+            endRound.reset();
+            freezer.interrupt();
+            reader.interrupt();
+            freezer.join(TimeUnit.SECONDS.toMillis(5));
+            reader.join(TimeUnit.SECONDS.toMillis(5));
+        }
+        try {
+            assertFalse(freezerTimedOut, "freeze test thread did not finish");
+            assertFalse(readerTimedOut, "lookup test thread did not finish");
+            assertTrue(errors.isEmpty(), "Errors during concurrent tombstone lookup+freeze: " + errors);
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void closeWaitsForInFlightSinkLifecycleLease() throws Exception {
+        BlockingPrepareSinkManager sinkManager = new BlockingPrepareSinkManager();
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
+        dir.init();
+        dir.put("k1".getBytes(), "v1".getBytes());
+        dir.freezeCurMemTable();
+        dir.flushImmutableMemTable();
+
+        AtomicReference<Throwable> sinkFailure = new AtomicReference<>();
+        Thread sinkThread = new Thread(() -> {
+            try {
+                dir.sinkToPaimon();
+            } catch (Throwable failure) {
+                sinkFailure.set(failure);
+            }
+        });
+        CountDownLatch closeFinished = new CountDownLatch(1);
+        Thread closeThread = new Thread(() -> {
+            dir.close();
+            closeFinished.countDown();
+        });
+
+        try {
+            sinkThread.start();
+            assertTrue(sinkManager.prepareEntered.await(5, TimeUnit.SECONDS));
+            closeThread.start();
+            assertFalse(
+                closeFinished.await(100, TimeUnit.MILLISECONDS),
+                "close must wait while Sink still holds a lifecycle lease"
+            );
+
+            sinkManager.allowPrepare.countDown();
+            sinkThread.join(TimeUnit.SECONDS.toMillis(5));
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+
+            assertFalse(sinkThread.isAlive(), "sink thread did not finish");
+            assertFalse(closeThread.isAlive(), "close thread did not finish");
+            assertNull(sinkFailure.get());
+            assertThrows(IllegalStateException.class, dir::stateSnapshot);
+        } finally {
+            sinkManager.allowPrepare.countDown();
+            dir.close();
+        }
+    }
+
+    @Test
     void fullLifecycleWriteFreezeOverwriteRecover() throws IOException {
         PMSConfig cfg = config(3, 256);
 
-        PMSBucketDirectorImpl dir1 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir1 = newDirector(cfg);
         dir1.init();
         // Write enough to trigger auto-freeze
         dir1.put("k1".getBytes(), "v1".getBytes());
@@ -909,7 +1302,7 @@ class PMSBucketDirectorImplTest {
         dir1.close();
 
         // Recover
-        PMSBucketDirectorImpl dir2 = new PMSBucketDirectorImpl(cfg);
+        PMSBucketDirectorImpl dir2 = newDirector(cfg);
         dir2.init();
         try {
             assertArrayEquals("v1_new".getBytes(), dir2.get("k1".getBytes()).orElse(null));
@@ -985,6 +1378,29 @@ class PMSBucketDirectorImplTest {
         public SinkCommitResult commit(PreparedSinkCommit prepared) {
             commitCalls++;
             throw new RuntimeException("commit failed after prepare");
+        }
+    }
+
+    private static final class BlockingPrepareSinkManager extends RecordingSinkManager {
+        private final CountDownLatch prepareEntered = new CountDownLatch(1);
+        private final CountDownLatch allowPrepare = new CountDownLatch(1);
+
+        BlockingPrepareSinkManager() {
+            super(1);
+        }
+
+        @Override
+        public PreparedSinkCommit prepare(SinkBatch batch) {
+            prepareEntered.countDown();
+            try {
+                if (!allowPrepare.await(5, TimeUnit.SECONDS)) {
+                    throw new AssertionError("timed out waiting to release Sink prepare");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Sink prepare interrupted", e);
+            }
+            return super.prepare(batch);
         }
     }
 }

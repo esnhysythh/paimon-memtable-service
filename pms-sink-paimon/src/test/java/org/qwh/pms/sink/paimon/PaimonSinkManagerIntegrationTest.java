@@ -478,8 +478,8 @@ class PaimonSinkManagerIntegrationTest {
             sequenceId,
             sequenceId,
             1,
-            SSTState.NEW,
-            0
+            2,
+            SSTState.NEW
         );
     }
 
@@ -602,6 +602,11 @@ class PaimonSinkManagerIntegrationTest {
                     snapshotClosed = true;
                 }
             };
+        }
+
+        @Override
+        public SSTReadSnapshot readVisibleSnapshot() {
+            throw new UnsupportedOperationException();
         }
 
         @Override

@@ -64,6 +64,7 @@ class SkipListImmutableMemTableTest {
     void exposesSequenceBounds() {
         assertEquals(1L, immutable.minSequenceId());
         assertEquals(3L, immutable.maxSequenceId());
+        assertTrue(immutable.oldestWriteAtMillis() > 0);
     }
 
     @Test
@@ -78,49 +79,4 @@ class SkipListImmutableMemTableTest {
         assertTrue(entries.get(2).isTombstone());
     }
 
-    @Test
-    void refCountOperations() {
-        assertEquals(0, immutable.refCount());
-        immutable.incrementRef();
-        assertEquals(1, immutable.refCount());
-        immutable.incrementRef();
-        assertEquals(2, immutable.refCount());
-        immutable.decrementRef();
-        assertEquals(1, immutable.refCount());
-    }
-
-    @Test
-    void refCountDecrementBelowZeroGoesNegative() {
-        // AtomicLong allows decrement below zero — this is by design.
-        // The caller (BucketDirector) is responsible for checking refCount before evict.
-        assertEquals(0, immutable.refCount());
-        immutable.decrementRef();
-        assertEquals(-1, immutable.refCount());
-    }
-
-    @Test
-    void refCountConcurrentIncrementDecrement() throws Exception {
-        int threadCount = 8;
-        int opsPerThread = 10_000;
-        List<Thread> threads = new ArrayList<>();
-
-        for (int t = 0; t < threadCount; t++) {
-            final int tid = t;
-            threads.add(new Thread(() -> {
-                for (int i = 0; i < opsPerThread; i++) {
-                    if (tid % 2 == 0) {
-                        immutable.incrementRef();
-                    } else {
-                        immutable.decrementRef();
-                    }
-                }
-            }));
-        }
-
-        for (Thread t : threads) t.start();
-        for (Thread t : threads) t.join();
-
-        // 4 threads increment, 4 threads decrement — net should be 0
-        assertEquals(0, immutable.refCount());
-    }
 }

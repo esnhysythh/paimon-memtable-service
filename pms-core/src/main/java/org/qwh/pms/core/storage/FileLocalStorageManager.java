@@ -225,6 +225,14 @@ public class FileLocalStorageManager implements LocalStorageManager {
     }
 
     @Override
+    public synchronized SSTReadSnapshot readVisibleSnapshot() {
+        List<SSTMeta> visible = metas.values().stream()
+            .sorted(Comparator.comparingLong(SSTMeta::maxFlushId).thenComparingLong(SSTMeta::minFlushId))
+            .toList();
+        return readSnapshot(visible);
+    }
+
+    @Override
     public SSTMeta compactSSTs(List<SSTMeta> metas) {
         if (metas == null || metas.size() < 2) {
             throw new IllegalArgumentException("at least two SSTs are required for compaction");
@@ -239,6 +247,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
             long expectedEntries = inputs.stream().mapToLong(SSTMeta::entryCount).sum();
             long minSequenceId = inputs.stream().mapToLong(SSTMeta::minSequenceId).min().orElse(0);
             long maxSequenceId = inputs.stream().mapToLong(SSTMeta::maxSequenceId).max().orElse(0);
+            long oldestWriteAtMillis = inputs.stream().mapToLong(SSTMeta::oldestWriteAtMillis).min().orElse(0);
             SSTMeta output;
             try (SSTReadSnapshot snapshot = readSnapshot(inputs)) {
                 for (SSTMeta meta : inputs) {
@@ -257,7 +266,8 @@ public class FileLocalStorageManager implements LocalStorageManager {
                         merged,
                         expectedEntries,
                         minSequenceId,
-                        maxSequenceId
+                        maxSequenceId,
+                        oldestWriteAtMillis
                     );
                 }
             }
@@ -646,6 +656,7 @@ public class FileLocalStorageManager implements LocalStorageManager {
             || meta.entryCount() != actual.entryCount()
             || meta.minSequenceId() != actual.minSequenceId()
             || meta.maxSequenceId() != actual.maxSequenceId()
+            || meta.oldestWriteAtMillis() != actual.oldestWriteAtMillis()
             || meta.createdAtMillis() != actual.createdAtMillis()
             || !java.util.Objects.equals(meta.minKey(), actual.minKey())
             || !java.util.Objects.equals(meta.maxKey(), actual.maxKey())) {

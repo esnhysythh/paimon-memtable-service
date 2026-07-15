@@ -333,7 +333,7 @@ public final class PmsTableService implements AutoCloseable {
         try {
             LOG.info("PMS sink started");
             synchronized (paimonCommitPublishLock) {
-                director.sinkToPaimon().ifPresent(this::publishCommittedLookupDelta);
+                director.sinkToPaimon().commitResult().ifPresent(this::publishCommittedLookupDelta);
             }
             retainLocalSSTsLocked();
             LOG.info("PMS sink completed");
@@ -633,7 +633,7 @@ public final class PmsTableService implements AutoCloseable {
     private void retainLocalSSTsLocked() {
         int evictedCount = 0;
         while (shouldEvictSinkedSST(director.stateSnapshot())) {
-            var evicted = director.evictOldestSinkedSST();
+            var evicted = director.evictOldestSinkedSST().evictedRun();
             if (evicted.isEmpty()) {
                 break;
             }
@@ -641,7 +641,7 @@ public final class PmsTableService implements AutoCloseable {
             LOG.info(
                 "Evicted sinked SST by retention: runId={}, fileSize={}, entryCount={}",
                 evicted.get().runId(),
-                evicted.get().fileSize(),
+                evicted.get().fileSizeBytes(),
                 evicted.get().entryCount()
             );
         }
@@ -727,26 +727,39 @@ public final class PmsTableService implements AutoCloseable {
 
     private static Map<String, Object> stateToMap(BucketStateSnapshot state) {
         Map<String, Object> result = new LinkedHashMap<>();
+        result.put("observedAtMillis", state.observedAtMillis());
         result.put("curMemTableEstimatedEntryCount", state.curMemTableEstimatedEntryCount());
         result.put("curMemTableSizeBytes", state.curMemTableSizeBytes());
-        result.put("immutableMemTableCount", state.immutableMemTableCount());
-        result.put("immutableMemTableTotalBytes", state.immutableMemTableTotalBytes());
-        result.put("lastAssignedSequenceId", state.lastAssignedSequenceId());
         result.put("curMemTableMinSequenceId", state.curMemTableMinSequenceId());
         result.put("curMemTableMaxSequenceId", state.curMemTableMaxSequenceId());
+        result.put("curMemTableOldestWriteAtMillis", state.curMemTableOldestWriteAtMillis());
+        result.put("curMemTableAgeMillis", state.curMemTableAgeMillis());
+        result.put("immutableMemTableCount", state.immutableMemTableCount());
+        result.put("immutableMemTableTotalBytes", state.immutableMemTableTotalBytes());
         result.put("immutableMemTableMinSequenceId", state.immutableMemTableMinSequenceId());
         result.put("immutableMemTableMaxSequenceId", state.immutableMemTableMaxSequenceId());
+        result.put("immutableMemTableOldestWriteAtMillis", state.immutableMemTableOldestWriteAtMillis());
+        result.put("immutableMemTableAgeMillis", state.immutableMemTableAgeMillis());
+        result.put("lastAssignedSequenceId", state.lastAssignedSequenceId());
         result.put("lastFlushedSequenceId", state.lastFlushedSequenceId());
+        result.put("lastPersistedSequenceId", state.lastPersistedSequenceId());
         result.put("newSSTCount", state.newSSTCount());
         result.put("newSSTTotalBytes", state.newSSTTotalBytes());
         result.put("newSSTTotalRows", state.newSSTTotalRows());
         result.put("newSSTMinSequenceId", state.newSSTMinSequenceId());
         result.put("newSSTMaxSequenceId", state.newSSTMaxSequenceId());
+        result.put("newSSTOldestWriteAtMillis", state.newSSTOldestWriteAtMillis());
+        result.put("newSSTAgeMillis", state.newSSTAgeMillis());
         result.put("sinkedSSTCount", state.sinkedSSTCount());
         result.put("sinkedSSTTotalBytes", state.sinkedSSTTotalBytes());
         result.put("sinkedSSTTotalRows", state.sinkedSSTTotalRows());
-        result.put("withMemCount", state.withMemCount());
-        result.put("withMemTotalBytes", state.withMemTotalBytes());
+        result.put("sinkedSSTMinSequenceId", state.sinkedSSTMinSequenceId());
+        result.put("sinkedSSTMaxSequenceId", state.sinkedSSTMaxSequenceId());
+        result.put("sinkedSSTOldestWriteAtMillis", state.sinkedSSTOldestWriteAtMillis());
+        result.put("sinkedSSTAgeMillis", state.sinkedSSTAgeMillis());
+        result.put("localRuns", state.localRuns());
+        result.put("sinkFlight", state.sinkFlight());
+        result.put("recoveredUnpersistedData", state.recoveredUnpersistedData());
         result.put("lastSinkedSnapshotId", state.lastSinkedSnapshotId());
         return result;
     }

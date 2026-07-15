@@ -38,7 +38,10 @@ class FileLocalStorageManagerTest {
             String key = (String) triples[i];
             byte[] value = (byte[]) triples[i + 1];
             long sequenceId = (long) triples[i + 2];
-            cur.put(new Key(key.getBytes()), value == null ? Value.tombstone(sequenceId) : new Value(value, sequenceId));
+            cur.put(
+                new Key(key.getBytes()),
+                value == null ? Value.tombstone(sequenceId) : new Value(value, sequenceId)
+            );
         }
         return cur.freeze();
     }
@@ -205,6 +208,7 @@ class FileLocalStorageManagerTest {
         assertArrayEquals("z".getBytes(), meta.maxKey().bytes());
         assertEquals(11L, meta.minSequenceId());
         assertEquals(12L, meta.maxSequenceId());
+        assertTrue(meta.oldestWriteAtMillis() > 0);
         assertTrue(Files.exists(meta.path()));
         assertTrue(meta.fileSize() > SSTFormat.FOOTER_SIZE);
     }
@@ -218,12 +222,14 @@ class FileLocalStorageManagerTest {
         String content = Files.readString(metaPath);
 
         assertTrue(Files.exists(metaPath));
+        assertTrue(content.contains("\"version\": 2"));
         assertTrue(content.contains("\"runId\": " + meta.runId()));
         assertTrue(content.contains("\"minFlushId\": 1"));
         assertTrue(content.contains("\"maxFlushId\": 1"));
         assertTrue(content.contains("\"sstFile\": \"sst-000001-000001.sst\""));
         assertTrue(content.contains("\"state\": \"NEW\""));
         assertTrue(content.contains("\"minSequenceId\": 1"));
+        assertTrue(content.contains("\"oldestWriteAtMillis\": " + meta.oldestWriteAtMillis()));
         assertTrue(content.contains("\"maxSequenceId\": 1"));
         assertTrue(content.contains("\"metaCrc32\""));
     }
@@ -362,12 +368,14 @@ class FileLocalStorageManagerTest {
             "a", "new-a".getBytes(), 3L,
             "c", null, 4L
         ));
+        long oldestWriteAtMillis = Math.min(first.oldestWriteAtMillis(), second.oldestWriteAtMillis());
 
         SSTMeta compacted = storage.compactSSTs(List.of(first, second));
 
         assertEquals(1L, compacted.minFlushId());
         assertEquals(2L, compacted.maxFlushId());
         assertEquals(3L, compacted.entryCount());
+        assertEquals(oldestWriteAtMillis, compacted.oldestWriteAtMillis());
         assertTrue(Files.exists(tempDir.resolve("sst-000001-000002.sst")));
         assertFalse(Files.exists(first.path()));
         assertFalse(Files.exists(second.path()));
@@ -380,15 +388,18 @@ class FileLocalStorageManagerTest {
         storage.persistFlushedSequenceId(compacted.maxSequenceId());
         FileLocalStorageManager reloaded = storage();
         assertEquals(List.of(compacted.runId()), reloaded.metas().stream().map(SSTMeta::runId).toList());
+        assertEquals(oldestWriteAtMillis, reloaded.metas().get(0).oldestWriteAtMillis());
     }
 
     @Test
-    void compactDelaysInputSstFileDeletionUntilReadSnapshotCloses() throws IOException {
+    void visibleSnapshotAtomicallyPinsItsSstViewUntilClose() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta first = storage.flushToSST(immutable("a", "old-a".getBytes(), 1L));
         SSTMeta second = storage.flushToSST(immutable("b", "old-b".getBytes(), 2L));
 
-        try (SSTReadSnapshot leases = storage.readSnapshot(List.of(first))) {
+        try (SSTReadSnapshot leases = storage.readVisibleSnapshot()) {
+            assertEquals(List.of(first.runId(), second.runId()),
+                leases.metas().stream().map(SSTMeta::runId).toList());
             storage.compactSSTs(List.of(first, second));
 
             assertTrue(Files.exists(first.path()));

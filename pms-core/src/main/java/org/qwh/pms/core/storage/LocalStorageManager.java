@@ -11,6 +11,11 @@ public interface LocalStorageManager {
 
     SSTReadSnapshot readSnapshot(List<SSTMeta> metas);
 
+    /**
+     * Atomically captures all currently visible local SSTs and enters their read epoch.
+     */
+    SSTReadSnapshot readVisibleSnapshot();
+
     SSTMeta compactSSTs(List<SSTMeta> metas);
 
     void deleteSST(SSTMeta meta);

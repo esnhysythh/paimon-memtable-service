@@ -9,7 +9,6 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.atomic.AtomicLong;
 
 public class SkipListImmutableMemTable implements ImmutableMemTable {
 
@@ -18,15 +17,16 @@ public class SkipListImmutableMemTable implements ImmutableMemTable {
     private final int estimatedEntryCount;
     private final long minSequenceId;
     private final long maxSequenceId;
-    private final AtomicLong refCount = new AtomicLong(0);
+    private final long oldestWriteAtMillis;
 
     SkipListImmutableMemTable(ConcurrentSkipListMap<Key, Value> map, long estimatedSize, int estimatedEntryCount,
-                              long minSequenceId, long maxSequenceId) {
+                              long minSequenceId, long maxSequenceId, long oldestWriteAtMillis) {
         this.map = map;
         this.estimatedSize = estimatedSize;
         this.estimatedEntryCount = estimatedEntryCount;
         this.minSequenceId = minSequenceId;
         this.maxSequenceId = maxSequenceId;
+        this.oldestWriteAtMillis = oldestWriteAtMillis;
     }
 
     @Override
@@ -68,18 +68,8 @@ public class SkipListImmutableMemTable implements ImmutableMemTable {
     }
 
     @Override
-    public void incrementRef() {
-        refCount.incrementAndGet();
-    }
-
-    @Override
-    public void decrementRef() {
-        refCount.decrementAndGet();
-    }
-
-    @Override
-    public long refCount() {
-        return refCount.get();
+    public long oldestWriteAtMillis() {
+        return oldestWriteAtMillis;
     }
 
     private static class EntryIterator implements Iterator<Entry> {
