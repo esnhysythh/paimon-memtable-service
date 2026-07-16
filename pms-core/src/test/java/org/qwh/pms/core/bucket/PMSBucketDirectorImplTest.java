@@ -19,8 +19,9 @@ import org.qwh.pms.core.sink.MockSinkManager;
 import org.qwh.pms.core.storage.SSTMeta;
 import org.qwh.pms.core.storage.SSTState;
 
-import java.nio.charset.StandardCharsets;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -718,6 +719,54 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void flushPublishedDuringSinkRemainsNewForNextSink() throws Exception {
+        BlockingPrepareSinkManager sinkManager = new BlockingPrepareSinkManager();
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
+        dir.init();
+        AtomicReference<Throwable> sinkFailure = new AtomicReference<>();
+        Thread sinkThread = new Thread(() -> {
+            try {
+                dir.sinkToPaimon();
+            } catch (Throwable failure) {
+                sinkFailure.set(failure);
+            }
+        });
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            sinkThread.start();
+            assertTrue(sinkManager.prepareEntered.await(5, TimeUnit.SECONDS));
+
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            sinkManager.allowPrepare.countDown();
+            sinkThread.join(TimeUnit.SECONDS.toMillis(5));
+
+            assertFalse(sinkThread.isAlive(), "sink thread did not finish");
+            assertNull(sinkFailure.get());
+            BucketStateSnapshot afterFirstSink = dir.stateSnapshot();
+            assertEquals(1, afterFirstSink.newSSTCount());
+            assertEquals(1, afterFirstSink.sinkedSSTCount());
+            assertEquals(2L, afterFirstSink.newSSTMinSequenceId());
+            assertEquals(2L, afterFirstSink.newSSTMaxSequenceId());
+
+            assertTrue(dir.sinkToPaimon().progressed());
+            BucketStateSnapshot afterSecondSink = dir.stateSnapshot();
+            assertEquals(0, afterSecondSink.newSSTCount());
+            assertEquals(2, afterSecondSink.sinkedSSTCount());
+            assertEquals(2L, afterSecondSink.lastPersistedSequenceId());
+        } finally {
+            sinkManager.allowPrepare.countDown();
+            sinkThread.join(TimeUnit.SECONDS.toMillis(5));
+            dir.close();
+        }
+    }
+
+    @Test
     void compactedSinkedRunRecoversAsSinkedAfterRestart() throws IOException {
         PMSConfig cfg = config(1_000_000, 256, 100, 32, 2);
 
@@ -1179,6 +1228,36 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void sstMaintenanceNeverAcquiresWriteBoundaryMutex() throws Exception {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256, 100, 32, 2));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            assertCompletesWhileHoldingWriteMutex(dir, () ->
+                assertTrue(dir.compactLocalSSTs().progressed())
+            );
+            assertCompletesWhileHoldingWriteMutex(dir, () ->
+                assertTrue(dir.sinkToPaimon().progressed())
+            );
+            assertCompletesWhileHoldingWriteMutex(dir, () ->
+                assertTrue(dir.evictOldestSinkedSST().progressed())
+            );
+
+            BucketStateSnapshot state = dir.stateSnapshot();
+            assertEquals(0, state.newSSTCount());
+            assertEquals(0, state.sinkedSSTCount());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
     void tombstoneRemainsVisibleAcrossConcurrentFreezePublication() throws Exception {
         PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();
@@ -1324,6 +1403,39 @@ class PMSBucketDirectorImplTest {
         return entries.stream()
             .map(entry -> new String(entry.value().bytes(), StandardCharsets.UTF_8))
             .toList();
+    }
+
+    private static void assertCompletesWhileHoldingWriteMutex(
+            PMSBucketDirectorImpl director,
+            Runnable operation) throws Exception {
+        Field field = PMSBucketDirectorImpl.class.getDeclaredField("writeMutex");
+        field.setAccessible(true);
+        Object writeMutex = field.get(director);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            started.countDown();
+            try {
+                operation.run();
+            } catch (Throwable error) {
+                failure.set(error);
+            } finally {
+                finished.countDown();
+            }
+        });
+
+        boolean completedWhileHeld;
+        synchronized (writeMutex) {
+            worker.start();
+            assertTrue(started.await(5, TimeUnit.SECONDS), "maintenance worker did not start");
+            completedWhileHeld = finished.await(5, TimeUnit.SECONDS);
+        }
+        worker.join(TimeUnit.SECONDS.toMillis(5));
+
+        assertTrue(completedWhileHeld, "SST maintenance attempted to acquire writeMutex");
+        assertFalse(worker.isAlive(), "SST maintenance worker did not finish");
+        assertNull(failure.get(), "SST maintenance failed: " + failure.get());
     }
 
     private static class RecordingSinkManager implements SinkManager {
