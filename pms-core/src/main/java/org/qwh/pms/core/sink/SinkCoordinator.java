@@ -23,11 +23,8 @@ public final class SinkCoordinator {
         return commitPrepared(prepared);
     }
 
-    public SinkCommitResult recoverPrepared(PreparedSinkCommit prepared) {
-        return commitPrepared(prepared);
-    }
-
-    private SinkCommitResult commitPrepared(PreparedSinkCommit prepared) {
+    public SinkCommitResult commitPrepared(PreparedSinkCommit prepared) {
+        Objects.requireNonNull(prepared, "prepared must not be null");
         SinkCommitResult result = Objects.requireNonNull(
             sinkManager.commit(prepared),
             "SinkManager.commit must not return null"

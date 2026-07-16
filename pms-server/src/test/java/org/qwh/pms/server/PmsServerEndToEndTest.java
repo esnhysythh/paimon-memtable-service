@@ -18,6 +18,7 @@ import org.qwh.pms.codec.PmsPrimaryKeyCodec;
 import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.core.bucket.PMSBucketDirector;
 import org.qwh.pms.core.bucket.PmsFatalWriteException;
+import org.qwh.pms.core.bucket.SinkFlightSnapshot;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
@@ -182,6 +183,58 @@ class PmsServerEndToEndTest {
                 assertEquals(Map.of(1, "prepared-a"), server.readIntStringRows());
             } finally {
                 recoveredRuntime.close();
+            }
+        }
+    }
+
+    @Test
+    void preparedSinkCommitRetriesInSameRuntimeWithoutPreparingAgain() throws Exception {
+        AtomicReference<FailOnceAfterPrepareSinkManager> sinkManagerRef = new AtomicReference<>();
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema())) {
+            PmsServerRuntime runtime = new PmsServerRuntime(
+                server.config(),
+                (table, commitUser, storage) -> {
+                    FailOnceAfterPrepareSinkManager manager = new FailOnceAfterPrepareSinkManager(
+                        new PaimonSinkManager(table, commitUser, storage)
+                    );
+                    sinkManagerRef.set(manager);
+                    return manager;
+                }
+            ).start();
+            try {
+                runtime.write(Map.of("id", 1, "marker", "online-retry-a"));
+                runtime.flush();
+
+                RuntimeException failure = assertThrows(RuntimeException.class, runtime::sink);
+                assertTrue(rootCauseMessage(failure).contains("forced first commit failure after prepare"));
+                FailOnceAfterPrepareSinkManager manager = sinkManagerRef.get();
+                assertNotNull(manager);
+                assertEquals(1, manager.prepareCalls);
+                assertEquals(1, manager.commitCalls);
+                assertEquals(
+                    SinkFlightSnapshot.Status.PREPARED_RETRY,
+                    ((SinkFlightSnapshot) runtime.state().get("sinkFlight")).status()
+                );
+
+                runtime.sink();
+
+                assertEquals(1, manager.prepareCalls);
+                assertEquals(2, manager.commitCalls);
+                assertEquals(manager.firstCommit.batchId(), manager.secondCommit.batchId());
+                assertEquals(manager.firstCommit.commitIdentifier(), manager.secondCommit.commitIdentifier());
+                assertEquals(manager.firstCommit.sstIds(), manager.secondCommit.sstIds());
+                assertArrayEquals(manager.firstCommit.payload(), manager.secondCommit.payload());
+                assertEquals(
+                    Map.of("id", 1, "marker", "online-retry-a"),
+                    runtime.get(Map.of("id", 1)).orElseThrow()
+                );
+                assertEquals(Map.of(1, "online-retry-a"), server.readIntStringRows());
+                assertEquals(
+                    SinkFlightSnapshot.Status.IDLE,
+                    ((SinkFlightSnapshot) runtime.state().get("sinkFlight")).status()
+                );
+            } finally {
+                runtime.close();
             }
         }
     }
@@ -1176,6 +1229,35 @@ class PmsServerEndToEndTest {
         @Override
         public SinkCommitResult commit(PreparedSinkCommit prepared) {
             throw new RuntimeException("forced commit failure after prepare");
+        }
+    }
+
+    private static final class FailOnceAfterPrepareSinkManager implements SinkManager {
+        private final SinkManager delegate;
+        private int prepareCalls;
+        private int commitCalls;
+        private PreparedSinkCommit firstCommit;
+        private PreparedSinkCommit secondCommit;
+
+        private FailOnceAfterPrepareSinkManager(SinkManager delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public PreparedSinkCommit prepare(SinkBatch batch) {
+            prepareCalls++;
+            return delegate.prepare(batch);
+        }
+
+        @Override
+        public SinkCommitResult commit(PreparedSinkCommit prepared) {
+            commitCalls++;
+            if (firstCommit == null) {
+                firstCommit = prepared;
+                throw new RuntimeException("forced first commit failure after prepare");
+            }
+            secondCommit = prepared;
+            return delegate.commit(prepared);
         }
     }
 

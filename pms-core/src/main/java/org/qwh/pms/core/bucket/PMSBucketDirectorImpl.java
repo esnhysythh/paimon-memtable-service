@@ -195,7 +195,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         long lastSnapshotId = state.lastSinkedSnapshotId();
         long lastPersistedSequenceId = state.lastPersistedSequenceId();
         for (var prepared : state.pendingPrepares()) {
-            SinkCommitResult result = sinkCoordinator.recoverPrepared(prepared);
+            SinkCommitResult result = sinkCoordinator.commitPrepared(prepared);
             sinkedIds.addAll(result.sstIds());
             lastSnapshotId = Math.max(lastSnapshotId, result.snapshotId());
             lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
@@ -433,29 +433,50 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                     refreshSinkFlightAfterFailureUnderLease();
                     throw e;
                 }
-                Set<Long> sinkedIds = new HashSet<>(toSink.stream().map(LocalRun::runId).toList());
-                List<SSTMeta> selectedSinkedMetas = storageManager.markSinked(toSinkMetas).stream()
-                    .filter(meta -> sinkedIds.contains(meta.runId()))
-                    .toList();
-                walManager.truncate(result.persistedSequenceId());
-                List<LocalRun> publishedSinkedRuns = publishSinkedRuns(sinkedIds, selectedSinkedMetas);
-                lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
-                lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
-                sinkFlight = SinkFlightSnapshot.idle();
-                List<LocalRunSnapshot> sinked = publishedSinkedRuns.stream()
-                    .map(run -> run.snapshot(nowMillis()))
-                    .toList();
-                RunState published = runState;
-                LOG.debug(
-                    "Sink: newSST count={}, sinkedSST count={}",
-                    published.newRuns().size(),
-                    published.sinkedRuns().size()
-                );
-                return new SinkOperationResult(
-                    OperationStatus.PROGRESSED,
-                    Optional.of(result),
-                    sinked
-                );
+                return completeCommittedSink(result, toSink);
+            } finally {
+                lifecycleLock.readLock().unlock();
+            }
+        }
+    }
+
+    @Override
+    public SinkOperationResult commitPreparedSink() {
+        synchronized (sstMaintenanceMutex) {
+            lifecycleLock.readLock().lock();
+            try {
+                ensureNotClosed();
+                SinkRecoveryState recovery = sinkMetaStore.load();
+                validateSinglePendingPrepare(recovery);
+                if (recovery.pendingPrepares().isEmpty()) {
+                    if (sinkFlight.active()) {
+                        throw new IllegalStateException(
+                            "active Sink flight has no pending prepare metadata: batch=" + sinkFlight.batchId()
+                        );
+                    }
+                    return SinkOperationResult.noop();
+                }
+                if (sinkFlight.status() != SinkFlightSnapshot.Status.PREPARED_RETRY) {
+                    throw new IllegalStateException(
+                        "pending prepare metadata requires PREPARED_RETRY flight, actual=" + sinkFlight.status()
+                    );
+                }
+                PreparedSinkCommit prepared = recovery.pendingPrepares().get(0);
+                List<LocalRun> selected = resolvePreparedRuns(prepared, runState.newRuns());
+                SinkFlightSnapshot expectedFlight = sinkFlightForPrepared(prepared, selected);
+                if (!sinkFlight.equals(expectedFlight)) {
+                    throw new IllegalStateException(
+                        "prepared Sink flight differs from durable prepare metadata: batch=" + prepared.batchId()
+                    );
+                }
+                SinkCommitResult result;
+                try {
+                    result = sinkCoordinator.commitPrepared(prepared);
+                } catch (RuntimeException e) {
+                    refreshSinkFlightAfterFailureUnderLease();
+                    throw e;
+                }
+                return completeCommittedSink(result, selected);
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -775,6 +796,41 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return oldestWriteAtMillis <= 0 ? 0 : Math.max(0, nowMillis - oldestWriteAtMillis);
     }
 
+    private SinkOperationResult completeCommittedSink(
+            SinkCommitResult result,
+            List<LocalRun> selectedRuns) {
+        List<Long> selectedRunIds = selectedRuns.stream().map(LocalRun::runId).toList();
+        if (!result.sstIds().equals(selectedRunIds)) {
+            throw new IllegalStateException(
+                "committed Sink result differs from maintenance-visible inputs: batch=" + result.batchId()
+            );
+        }
+        Set<Long> sinkedIds = Set.copyOf(selectedRunIds);
+        List<SSTMeta> selectedSinkedMetas = storageManager.markSinked(metas(selectedRuns)).stream()
+            .filter(meta -> sinkedIds.contains(meta.runId()))
+            .toList();
+        walManager.truncate(result.persistedSequenceId());
+        List<LocalRun> publishedSinkedRuns = publishSinkedRuns(sinkedIds, selectedSinkedMetas);
+        lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
+        lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
+        sinkFlight = SinkFlightSnapshot.idle();
+        List<LocalRunSnapshot> sinked = publishedSinkedRuns.stream()
+            .map(run -> run.snapshot(nowMillis()))
+            .toList();
+        RunState published = runState;
+        LOG.debug(
+            "Sink completed: batch={}, newSST count={}, sinkedSST count={}",
+            result.batchId(),
+            published.newRuns().size(),
+            published.sinkedRuns().size()
+        );
+        return new SinkOperationResult(
+            OperationStatus.PROGRESSED,
+            Optional.of(result),
+            sinked
+        );
+    }
+
     private CompactionResult.Group compactSelectedGroup(SSTState state, List<LocalRun> selected) {
         List<Long> inputRunIds = selected.stream().map(LocalRun::runId).toList();
         SSTMeta compacted = storageManager.compactSSTs(metas(selected));
@@ -942,6 +998,47 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return Optional.of(selected);
     }
 
+    private static List<LocalRun> resolvePreparedRuns(
+            PreparedSinkCommit prepared,
+            List<LocalRun> candidates) {
+        Set<Long> selectedIds = Set.copyOf(prepared.sstIds());
+        List<LocalRun> selected = candidates.stream()
+            .filter(run -> selectedIds.contains(run.runId()))
+            .toList();
+        if (selected.size() != prepared.sstIds().size()) {
+            throw new IllegalStateException(
+                "pending prepared Sink references missing or replaced NEW runs: batch=" + prepared.batchId()
+            );
+        }
+        List<Long> orderedIds = selected.stream().map(LocalRun::runId).toList();
+        if (!orderedIds.equals(prepared.sstIds())) {
+            throw new IllegalStateException(
+                "pending prepared Sink run order differs from durable metadata: batch=" + prepared.batchId()
+            );
+        }
+        validateContinuousRuns("Prepared Sink", selected);
+        List<SSTMeta> selectedMetas = metas(selected);
+        if (minSequenceId(selectedMetas) != prepared.minSequenceId()
+                || maxSequenceId(selectedMetas) != prepared.maxSequenceId()) {
+            throw new IllegalStateException(
+                "pending prepared Sink sequence range differs from local runs: batch=" + prepared.batchId()
+            );
+        }
+        return selected;
+    }
+
+    private static SinkFlightSnapshot sinkFlightForPrepared(
+            PreparedSinkCommit prepared,
+            List<LocalRun> selected) {
+        return new SinkFlightSnapshot(
+            SinkFlightSnapshot.Status.PREPARED_RETRY,
+            prepared.batchId(),
+            maxFlushId(metas(selected)),
+            prepared.minSequenceId(),
+            prepared.maxSequenceId()
+        );
+    }
+
     private static long saturatedAdd(long left, long right) {
         if (right > Long.MAX_VALUE - left) {
             return Long.MAX_VALUE;
@@ -1030,23 +1127,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             return SinkFlightSnapshot.idle();
         }
         PreparedSinkCommit prepared = recovery.pendingPrepares().get(0);
-        Set<Long> selectedIds = Set.copyOf(prepared.sstIds());
-        List<SSTMeta> selected = storageManager.metas().stream()
-            .filter(meta -> selectedIds.contains(meta.runId()))
+        List<LocalRun> candidates = localRuns(storageManager.metas()).stream()
+            .filter(run -> run.meta().state() == SSTState.NEW)
             .toList();
-        if (selected.size() != selectedIds.size()) {
-            throw new IllegalStateException(
-                "pending prepared Sink references missing or replaced local runs: batch=" + prepared.batchId()
-            );
-        }
-        validateContinuousRuns("Prepared Sink recovery", localRuns(selected));
-        return new SinkFlightSnapshot(
-            SinkFlightSnapshot.Status.PREPARED_RETRY,
-            prepared.batchId(),
-            maxFlushId(selected),
-            prepared.minSequenceId(),
-            prepared.maxSequenceId()
-        );
+        List<LocalRun> selected = resolvePreparedRuns(prepared, candidates);
+        return sinkFlightForPrepared(prepared, selected);
     }
 
     private static SequenceStats sequenceStats(List<ImmutableMemTable> immutables) {
