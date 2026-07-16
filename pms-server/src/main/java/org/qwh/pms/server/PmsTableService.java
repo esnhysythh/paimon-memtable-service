@@ -44,6 +44,7 @@ import org.qwh.pms.core.bucket.LocalRunSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
+import org.qwh.pms.core.bucket.SinkFlightSnapshot;
 import org.qwh.pms.core.bucket.operation.CompactionSelection;
 import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.config.FlowControlConfig;
@@ -330,9 +331,11 @@ public final class PmsTableService implements AutoCloseable {
     public void sink() {
         LOG.info("PMS sink started");
         synchronized (paimonCommitPublishLock) {
-            director.sinkToPaimon(SinkSelection.allAvailable())
-                .commitResult()
-                .ifPresent(this::publishCommittedLookupDelta);
+            var state = director.stateSnapshot();
+            var result = state.sinkFlight().status() == SinkFlightSnapshot.Status.PREPARED_RETRY
+                ? director.commitPreparedSink()
+                : director.sinkToPaimon(SinkSelection.allAvailable());
+            result.commitResult().ifPresent(this::publishCommittedLookupDelta);
         }
         retainLocalSSTsUntilWithinLimits();
         LOG.info("PMS sink completed");

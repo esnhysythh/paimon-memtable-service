@@ -37,6 +37,9 @@ public interface PMSBucketDirector {
     /** Executes one oldest continuous NEW prefix within the supplied sequence and batch bounds. */
     SinkOperationResult sinkToPaimon(SinkSelection selection);
 
+    /** Commits the single durable prepared Sink without preparing a new batch. */
+    SinkOperationResult commitPreparedSink();
+
     /** Evicts one oldest SINKED run without performing an implicit compaction. */
     EvictionResult evictOldestSinkedSST();
 

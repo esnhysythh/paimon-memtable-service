@@ -1047,6 +1047,15 @@ class PMSBucketDirectorImplTest {
             assertEquals(SinkFlightSnapshot.Status.PREPARED_RETRY, failedSink.sinkFlight().status());
             assertEquals("sink-1-1", failedSink.sinkFlight().batchId());
             assertEquals(1L, failedSink.sinkFlight().sinkFenceFlushId());
+
+            RuntimeException retryError = assertThrows(RuntimeException.class, dir1::commitPreparedSink);
+            assertTrue(retryError.getMessage().contains("commit failed after prepare"));
+            assertEquals(1, failingSink.prepareCalls);
+            assertEquals(2, failingSink.commitCalls);
+            assertEquals(
+                SinkFlightSnapshot.Status.PREPARED_RETRY,
+                dir1.stateSnapshot().sinkFlight().status()
+            );
         } finally {
             dir1.close();
         }
@@ -1081,6 +1090,54 @@ class PMSBucketDirectorImplTest {
             assertEquals(77L, dir3.stateSnapshot().lastSinkedSnapshotId());
         } finally {
             dir3.close();
+        }
+    }
+
+    @Test
+    void preparedSinkCommitCanRetryInSameProcessWithoutPreparingAgain() throws IOException {
+        FailOnceCommitSinkManager sinkManager = new FailOnceCommitSinkManager(77);
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+
+            RuntimeException firstFailure = assertThrows(
+                RuntimeException.class,
+                () -> dir.sinkToPaimon(SinkSelection.allAvailable())
+            );
+            assertTrue(firstFailure.getMessage().contains("commit failed once after prepare"));
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(1, sinkManager.commitCalls);
+            assertEquals(
+                SinkFlightSnapshot.Status.PREPARED_RETRY,
+                dir.stateSnapshot().sinkFlight().status()
+            );
+
+            flushEntry(dir, "k2", "v2");
+
+            SinkOperationResult retried = dir.commitPreparedSink();
+
+            assertTrue(retried.progressed());
+            assertEquals(77L, retried.commitResult().orElseThrow().snapshotId());
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(2, sinkManager.commitCalls);
+            assertEquals(sinkManager.firstCommit.batchId(), sinkManager.secondCommit.batchId());
+            assertEquals(sinkManager.firstCommit.commitIdentifier(), sinkManager.secondCommit.commitIdentifier());
+            assertEquals(sinkManager.firstCommit.sstIds(), sinkManager.secondCommit.sstIds());
+            assertArrayEquals(sinkManager.firstCommit.payload(), sinkManager.secondCommit.payload());
+            assertEquals(sinkManager.firstCommit.fileRefs(), sinkManager.secondCommit.fileRefs());
+
+            BucketStateSnapshot recovered = dir.stateSnapshot();
+            assertEquals(SinkFlightSnapshot.Status.IDLE, recovered.sinkFlight().status());
+            assertEquals(1, recovered.newSSTCount());
+            assertEquals(1, recovered.sinkedSSTCount());
+            assertEquals(1L, recovered.lastPersistedSequenceId());
+            assertEquals(77L, recovered.lastSinkedSnapshotId());
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElseThrow());
+            assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElseThrow());
+            assertFalse(dir.commitPreparedSink().progressed());
+        } finally {
+            dir.close();
         }
     }
 
@@ -1582,7 +1639,7 @@ class PMSBucketDirectorImplTest {
     }
 
     private static class RecordingSinkManager implements SinkManager {
-        private final long snapshotId;
+        final long snapshotId;
         int prepareCalls;
         int commitCalls;
         String preparedBatchId;
@@ -1633,6 +1690,31 @@ class PMSBucketDirectorImplTest {
         public SinkCommitResult commit(PreparedSinkCommit prepared) {
             commitCalls++;
             throw new RuntimeException("commit failed after prepare");
+        }
+    }
+
+    private static final class FailOnceCommitSinkManager extends RecordingSinkManager {
+        PreparedSinkCommit firstCommit;
+        PreparedSinkCommit secondCommit;
+
+        FailOnceCommitSinkManager(long snapshotId) {
+            super(snapshotId);
+        }
+
+        @Override
+        public SinkCommitResult commit(PreparedSinkCommit prepared) {
+            commitCalls++;
+            if (firstCommit == null) {
+                firstCommit = prepared;
+                throw new RuntimeException("commit failed once after prepare");
+            }
+            secondCommit = prepared;
+            return new SinkCommitResult(
+                prepared.batchId(),
+                snapshotId,
+                prepared.maxSequenceId(),
+                prepared.sstIds()
+            );
         }
     }
 
