@@ -619,9 +619,5 @@ class PaimonSinkManagerIntegrationTest {
             throw new UnsupportedOperationException();
         }
 
-        @Override
-        public Optional<SSTMeta> evictOldestSinkedSST() {
-            throw new UnsupportedOperationException();
-        }
     }
 }

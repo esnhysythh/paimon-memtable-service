@@ -2,16 +2,16 @@ package org.qwh.pms.core.bucket.operation;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import org.qwh.pms.core.bucket.LocalRunSnapshot;
 import org.qwh.pms.core.storage.SSTState;
 
-public record CompactionResult(OperationStatus status, List<Group> groups) {
+public record CompactionResult(OperationStatus status, Optional<Group> group) {
     public CompactionResult {
         Objects.requireNonNull(status, "status must not be null");
-        Objects.requireNonNull(groups, "groups must not be null");
-        groups = List.copyOf(groups);
-        if (status == OperationStatus.PROGRESSED != !groups.isEmpty()) {
-            throw new IllegalArgumentException("compaction progress must match group presence");
+        Objects.requireNonNull(group, "group must not be null");
+        if (status == OperationStatus.PROGRESSED != group.isPresent()) {
+            throw new IllegalArgumentException("compaction progress must match output presence");
         }
     }
 
@@ -20,7 +20,7 @@ public record CompactionResult(OperationStatus status, List<Group> groups) {
     }
 
     public static CompactionResult noop() {
-        return new CompactionResult(OperationStatus.NOOP, List.of());
+        return new CompactionResult(OperationStatus.NOOP, Optional.empty());
     }
 
     public record Group(SSTState state, List<Long> inputRunIds, LocalRunSnapshot outputRun) {
