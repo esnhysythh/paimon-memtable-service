@@ -38,6 +38,7 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -62,8 +63,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private final SinkMetaStore sinkMetaStore;
     private final SinkCoordinator sinkCoordinator;
     private volatile MemTableState memTables;
-    private volatile List<LocalRun> newRuns = List.of();
-    private volatile List<LocalRun> sinkedRuns = List.of();
+    private volatile RunState runState = RunState.empty();
     private volatile SinkFlightSnapshot sinkFlight = SinkFlightSnapshot.idle();
     private volatile long recoveredUnpersistedMaxSequenceId;
     private volatile long lastFlushedSequenceId;
@@ -72,8 +72,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private volatile RecoverySummary lastRecoverySummary = RecoverySummary.empty();
 
     /*
-     * Nested lock order is flushMutex/sstMaintenanceMutex -> lifecycleLock -> writeMutex.
-     * writeQueueMutex is never held while performing WAL, storage, or sink work.
+     * Nested lock order is flushMutex/sstMaintenanceMutex -> lifecycleLock -> writeMutex or
+     * runStateMutex. writeMutex and runStateMutex are separate publication domains and are never
+     * nested with each other. writeQueueMutex is never held while performing WAL, storage, or
+     * sink work.
      */
     /**
      * Operation lease: public operations hold the read side for their full duration, including
@@ -82,14 +84,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
      */
     private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
     /**
-     * Serializes the WAL append -> MemTable apply -> freeze boundary and short MemTable/run
-     * publication updates. Queries and state snapshots never acquire this lock.
+     * Serializes the WAL append -> MemTable apply -> freeze boundary and short MemTableState
+     * publication updates. Queries, state snapshots, and SST maintenance never acquire this lock.
      */
     private final Object writeMutex = new Object();
     /** Serializes Flush selection and publication so one immutable cannot be flushed twice. */
     private final Object flushMutex = new Object();
     private final Object writeQueueMutex = new Object();
     private final ArrayDeque<WriteBatchRequest> pendingWrites = new ArrayDeque<>();
+    /**
+     * Serializes short immutable RunState delta publications from Flush and SST maintenance.
+     * Storage I/O and Paimon I/O must never run while holding this mutex.
+     */
+    private final Object runStateMutex = new Object();
     /**
      * V1 permits one SST maintenance operation at a time. A Sink may leave a durable prepared
      * flight after failure; its logical flush fence then excludes the selected NEW prefix from
@@ -128,12 +135,13 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds(), recoveredSink.lastPersistedSequenceId());
         walManager.truncate(recoveredSink.lastPersistedSequenceId());
         sinkFlight = SinkFlightSnapshot.idle();
-        refreshRunLists();
+        runState = RunState.fromMetas(storageManager.metas());
+        RunState recoveredRuns = runState;
         lastFlushedSequenceId = recoveryState.lastFlushedSequenceId();
         lastPersistedSequenceId = recoveredSink.lastPersistedSequenceId();
         recoveredUnpersistedMaxSequenceId = Math.max(
             recoveryState.maxRecoveredSequenceId(),
-            maxSequenceId(metas(newRuns))
+            maxSequenceId(metas(recoveredRuns.newRuns()))
         );
         lastSinkedSnapshotId = recoveredSink.lastSinkedSnapshotId();
         lastRecoverySummary = new RecoverySummary(
@@ -144,8 +152,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             recoveredSink.sinkedSSTIds().size() - initialSink.sinkedSSTIds().size(),
             recoveredSink.sinkedSSTIds().size(),
             lastSinkedSnapshotId,
-            newRuns.size(),
-            sinkedRuns.size(),
+            recoveredRuns.newRuns().size(),
+            recoveredRuns.sinkedRuns().size(),
             memTables.current().estimatedEntryCount()
         );
         LOG.info("PMS recovery summary: {}", lastRecoverySummary);
@@ -369,24 +377,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                     }
                     memTables = new MemTableState(currentState.current(), immutableList);
                     lastFlushedSequenceId = Math.max(lastFlushedSequenceId, meta.maxSequenceId());
-
-                    List<LocalRun> runList = new ArrayList<>(newRuns);
-                    // A concurrent maintenance refresh may already have observed the durable SST
-                    // after flushToSST() but before this in-memory publication point.
-                    Optional<LocalRun> alreadyPublished = runList.stream()
-                        .filter(run -> run.runId() == meta.runId())
-                        .findFirst();
-                    LocalRun output = alreadyPublished.orElseGet(() -> new LocalRun(meta));
-                    if (alreadyPublished.isEmpty()) {
-                        runList.add(output);
-                    }
-                    newRuns = List.copyOf(runList);
-                    LOG.debug("Flush: immutable count={}, newSST count={}", immutableList.size(), runList.size());
-                    return new FlushResult(
-                        OperationStatus.PROGRESSED,
-                        Optional.of(output.snapshot(nowMillis()))
-                    );
                 }
+                // A run becomes maintenance-eligible only after both its durable flush boundary
+                // and the MemTable -> SST query handoff have completed.
+                LocalRun output = publishFlushedRun(meta);
+                LOG.debug(
+                    "Flush: immutable count={}, newSST count={}",
+                    memTables.immutables().size(),
+                    runState.newRuns().size()
+                );
+                return new FlushResult(
+                    OperationStatus.PROGRESSED,
+                    Optional.of(output.snapshot(nowMillis()))
+                );
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -399,30 +402,27 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                List<LocalRun> toSink;
-                synchronized (writeMutex) {
-                    if (sinkFlight.active()) {
-                        throw new IllegalStateException(
-                            "cannot start a new Sink while another Sink is " + sinkFlight.status()
-                        );
-                    }
-                    if (newRuns.isEmpty()) {
-                        return SinkOperationResult.noop();
-                    }
-                    toSink = List.copyOf(newRuns);
-                    validateContinuousRuns(toSink);
-                    List<SSTMeta> selected = metas(toSink);
-                    sinkFlight = new SinkFlightSnapshot(
-                        SinkFlightSnapshot.Status.IN_FLIGHT,
-                        nextBatchId(selected),
-                        maxFlushId(selected),
-                        minSequenceId(selected),
-                        maxSequenceId(selected)
+                if (sinkFlight.active()) {
+                    throw new IllegalStateException(
+                        "cannot start a new Sink while another Sink is " + sinkFlight.status()
                     );
                 }
+                List<LocalRun> toSink = runState.newRuns();
+                if (toSink.isEmpty()) {
+                    return SinkOperationResult.noop();
+                }
+                validateContinuousRuns(toSink);
                 List<SSTMeta> toSinkMetas = metas(toSink);
+                SinkFlightSnapshot flight = new SinkFlightSnapshot(
+                    SinkFlightSnapshot.Status.IN_FLIGHT,
+                    nextBatchId(toSinkMetas),
+                    maxFlushId(toSinkMetas),
+                    minSequenceId(toSinkMetas),
+                    maxSequenceId(toSinkMetas)
+                );
+                sinkFlight = flight;
                 SinkBatch batch = new SinkBatch(
-                    sinkFlight.batchId(),
+                    flight.batchId(),
                     toSinkMetas,
                     minSequenceId(toSinkMetas),
                     maxSequenceId(toSinkMetas)
@@ -434,26 +434,29 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                     refreshSinkFlightAfterFailureUnderLease();
                     throw e;
                 }
-                storageManager.markSinked(toSinkMetas);
+                Set<Long> sinkedIds = new HashSet<>(result.sstIds());
+                List<SSTMeta> selectedSinkedMetas = storageManager.markSinked(toSinkMetas).stream()
+                    .filter(meta -> sinkedIds.contains(meta.runId()))
+                    .toList();
                 walManager.truncate(result.persistedSequenceId());
-
-                synchronized (writeMutex) {
-                    Set<Long> sinkedIds = new HashSet<>(result.sstIds());
-                    refreshRunLists();
-                    lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
-                    lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
-                    sinkFlight = SinkFlightSnapshot.idle();
-                    List<LocalRunSnapshot> sinked = sinkedRuns.stream()
-                        .filter(run -> sinkedIds.contains(run.runId()))
-                        .map(run -> run.snapshot(nowMillis()))
-                        .toList();
-                    LOG.debug("Sink: newSST count={}, sinkedSST count={}", newRuns.size(), sinkedRuns.size());
-                    return new SinkOperationResult(
-                        OperationStatus.PROGRESSED,
-                        Optional.of(result),
-                        sinked
-                    );
-                }
+                List<LocalRun> publishedSinkedRuns = publishSinkedRuns(sinkedIds, selectedSinkedMetas);
+                lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
+                lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
+                sinkFlight = SinkFlightSnapshot.idle();
+                List<LocalRunSnapshot> sinked = publishedSinkedRuns.stream()
+                    .map(run -> run.snapshot(nowMillis()))
+                    .toList();
+                RunState published = runState;
+                LOG.debug(
+                    "Sink: newSST count={}, sinkedSST count={}",
+                    published.newRuns().size(),
+                    published.sinkedRuns().size()
+                );
+                return new SinkOperationResult(
+                    OperationStatus.PROGRESSED,
+                    Optional.of(result),
+                    sinked
+                );
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -466,47 +469,42 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                synchronized (writeMutex) {
-                    CompactionResult compaction = CompactionResult.noop();
-                    if (sinkedRuns.size() > storageConfig.sinkedMaxCount()) {
-                        Optional<CompactionResult.Group> compacted = compactOneGroupLocked(SSTState.SINKED);
-                        if (compacted.isPresent()) {
-                            compaction = new CompactionResult(OperationStatus.PROGRESSED, List.of(compacted.get()));
-                        }
-                        if (compacted.isPresent() && sinkedRuns.size() <= storageConfig.sinkedMaxCount()) {
-                            LOG.debug(
-                                "Skip sinked SST eviction after compaction: compactedRun={}, remainingSinkedSSTCount={}",
-                                compacted.get().outputRun().runId(),
-                                sinkedRuns.size()
-                            );
-                            return new EvictionResult(
-                                OperationStatus.PROGRESSED,
-                                compaction,
-                                Optional.empty()
-                            );
-                        }
+                CompactionResult compaction = CompactionResult.noop();
+                if (runState.sinkedRuns().size() > storageConfig.sinkedMaxCount()) {
+                    Optional<CompactionResult.Group> compacted = compactOneGroup(SSTState.SINKED);
+                    if (compacted.isPresent()) {
+                        compaction = new CompactionResult(OperationStatus.PROGRESSED, List.of(compacted.get()));
                     }
-                    Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
-                    if (evicted.isPresent()) {
-                        long evictedRunId = evicted.get().runId();
-                        sinkedRuns = sinkedRuns.stream()
-                            .filter(run -> run.runId() != evictedRunId)
-                            .toList();
+                    if (compacted.isPresent() && runState.sinkedRuns().size() <= storageConfig.sinkedMaxCount()) {
                         LOG.debug(
-                            "Evicted sinked SST: runId={}, remainingSinkedSSTCount={}",
-                            evictedRunId,
-                            sinkedRuns.size()
+                            "Skip sinked SST eviction after compaction: compactedRun={}, remainingSinkedSSTCount={}",
+                            compacted.get().outputRun().runId(),
+                            runState.sinkedRuns().size()
                         );
                         return new EvictionResult(
                             OperationStatus.PROGRESSED,
                             compaction,
-                            Optional.of(new LocalRun(evicted.get()).snapshot(nowMillis()))
+                            Optional.empty()
                         );
                     }
-                    return compaction.progressed()
-                        ? new EvictionResult(OperationStatus.PROGRESSED, compaction, Optional.empty())
-                        : EvictionResult.noop();
                 }
+                Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
+                if (evicted.isPresent()) {
+                    LocalRun evictedRun = publishEvictedRun(evicted.get().runId());
+                    LOG.debug(
+                        "Evicted sinked SST: runId={}, remainingSinkedSSTCount={}",
+                        evictedRun.runId(),
+                        runState.sinkedRuns().size()
+                    );
+                    return new EvictionResult(
+                        OperationStatus.PROGRESSED,
+                        compaction,
+                        Optional.of(evictedRun.snapshot(nowMillis()))
+                    );
+                }
+                return compaction.progressed()
+                    ? new EvictionResult(OperationStatus.PROGRESSED, compaction, Optional.empty())
+                    : EvictionResult.noop();
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -519,14 +517,12 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                synchronized (writeMutex) {
-                    List<CompactionResult.Group> groups = new ArrayList<>();
-                    compactOneGroupLocked(SSTState.NEW).ifPresent(groups::add);
-                    compactOneGroupLocked(SSTState.SINKED).ifPresent(groups::add);
-                    return groups.isEmpty()
-                        ? CompactionResult.noop()
-                        : new CompactionResult(OperationStatus.PROGRESSED, groups);
-                }
+                List<CompactionResult.Group> groups = new ArrayList<>();
+                compactOneGroup(SSTState.NEW).ifPresent(groups::add);
+                compactOneGroup(SSTState.SINKED).ifPresent(groups::add);
+                return groups.isEmpty()
+                    ? CompactionResult.noop()
+                    : new CompactionResult(OperationStatus.PROGRESSED, groups);
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -774,11 +770,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return Optional.of(value.bytes());
     }
 
-    private void refreshRunLists() {
-        newRuns = localRuns(storageManager.metas(SSTState.NEW));
-        sinkedRuns = localRuns(storageManager.metas(SSTState.SINKED));
-    }
-
     /** Caller must hold a lifecycle read lease. */
     private void refreshSinkFlightAfterFailureUnderLease() {
         SinkRecoveryState recovery = sinkMetaStore.load();
@@ -804,19 +795,15 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return oldestWriteAtMillis <= 0 ? 0 : Math.max(0, nowMillis - oldestWriteAtMillis);
     }
 
-    private Optional<CompactionResult.Group> compactOneGroupLocked(SSTState state) {
-        List<LocalRun> source = state == SSTState.NEW ? newRuns : sinkedRuns;
+    private Optional<CompactionResult.Group> compactOneGroup(SSTState state) {
+        List<LocalRun> source = runState.runs(state);
         Optional<List<LocalRun>> group = selectCompactionGroup(state, source);
         if (group.isEmpty()) {
             return Optional.empty();
         }
         List<Long> inputRunIds = group.get().stream().map(LocalRun::runId).toList();
         SSTMeta compacted = storageManager.compactSSTs(metas(group.get()));
-        refreshRunLists();
-        LocalRun output = (state == SSTState.NEW ? newRuns : sinkedRuns).stream()
-            .filter(run -> run.runId() == compacted.runId())
-            .findFirst()
-            .orElseThrow(() -> new IllegalStateException("compaction output run is not visible"));
+        LocalRun output = publishCompactedRun(state, Set.copyOf(inputRunIds), compacted);
         LOG.debug(
             "Compacted local SSTs: state={}, inputCount={}, outputRunId={}, flushRange=[{},{}]",
             state,
@@ -830,6 +817,86 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             inputRunIds,
             output.snapshot(nowMillis())
         ));
+    }
+
+    private LocalRun publishFlushedRun(SSTMeta meta) {
+        if (meta.state() != SSTState.NEW) {
+            throw new IllegalArgumentException("flushed run must be NEW");
+        }
+        synchronized (runStateMutex) {
+            RunState current = runState;
+            LocalRun output = new LocalRun(meta);
+            List<LocalRun> updated = new ArrayList<>(current.newRuns());
+            updated.add(output);
+            runState = new RunState(updated, current.sinkedRuns());
+            return output;
+        }
+    }
+
+    private LocalRun publishCompactedRun(SSTState state, Set<Long> inputRunIds, SSTMeta compacted) {
+        if (compacted.state() != state) {
+            throw new IllegalStateException(
+                "compaction output state differs from selected state: expected=" + state
+                    + ", actual=" + compacted.state()
+            );
+        }
+        synchronized (runStateMutex) {
+            RunState current = runState;
+            List<LocalRun> source = current.runs(state);
+            List<LocalRun> updated = new ArrayList<>();
+            for (LocalRun run : source) {
+                if (!inputRunIds.contains(run.runId())) {
+                    updated.add(run);
+                }
+            }
+            if (source.size() - updated.size() != inputRunIds.size()) {
+                throw new IllegalStateException("selected compaction inputs are no longer maintenance-visible");
+            }
+            LocalRun output = new LocalRun(compacted);
+            updated.add(output);
+            runState = state == SSTState.NEW
+                ? new RunState(updated, current.sinkedRuns())
+                : new RunState(current.newRuns(), updated);
+            return output;
+        }
+    }
+
+    private List<LocalRun> publishSinkedRuns(Set<Long> sinkedIds, List<SSTMeta> sinkedMetas) {
+        if (sinkedMetas.size() != sinkedIds.size()
+                || sinkedMetas.stream().anyMatch(meta -> meta.state() != SSTState.SINKED)) {
+            throw new IllegalStateException("Sink success did not publish every selected run as SINKED");
+        }
+        synchronized (runStateMutex) {
+            RunState current = runState;
+            List<LocalRun> remainingNew = current.newRuns().stream()
+                .filter(run -> !sinkedIds.contains(run.runId()))
+                .toList();
+            if (current.newRuns().size() - remainingNew.size() != sinkedIds.size()) {
+                throw new IllegalStateException("Sink inputs are no longer maintenance-visible as NEW");
+            }
+            List<LocalRun> published = localRuns(sinkedMetas);
+            List<LocalRun> updatedSinked = new ArrayList<>(current.sinkedRuns());
+            updatedSinked.addAll(published);
+            runState = new RunState(remainingNew, updatedSinked);
+            return published;
+        }
+    }
+
+    private LocalRun publishEvictedRun(long evictedRunId) {
+        synchronized (runStateMutex) {
+            RunState current = runState;
+            LocalRun evicted = current.sinkedRuns().stream()
+                .filter(run -> run.runId() == evictedRunId)
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                    "evicted run is not maintenance-visible as SINKED: " + evictedRunId
+                ));
+            List<LocalRun> remaining = current.sinkedRuns().stream()
+                .filter(run -> run.runId() != evictedRunId)
+                .toList();
+            runState = new RunState(current.newRuns(), remaining);
+            return evicted;
+        }
     }
 
     private Optional<List<LocalRun>> selectCompactionGroup(SSTState state, List<LocalRun> runs) {
@@ -1131,6 +1198,65 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             Objects.requireNonNull(current, "current must not be null");
             Objects.requireNonNull(immutables, "immutables must not be null");
             immutables = List.copyOf(immutables);
+        }
+    }
+
+    /**
+     * Immutable maintenance-visible SST view. It deliberately advances after the storage mutation:
+     * Flush publishes a run only after its boundary and MemTable handoff complete, while
+     * Sink/compact/evict publish one delta after their storage operation completes.
+     */
+    private record RunState(List<LocalRun> newRuns, List<LocalRun> sinkedRuns) {
+        private RunState {
+            newRuns = normalize(newRuns, SSTState.NEW);
+            sinkedRuns = normalize(sinkedRuns, SSTState.SINKED);
+            Set<Long> runIds = new HashSet<>();
+            for (LocalRun run : newRuns) {
+                if (!runIds.add(run.runId())) {
+                    throw new IllegalArgumentException("duplicate NEW run id: " + run.runId());
+                }
+            }
+            for (LocalRun run : sinkedRuns) {
+                if (!runIds.add(run.runId())) {
+                    throw new IllegalArgumentException("run id appears in both SST states: " + run.runId());
+                }
+            }
+        }
+
+        private static RunState empty() {
+            return new RunState(List.of(), List.of());
+        }
+
+        private static RunState fromMetas(List<SSTMeta> metas) {
+            List<LocalRun> runs = localRuns(metas);
+            return new RunState(
+                runs.stream().filter(run -> run.meta().state() == SSTState.NEW).toList(),
+                runs.stream().filter(run -> run.meta().state() == SSTState.SINKED).toList()
+            );
+        }
+
+        private List<LocalRun> runs(SSTState state) {
+            return state == SSTState.NEW ? newRuns : sinkedRuns;
+        }
+
+        private static List<LocalRun> normalize(List<LocalRun> runs, SSTState expectedState) {
+            Objects.requireNonNull(runs, "runs must not be null");
+            for (LocalRun run : runs) {
+                Objects.requireNonNull(run, "run must not be null");
+                if (run.meta().state() != expectedState) {
+                    throw new IllegalArgumentException(
+                        "run has unexpected state: runId=" + run.runId()
+                            + ", expected=" + expectedState
+                            + ", actual=" + run.meta().state()
+                    );
+                }
+            }
+            return runs.stream()
+                .sorted(
+                    Comparator.comparingLong((LocalRun run) -> run.meta().maxFlushId())
+                        .thenComparingLong(run -> run.meta().minFlushId())
+                )
+                .toList();
         }
     }
 }
