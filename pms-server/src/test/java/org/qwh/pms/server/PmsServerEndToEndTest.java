@@ -50,12 +50,16 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -745,6 +749,70 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void serviceFlushCompletesWhileSinkPrepareIsBlocked() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema())) {
+            AtomicReference<BlockingPrepareSinkManager> sinkManagerRef = new AtomicReference<>();
+            try (PmsTableService service = PmsTableService.open(
+                    server.config(),
+                    (table, commitUser, storage) -> {
+                        BlockingPrepareSinkManager manager = new BlockingPrepareSinkManager(
+                            new PaimonSinkManager(table, commitUser, storage)
+                        );
+                        sinkManagerRef.set(manager);
+                        return manager;
+                    })) {
+                BlockingPrepareSinkManager sinkManager = sinkManagerRef.get();
+                assertNotNull(sinkManager);
+                service.write(Map.of("id", 1, "marker", "before-sink"));
+                service.flush();
+
+                AtomicReference<Throwable> sinkFailure = new AtomicReference<>();
+                Thread sinkThread = new Thread(() -> {
+                    try {
+                        service.sink();
+                    } catch (Throwable failure) {
+                        sinkFailure.set(failure);
+                    }
+                });
+                AtomicReference<Throwable> flushFailure = new AtomicReference<>();
+                Thread flushThread = new Thread(() -> {
+                    try {
+                        service.flush();
+                    } catch (Throwable failure) {
+                        flushFailure.set(failure);
+                    }
+                });
+                try {
+                    sinkThread.start();
+                    assertTrue(sinkManager.prepareEntered.await(5, TimeUnit.SECONDS));
+
+                    service.write(Map.of("id", 2, "marker", "during-sink"));
+                    flushThread.start();
+                    flushThread.join(TimeUnit.SECONDS.toMillis(5));
+
+                    assertFalse(flushThread.isAlive(), "service Flush was blocked by in-flight Sink");
+                    assertNull(flushFailure.get());
+                } finally {
+                    sinkManager.allowPrepare.countDown();
+                    sinkThread.join(TimeUnit.SECONDS.toMillis(5));
+                    flushThread.join(TimeUnit.SECONDS.toMillis(5));
+                }
+
+                assertFalse(sinkThread.isAlive(), "service Sink did not finish");
+                assertNull(sinkFailure.get());
+                Map<String, Object> afterFirstSink = service.state();
+                assertEquals(1L, number(afterFirstSink, "newSSTCount"));
+                assertEquals(1L, number(afterFirstSink, "sinkedSSTCount"));
+
+                service.sink();
+                Map<String, Object> afterSecondSink = service.state();
+                assertEquals(0L, number(afterSecondSink, "newSSTCount"));
+                assertEquals(2L, number(afterSecondSink, "sinkedSSTCount"));
+            }
+        }
+    }
+
+    @Test
     void configManagerLoadsPropertiesFile() throws Exception {
         Properties props = baseProperties();
         java.nio.file.Path configFile = tempDir.resolve("pms-server.properties");
@@ -1075,6 +1143,35 @@ class PmsServerEndToEndTest {
         @Override
         public SinkCommitResult commit(PreparedSinkCommit prepared) {
             throw new RuntimeException("forced commit failure after prepare");
+        }
+    }
+
+    private static final class BlockingPrepareSinkManager implements SinkManager {
+        private final SinkManager delegate;
+        private final CountDownLatch prepareEntered = new CountDownLatch(1);
+        private final CountDownLatch allowPrepare = new CountDownLatch(1);
+
+        private BlockingPrepareSinkManager(SinkManager delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public PreparedSinkCommit prepare(SinkBatch batch) {
+            prepareEntered.countDown();
+            try {
+                if (!allowPrepare.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("timed out waiting to release blocked Sink prepare");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("blocked Sink prepare was interrupted", e);
+            }
+            return delegate.prepare(batch);
+        }
+
+        @Override
+        public SinkCommitResult commit(PreparedSinkCommit prepared) {
+            return delegate.commit(prepared);
         }
     }
 

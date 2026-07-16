@@ -71,7 +71,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
 
 public final class PmsTableService implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(PmsTableService.class);
@@ -90,8 +89,9 @@ public final class PmsTableService implements AutoCloseable {
     private final PmsTableSchema protocolTableSchema;
     private final StorageConfig storageConfig;
     private final FlowControlConfig flowControlConfig;
-    private final ReentrantLock maintenanceLock = new ReentrantLock();
     private final Object paimonCommitPublishLock = new Object();
+    /** Serializes each retention check-and-evict loop without blocking Flush or Paimon Sink I/O. */
+    private final Object retentionMutex = new Object();
     private final PaimonKeyValueLookupService paimonLookup;
     private final ThresholdFileLookupRouter lookupRouter;
     private final LocalCacheDirectory lookupCacheDirectory;
@@ -317,38 +317,23 @@ public final class PmsTableService implements AutoCloseable {
     }
 
     public void flush() {
-        maintenanceLock.lock();
-        try {
-            LOG.info("PMS flush started");
-            director.freezeCurMemTable();
-            director.flushImmutableMemTable();
-            LOG.info("PMS flush completed");
-        } finally {
-            maintenanceLock.unlock();
-        }
+        LOG.info("PMS flush started");
+        director.freezeCurMemTable();
+        director.flushImmutableMemTable();
+        LOG.info("PMS flush completed");
     }
 
     public void sink() {
-        maintenanceLock.lock();
-        try {
-            LOG.info("PMS sink started");
-            synchronized (paimonCommitPublishLock) {
-                director.sinkToPaimon().commitResult().ifPresent(this::publishCommittedLookupDelta);
-            }
-            retainLocalSSTsLocked();
-            LOG.info("PMS sink completed");
-        } finally {
-            maintenanceLock.unlock();
+        LOG.info("PMS sink started");
+        synchronized (paimonCommitPublishLock) {
+            director.sinkToPaimon().commitResult().ifPresent(this::publishCommittedLookupDelta);
         }
+        retainLocalSSTsUntilWithinLimits();
+        LOG.info("PMS sink completed");
     }
 
     public void retainLocalSSTs() {
-        maintenanceLock.lock();
-        try {
-            retainLocalSSTsLocked();
-        } finally {
-            maintenanceLock.unlock();
-        }
+        retainLocalSSTsUntilWithinLimits();
     }
 
     public Map<String, Object> state() {
@@ -630,23 +615,25 @@ public final class PmsTableService implements AutoCloseable {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
     }
 
-    private void retainLocalSSTsLocked() {
-        int evictedCount = 0;
-        while (shouldEvictSinkedSST(director.stateSnapshot())) {
-            var evicted = director.evictOldestSinkedSST().evictedRun();
-            if (evicted.isEmpty()) {
-                break;
+    private void retainLocalSSTsUntilWithinLimits() {
+        synchronized (retentionMutex) {
+            int evictedCount = 0;
+            while (shouldEvictSinkedSST(director.stateSnapshot())) {
+                var evicted = director.evictOldestSinkedSST().evictedRun();
+                if (evicted.isEmpty()) {
+                    break;
+                }
+                evictedCount++;
+                LOG.info(
+                    "Evicted sinked SST by retention: runId={}, fileSize={}, entryCount={}",
+                    evicted.get().runId(),
+                    evicted.get().fileSizeBytes(),
+                    evicted.get().entryCount()
+                );
             }
-            evictedCount++;
-            LOG.info(
-                "Evicted sinked SST by retention: runId={}, fileSize={}, entryCount={}",
-                evicted.get().runId(),
-                evicted.get().fileSizeBytes(),
-                evicted.get().entryCount()
-            );
-        }
-        if (evictedCount > 0) {
-            LOG.info("PMS local SST retention completed, evictedSinkedSSTCount={}", evictedCount);
+            if (evictedCount > 0) {
+                LOG.info("PMS local SST retention completed, evictedSinkedSSTCount={}", evictedCount);
+            }
         }
     }
 

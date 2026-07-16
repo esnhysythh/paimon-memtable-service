@@ -434,7 +434,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                     refreshSinkFlightAfterFailureUnderLease();
                     throw e;
                 }
-                Set<Long> sinkedIds = new HashSet<>(result.sstIds());
+                Set<Long> sinkedIds = new HashSet<>(toSink.stream().map(LocalRun::runId).toList());
                 List<SSTMeta> selectedSinkedMetas = storageManager.markSinked(toSinkMetas).stream()
                     .filter(meta -> sinkedIds.contains(meta.runId()))
                     .toList();
