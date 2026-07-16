@@ -3,10 +3,12 @@ package org.qwh.pms.core.bucket;
 import java.util.List;
 import java.util.Optional;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
+import org.qwh.pms.core.bucket.operation.CompactionSelection;
 import org.qwh.pms.core.bucket.operation.EvictionResult;
 import org.qwh.pms.core.bucket.operation.FlushResult;
 import org.qwh.pms.core.bucket.operation.FreezeResult;
 import org.qwh.pms.core.bucket.operation.SinkOperationResult;
+import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Value;
 
@@ -32,11 +34,14 @@ public interface PMSBucketDirector {
 
     FlushResult flushImmutableMemTable();
 
-    SinkOperationResult sinkToPaimon();
+    /** Executes one oldest continuous NEW prefix within the supplied sequence and batch bounds. */
+    SinkOperationResult sinkToPaimon(SinkSelection selection);
 
+    /** Evicts one oldest SINKED run without performing an implicit compaction. */
     EvictionResult evictOldestSinkedSST();
 
-    CompactionResult compactLocalSSTs();
+    /** Compacts exactly one selected same-state continuous group; stale selections are noops. */
+    CompactionResult compactLocalSSTs(CompactionSelection selection);
 
     BucketStateSnapshot stateSnapshot();
 

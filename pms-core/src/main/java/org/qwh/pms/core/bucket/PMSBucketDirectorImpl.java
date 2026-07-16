@@ -2,13 +2,14 @@ package org.qwh.pms.core.bucket;
 
 import org.qwh.pms.core.config.MemTableConfig;
 import org.qwh.pms.core.config.PMSConfig;
-import org.qwh.pms.core.config.StorageConfig;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
+import org.qwh.pms.core.bucket.operation.CompactionSelection;
 import org.qwh.pms.core.bucket.operation.EvictionResult;
 import org.qwh.pms.core.bucket.operation.FlushResult;
 import org.qwh.pms.core.bucket.operation.FreezeResult;
 import org.qwh.pms.core.bucket.operation.OperationStatus;
 import org.qwh.pms.core.bucket.operation.SinkOperationResult;
+import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.memtable.CurMemTable;
 import org.qwh.pms.core.memtable.ImmutableMemTable;
 import org.qwh.pms.core.memtable.SkipListCurMemTable;
@@ -57,7 +58,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private static final int MAX_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
 
     private final MemTableConfig memTableConfig;
-    private final StorageConfig storageConfig;
     private final WALManagerImpl walManager;
     private final FileLocalStorageManager storageManager;
     private final SinkMetaStore sinkMetaStore;
@@ -111,7 +111,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         Objects.requireNonNull(config, "config must not be null");
         Objects.requireNonNull(sinkManagerFactory, "sinkManagerFactory must not be null");
         this.memTableConfig = config.memtable();
-        this.storageConfig = config.storage();
         this.walManager = new WALManagerImpl(config);
         this.storageManager = new FileLocalStorageManager(config.storage());
         this.sinkMetaStore = new SinkMetaStore(Path.of(config.storage().dir()).resolve("sink"));
@@ -397,7 +396,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public SinkOperationResult sinkToPaimon() {
+    public SinkOperationResult sinkToPaimon(SinkSelection selection) {
+        Objects.requireNonNull(selection, "selection must not be null");
         synchronized (sstMaintenanceMutex) {
             lifecycleLock.readLock().lock();
             try {
@@ -407,11 +407,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                         "cannot start a new Sink while another Sink is " + sinkFlight.status()
                     );
                 }
-                List<LocalRun> toSink = runState.newRuns();
+                List<LocalRun> toSink = selectSinkPrefix(selection, runState.newRuns());
                 if (toSink.isEmpty()) {
                     return SinkOperationResult.noop();
                 }
-                validateContinuousRuns(toSink);
                 List<SSTMeta> toSinkMetas = metas(toSink);
                 SinkFlightSnapshot flight = new SinkFlightSnapshot(
                     SinkFlightSnapshot.Status.IN_FLIGHT,
@@ -469,42 +468,22 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                CompactionResult compaction = CompactionResult.noop();
-                if (runState.sinkedRuns().size() > storageConfig.sinkedMaxCount()) {
-                    Optional<CompactionResult.Group> compacted = compactOneGroup(SSTState.SINKED);
-                    if (compacted.isPresent()) {
-                        compaction = new CompactionResult(OperationStatus.PROGRESSED, List.of(compacted.get()));
-                    }
-                    if (compacted.isPresent() && runState.sinkedRuns().size() <= storageConfig.sinkedMaxCount()) {
-                        LOG.debug(
-                            "Skip sinked SST eviction after compaction: compactedRun={}, remainingSinkedSSTCount={}",
-                            compacted.get().outputRun().runId(),
-                            runState.sinkedRuns().size()
-                        );
-                        return new EvictionResult(
-                            OperationStatus.PROGRESSED,
-                            compaction,
-                            Optional.empty()
-                        );
-                    }
+                List<LocalRun> sinkedRuns = runState.sinkedRuns();
+                if (sinkedRuns.isEmpty()) {
+                    return EvictionResult.noop();
                 }
-                Optional<SSTMeta> evicted = storageManager.evictOldestSinkedSST();
-                if (evicted.isPresent()) {
-                    LocalRun evictedRun = publishEvictedRun(evicted.get().runId());
-                    LOG.debug(
-                        "Evicted sinked SST: runId={}, remainingSinkedSSTCount={}",
-                        evictedRun.runId(),
-                        runState.sinkedRuns().size()
-                    );
-                    return new EvictionResult(
-                        OperationStatus.PROGRESSED,
-                        compaction,
-                        Optional.of(evictedRun.snapshot(nowMillis()))
-                    );
-                }
-                return compaction.progressed()
-                    ? new EvictionResult(OperationStatus.PROGRESSED, compaction, Optional.empty())
-                    : EvictionResult.noop();
+                LocalRun oldest = sinkedRuns.get(0);
+                storageManager.deleteSST(oldest.meta());
+                LocalRun evictedRun = publishEvictedRun(oldest.runId());
+                LOG.debug(
+                    "Evicted sinked SST: runId={}, remainingSinkedSSTCount={}",
+                    evictedRun.runId(),
+                    runState.sinkedRuns().size()
+                );
+                return new EvictionResult(
+                    OperationStatus.PROGRESSED,
+                    Optional.of(evictedRun.snapshot(nowMillis()))
+                );
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -512,17 +491,18 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public CompactionResult compactLocalSSTs() {
+    public CompactionResult compactLocalSSTs(CompactionSelection selection) {
+        Objects.requireNonNull(selection, "selection must not be null");
         synchronized (sstMaintenanceMutex) {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                List<CompactionResult.Group> groups = new ArrayList<>();
-                compactOneGroup(SSTState.NEW).ifPresent(groups::add);
-                compactOneGroup(SSTState.SINKED).ifPresent(groups::add);
-                return groups.isEmpty()
-                    ? CompactionResult.noop()
-                    : new CompactionResult(OperationStatus.PROGRESSED, groups);
+                Optional<List<LocalRun>> selected = resolveCompactionSelection(selection);
+                if (selected.isEmpty()) {
+                    return CompactionResult.noop();
+                }
+                CompactionResult.Group group = compactSelectedGroup(selection.state(), selected.get());
+                return new CompactionResult(OperationStatus.PROGRESSED, Optional.of(group));
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -795,28 +775,23 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return oldestWriteAtMillis <= 0 ? 0 : Math.max(0, nowMillis - oldestWriteAtMillis);
     }
 
-    private Optional<CompactionResult.Group> compactOneGroup(SSTState state) {
-        List<LocalRun> source = runState.runs(state);
-        Optional<List<LocalRun>> group = selectCompactionGroup(state, source);
-        if (group.isEmpty()) {
-            return Optional.empty();
-        }
-        List<Long> inputRunIds = group.get().stream().map(LocalRun::runId).toList();
-        SSTMeta compacted = storageManager.compactSSTs(metas(group.get()));
+    private CompactionResult.Group compactSelectedGroup(SSTState state, List<LocalRun> selected) {
+        List<Long> inputRunIds = selected.stream().map(LocalRun::runId).toList();
+        SSTMeta compacted = storageManager.compactSSTs(metas(selected));
         LocalRun output = publishCompactedRun(state, Set.copyOf(inputRunIds), compacted);
         LOG.debug(
             "Compacted local SSTs: state={}, inputCount={}, outputRunId={}, flushRange=[{},{}]",
             state,
-            group.get().size(),
+            selected.size(),
             compacted.runId(),
             compacted.minFlushId(),
             compacted.maxFlushId()
         );
-        return Optional.of(new CompactionResult.Group(
+        return new CompactionResult.Group(
             state,
             inputRunIds,
             output.snapshot(nowMillis())
-        ));
+        );
     }
 
     private LocalRun publishFlushedRun(SSTMeta meta) {
@@ -899,18 +874,57 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
-    private Optional<List<LocalRun>> selectCompactionGroup(SSTState state, List<LocalRun> runs) {
-        if (runs.size() < storageConfig.compactMinFiles()) {
+    private static List<LocalRun> selectSinkPrefix(SinkSelection selection, List<LocalRun> newRuns) {
+        if (newRuns.isEmpty()) {
+            return List.of();
+        }
+        validateContinuousRuns("Sink", newRuns);
+        List<LocalRun> selected = new ArrayList<>();
+        long selectedBytes = 0;
+        for (LocalRun run : newRuns) {
+            SSTMeta meta = run.meta();
+            if (meta.minSequenceId() <= selection.targetSequenceId()
+                    && meta.maxSequenceId() > selection.targetSequenceId()) {
+                throw new IllegalStateException(
+                    "NEW run crosses Sink target sequence fence: runId=" + run.runId()
+                        + ", sequenceRange=[" + meta.minSequenceId() + "," + meta.maxSequenceId() + "]"
+                        + ", targetSequenceId=" + selection.targetSequenceId()
+                );
+            }
+            if (meta.maxSequenceId() > selection.targetSequenceId()
+                    || selected.size() >= selection.maxSstCount()) {
+                break;
+            }
+            if (!selected.isEmpty()
+                    && meta.fileSize() > selection.maxInputBytes() - selectedBytes) {
+                break;
+            }
+            // A single oversized oldest run is allowed so a positive byte limit cannot stall
+            // persisted-boundary progress forever.
+            selected.add(run);
+            selectedBytes = saturatedAdd(selectedBytes, meta.fileSize());
+        }
+        return List.copyOf(selected);
+    }
+
+    private Optional<List<LocalRun>> resolveCompactionSelection(CompactionSelection selection) {
+        List<LocalRun> source = runState.runs(selection.state());
+        Set<Long> selectedIds = Set.copyOf(selection.inputRunIds());
+        List<LocalRun> selected = source.stream()
+            .filter(run -> selectedIds.contains(run.runId()))
+            .toList();
+        if (selected.size() != selection.inputRunIds().size()) {
             return Optional.empty();
         }
-        long sinkFenceFlushId = state == SSTState.NEW && sinkFlight.active()
+        List<Long> orderedIds = selected.stream().map(LocalRun::runId).toList();
+        if (!orderedIds.equals(selection.inputRunIds())) {
+            throw new IllegalArgumentException("compaction inputs must be ordered from oldest to newest");
+        }
+        validateContinuousRuns("Compaction", selected);
+        long sinkFenceFlushId = selection.state() == SSTState.NEW && sinkFlight.active()
             ? sinkFlight.sinkFenceFlushId()
             : 0;
-        long maxGroupBytes = storageConfig.compactThresholdMb() * 1024L * 1024L;
-        List<LocalRun> group = new ArrayList<>();
-        long groupBytes = 0;
-        long previousMaxFlushId = -1;
-        for (LocalRun run : runs) {
+        for (LocalRun run : selected) {
             SSTMeta sst = run.meta();
             if (sinkFenceFlushId > 0) {
                 if (sst.minFlushId() <= sinkFenceFlushId && sst.maxFlushId() > sinkFenceFlushId) {
@@ -921,28 +935,18 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                     );
                 }
                 if (sst.maxFlushId() <= sinkFenceFlushId) {
-                    continue;
+                    return Optional.empty();
                 }
-            }
-            boolean continuous = group.isEmpty() || previousMaxFlushId + 1 == sst.minFlushId();
-            boolean fits = sst.fileSize() <= maxGroupBytes && groupBytes + sst.fileSize() <= maxGroupBytes;
-            if (!continuous || !fits) {
-                if (group.size() >= storageConfig.compactMinFiles()) {
-                    return Optional.of(List.copyOf(group));
-                }
-                group.clear();
-                groupBytes = 0;
-                previousMaxFlushId = -1;
-            }
-            if (sst.fileSize() <= maxGroupBytes) {
-                group.add(run);
-                groupBytes += sst.fileSize();
-                previousMaxFlushId = sst.maxFlushId();
             }
         }
-        return group.size() >= storageConfig.compactMinFiles()
-            ? Optional.of(List.copyOf(group))
-            : Optional.empty();
+        return Optional.of(selected);
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        if (right > Long.MAX_VALUE - left) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
     }
 
     private void maybeFreezeLocked() {
@@ -999,13 +1003,13 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return ssts.stream().mapToLong(SSTMeta::maxFlushId).max().orElse(0);
     }
 
-    private static void validateContinuousRuns(List<LocalRun> runs) {
+    private static void validateContinuousRuns(String operation, List<LocalRun> runs) {
         long previousMaxFlushId = -1;
         for (LocalRun run : runs) {
             SSTMeta meta = run.meta();
             if (previousMaxFlushId >= 0 && previousMaxFlushId + 1 != meta.minFlushId()) {
                 throw new IllegalStateException(
-                    "Sink requires a continuous NEW prefix: previousMaxFlushId=" + previousMaxFlushId
+                    operation + " requires continuous local runs: previousMaxFlushId=" + previousMaxFlushId
                         + ", nextRange=[" + meta.minFlushId() + "," + meta.maxFlushId() + "]"
                 );
             }
@@ -1035,7 +1039,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 "pending prepared Sink references missing or replaced local runs: batch=" + prepared.batchId()
             );
         }
-        validateContinuousRuns(localRuns(selected));
+        validateContinuousRuns("Prepared Sink recovery", localRuns(selected));
         return new SinkFlightSnapshot(
             SinkFlightSnapshot.Status.PREPARED_RETRY,
             prepared.batchId(),

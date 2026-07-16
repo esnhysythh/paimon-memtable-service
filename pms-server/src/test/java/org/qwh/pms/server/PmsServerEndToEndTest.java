@@ -424,6 +424,39 @@ class PmsServerEndToEndTest {
     }
 
     @Test
+    void sinkRetentionCompactsAnExplicitSinkedRunGroupBeforeEviction() throws Exception {
+        Properties props = baseProperties();
+        props.setProperty("pms.storage.sinked_max_count", "1");
+        props.setProperty("pms.storage.compact_min_files", "2");
+        PmsServerConfig config = new ConfigManager().from(props);
+
+        try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
+            server.write(Map.of("id", 1, "marker", "compact-1"));
+            server.flush();
+            server.write(Map.of("id", 2, "marker", "compact-2"));
+            server.flush();
+
+            server.sink();
+
+            Map<String, Object> state = server.getJson("/state");
+            assertEquals(0L, number(state, "newSSTCount"));
+            assertEquals(1L, number(state, "sinkedSSTCount"));
+            assertEquals(2L, number(state, "sinkedSSTTotalRows"));
+            assertFalse(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000001.sst")));
+            assertFalse(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000002.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000002.sst")));
+            assertEquals(
+                Map.of("id", 1, "marker", "compact-1"),
+                server.getLocal(Map.of("id", 1)).row()
+            );
+            assertEquals(
+                Map.of("id", 2, "marker", "compact-2"),
+                server.getLocal(Map.of("id", 2)).row()
+            );
+        }
+    }
+
+    @Test
     void prefixLocalReturnsLatestRowsAcrossLocalLayersAndFiltersTombstones() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, compositePkSchema()).start()) {
             server.write(Map.of("id", 1, "sub_id", 1, "marker", "old-1"));

@@ -4,10 +4,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
+import org.qwh.pms.core.bucket.operation.CompactionSelection;
 import org.qwh.pms.core.bucket.operation.EvictionResult;
 import org.qwh.pms.core.bucket.operation.FlushResult;
 import org.qwh.pms.core.bucket.operation.FreezeResult;
 import org.qwh.pms.core.bucket.operation.SinkOperationResult;
+import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.config.*;
 import org.qwh.pms.core.memtable.model.Entry;
 import org.qwh.pms.core.memtable.model.Value;
@@ -254,8 +256,8 @@ class PMSBucketDirectorImplTest {
             assertFalse(freeze.progressed());
             assertEquals(0L, freeze.fenceSequenceId());
             assertFalse(dir.flushImmutableMemTable().progressed());
-            assertFalse(dir.sinkToPaimon().progressed());
-            assertFalse(dir.compactLocalSSTs().progressed());
+            assertFalse(dir.sinkToPaimon(SinkSelection.allAvailable()).progressed());
+            assertFalse(dir.compactLocalSSTs(new CompactionSelection(SSTState.NEW, List.of(1L, 2L))).progressed());
             assertFalse(dir.evictOldestSinkedSST().progressed());
         } finally {
             dir.close();
@@ -339,11 +341,11 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            LocalRunSnapshot compacted = dir.compactLocalSSTs()
-                .groups().get(0).outputRun();
+            LocalRunSnapshot compacted = compactAllRuns(dir, SSTState.NEW)
+                .group().orElseThrow().outputRun();
             assertEquals(oldestWriteAtMillis, compacted.oldestWriteAtMillis());
 
-            LocalRunSnapshot sinked = dir.sinkToPaimon().sinkedRuns().get(0);
+            LocalRunSnapshot sinked = dir.sinkToPaimon(SinkSelection.allAvailable()).sinkedRuns().get(0);
             assertEquals(oldestWriteAtMillis, sinked.oldestWriteAtMillis());
             assertEquals(SSTState.SINKED, sinked.state());
 
@@ -376,7 +378,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(0L, recovered.lastPersistedSequenceId());
             assertTrue(recovered.recoveredUnpersistedData());
 
-            dir2.sinkToPaimon();
+            dir2.sinkToPaimon(SinkSelection.allAvailable());
             BucketStateSnapshot persisted = dir2.stateSnapshot();
             assertEquals(1L, persisted.lastPersistedSequenceId());
             assertFalse(persisted.recoveredUnpersistedData());
@@ -492,8 +494,14 @@ class PMSBucketDirectorImplTest {
         assertThrows(IllegalStateException.class, () -> dir.delete("k".getBytes()));
         assertThrows(IllegalStateException.class, () -> dir.get("k".getBytes()));
         assertThrows(IllegalStateException.class, dir::freezeCurMemTable);
-        assertThrows(IllegalStateException.class, dir::sinkToPaimon);
-        assertThrows(IllegalStateException.class, dir::compactLocalSSTs);
+        assertThrows(
+            IllegalStateException.class,
+            () -> dir.sinkToPaimon(SinkSelection.allAvailable())
+        );
+        assertThrows(
+            IllegalStateException.class,
+            () -> dir.compactLocalSSTs(new CompactionSelection(SSTState.NEW, List.of(1L, 2L)))
+        );
         assertThrows(IllegalStateException.class, dir::stateSnapshot);
         dir.close();
     }
@@ -595,7 +603,7 @@ class PMSBucketDirectorImplTest {
             dir.put("q/1".getBytes(), "outside".getBytes());
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
-            dir.sinkToPaimon();
+            dir.sinkToPaimon(SinkSelection.allAvailable());
 
             dir.put("p/1".getBytes(), "new-1".getBytes());
             dir.delete("p/2".getBytes());
@@ -645,13 +653,12 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            CompactionResult compaction = dir.compactLocalSSTs();
+            CompactionResult compaction = compactAllRuns(dir, SSTState.NEW);
 
             assertTrue(compaction.progressed());
-            assertEquals(1, compaction.groups().size());
-            assertEquals(List.of(1L, 2L), compaction.groups().get(0).inputRunIds());
-            assertEquals(1L, compaction.groups().get(0).outputRun().minFlushId());
-            assertEquals(2L, compaction.groups().get(0).outputRun().maxFlushId());
+            assertEquals(List.of(1L, 2L), compaction.group().orElseThrow().inputRunIds());
+            assertEquals(1L, compaction.group().orElseThrow().outputRun().minFlushId());
+            assertEquals(2L, compaction.group().orElseThrow().outputRun().maxFlushId());
 
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertEquals(1, snap.newSSTCount());
@@ -678,7 +685,7 @@ class PMSBucketDirectorImplTest {
             Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
             assertTrue(Files.exists(sstFile));
 
-            SinkOperationResult sink = dir.sinkToPaimon();
+            SinkOperationResult sink = dir.sinkToPaimon(SinkSelection.allAvailable());
 
             assertTrue(sink.progressed());
             assertEquals(1L, sink.commitResult().orElseThrow().snapshotId());
@@ -706,13 +713,96 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            dir.sinkToPaimon();
+            dir.sinkToPaimon(SinkSelection.allAvailable());
 
             assertEquals(1, sinkManager.prepareCalls);
             assertEquals(1, sinkManager.commitCalls);
             assertEquals("sink-1-1", sinkManager.preparedBatchId);
             assertEquals(1L, sinkManager.preparedMaxSequenceId);
             assertEquals(99L, dir.stateSnapshot().lastSinkedSnapshotId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void boundedSinkSelectionAdvancesOneContinuousPrefixTowardFixedFence() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+            flushEntry(dir, "k2", "v2");
+            flushEntry(dir, "k3", "v3");
+
+            SinkOperationResult first = dir.sinkToPaimon(new SinkSelection(3, 1, Long.MAX_VALUE));
+
+            assertTrue(first.progressed());
+            assertEquals(List.of(1L), first.sinkedRuns().stream().map(LocalRunSnapshot::runId).toList());
+            assertEquals(1L, dir.stateSnapshot().lastPersistedSequenceId());
+
+            SinkOperationResult second = dir.sinkToPaimon(new SinkSelection(2, 10, Long.MAX_VALUE));
+
+            assertTrue(second.progressed());
+            assertEquals(List.of(2L), second.sinkedRuns().stream().map(LocalRunSnapshot::runId).toList());
+            BucketStateSnapshot atFence = dir.stateSnapshot();
+            assertEquals(2L, atFence.lastPersistedSequenceId());
+            assertEquals(1, atFence.newSSTCount());
+            assertEquals(3L, atFence.newSSTMinSequenceId());
+            assertFalse(dir.sinkToPaimon(new SinkSelection(2, 10, Long.MAX_VALUE)).progressed());
+
+            assertTrue(dir.sinkToPaimon(SinkSelection.allAvailable()).progressed());
+            assertEquals(3L, dir.stateSnapshot().lastPersistedSequenceId());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void sinkByteLimitStillAllowsOneOversizedOldestRun() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+            flushEntry(dir, "k2", "v2");
+            flushEntry(dir, "k3", "v3");
+            List<LocalRunSnapshot> runs = dir.stateSnapshot().localRuns();
+            long belowFirstTwo = runs.get(0).fileSizeBytes() + runs.get(1).fileSizeBytes() - 1;
+
+            SinkOperationResult first = dir.sinkToPaimon(
+                new SinkSelection(Long.MAX_VALUE, 10, belowFirstTwo)
+            );
+
+            assertEquals(List.of(1L), first.sinkedRuns().stream().map(LocalRunSnapshot::runId).toList());
+
+            SinkOperationResult oversized = dir.sinkToPaimon(
+                new SinkSelection(Long.MAX_VALUE, 10, 1)
+            );
+
+            assertEquals(List.of(2L), oversized.sinkedRuns().stream().map(LocalRunSnapshot::runId).toList());
+            assertEquals(1, dir.stateSnapshot().newSSTCount());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void sinkSelectionRejectsRunCrossingTargetSequenceFence() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.put("k2".getBytes(), "v2".getBytes());
+            dir.freezeCurMemTable();
+            dir.flushImmutableMemTable();
+
+            IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> dir.sinkToPaimon(new SinkSelection(1, 10, Long.MAX_VALUE))
+            );
+
+            assertTrue(error.getMessage().contains("crosses Sink target sequence fence"));
+            assertEquals(1, dir.stateSnapshot().newSSTCount());
+            assertEquals(SinkFlightSnapshot.Status.IDLE, dir.stateSnapshot().sinkFlight().status());
         } finally {
             dir.close();
         }
@@ -726,7 +816,7 @@ class PMSBucketDirectorImplTest {
         AtomicReference<Throwable> sinkFailure = new AtomicReference<>();
         Thread sinkThread = new Thread(() -> {
             try {
-                dir.sinkToPaimon();
+                dir.sinkToPaimon(SinkSelection.allAvailable());
             } catch (Throwable failure) {
                 sinkFailure.set(failure);
             }
@@ -754,7 +844,7 @@ class PMSBucketDirectorImplTest {
             assertEquals(2L, afterFirstSink.newSSTMinSequenceId());
             assertEquals(2L, afterFirstSink.newSSTMaxSequenceId());
 
-            assertTrue(dir.sinkToPaimon().progressed());
+            assertTrue(dir.sinkToPaimon(SinkSelection.allAvailable()).progressed());
             BucketStateSnapshot afterSecondSink = dir.stateSnapshot();
             assertEquals(0, afterSecondSink.newSSTCount());
             assertEquals(2, afterSecondSink.sinkedSSTCount());
@@ -779,9 +869,9 @@ class PMSBucketDirectorImplTest {
             dir1.put("k2".getBytes(), "v2".getBytes());
             dir1.freezeCurMemTable();
             dir1.flushImmutableMemTable();
-            dir1.sinkToPaimon();
+            dir1.sinkToPaimon(SinkSelection.allAvailable());
 
-            dir1.compactLocalSSTs();
+            compactAllRuns(dir1, SSTState.SINKED);
 
             BucketStateSnapshot compacted = dir1.stateSnapshot();
             assertEquals(0, compacted.newSSTCount());
@@ -805,7 +895,30 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
-    void evictCompactsFirstWhenOnlySinkedCountExceedsLimit() throws IOException {
+    void explicitCompactionRejectsNonContinuousInputsAndNoopsWhenStale() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256, 100, 32, 2));
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+            flushEntry(dir, "k2", "v2");
+            flushEntry(dir, "k3", "v3");
+
+            assertThrows(
+                IllegalStateException.class,
+                () -> compactRuns(dir, SSTState.NEW, List.of(1L, 3L))
+            );
+            assertFalse(compactRuns(dir, SSTState.NEW, List.of(98L, 99L)).progressed());
+
+            assertTrue(compactRuns(dir, SSTState.NEW, List.of(1L, 2L)).progressed());
+            assertFalse(compactRuns(dir, SSTState.NEW, List.of(1L, 2L)).progressed());
+            assertEquals(2, dir.stateSnapshot().newSSTCount());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void explicitSinkedCompactionCanResolveCountPressureWithoutEviction() throws IOException {
         PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256, 1, 32, 2));
         dir.init();
         try {
@@ -815,13 +928,11 @@ class PMSBucketDirectorImplTest {
             dir.put("k2".getBytes(), "v2".getBytes());
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
-            dir.sinkToPaimon();
+            dir.sinkToPaimon(SinkSelection.allAvailable());
 
-            EvictionResult eviction = dir.evictOldestSinkedSST();
+            CompactionResult compaction = compactAllRuns(dir, SSTState.SINKED);
 
-            assertTrue(eviction.progressed());
-            assertTrue(eviction.compaction().progressed());
-            assertTrue(eviction.evictedRun().isEmpty());
+            assertTrue(compaction.progressed());
             BucketStateSnapshot snap = dir.stateSnapshot();
             assertEquals(1, snap.sinkedSSTCount());
             assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElse(null));
@@ -843,7 +954,7 @@ class PMSBucketDirectorImplTest {
             dir.put("k2".getBytes(), "v2".getBytes());
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
-            dir.sinkToPaimon();
+            dir.sinkToPaimon(SinkSelection.allAvailable());
 
             dir.put("k3".getBytes(), "v3".getBytes());
             dir.freezeCurMemTable();
@@ -892,7 +1003,7 @@ class PMSBucketDirectorImplTest {
         dir1.put("k1".getBytes(), "v1".getBytes());
         dir1.freezeCurMemTable();
         dir1.flushImmutableMemTable();
-        dir1.sinkToPaimon();
+        dir1.sinkToPaimon(SinkSelection.allAvailable());
         dir1.close();
 
         Path sstFile = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
@@ -924,7 +1035,10 @@ class PMSBucketDirectorImplTest {
             dir1.freezeCurMemTable();
             dir1.flushImmutableMemTable();
 
-            RuntimeException error = assertThrows(RuntimeException.class, dir1::sinkToPaimon);
+            RuntimeException error = assertThrows(
+                RuntimeException.class,
+                () -> dir1.sinkToPaimon(SinkSelection.allAvailable())
+            );
             assertTrue(error.getMessage().contains("commit failed after prepare"));
             assertEquals(1, failingSink.prepareCalls);
             assertEquals(1, failingSink.commitCalls);
@@ -981,9 +1095,15 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            assertThrows(RuntimeException.class, dir::sinkToPaimon);
+            assertThrows(
+                RuntimeException.class,
+                () -> dir.sinkToPaimon(SinkSelection.allAvailable())
+            );
             assertEquals(1L, dir.stateSnapshot().sinkFlight().sinkFenceFlushId());
-            assertThrows(IllegalStateException.class, dir::sinkToPaimon);
+            assertThrows(
+                IllegalStateException.class,
+                () -> dir.sinkToPaimon(SinkSelection.allAvailable())
+            );
 
             dir.put("k2".getBytes(), "v2".getBytes());
             dir.freezeCurMemTable();
@@ -992,13 +1112,12 @@ class PMSBucketDirectorImplTest {
             dir.freezeCurMemTable();
             dir.flushImmutableMemTable();
 
-            CompactionResult compaction = dir.compactLocalSSTs();
+            CompactionResult compaction = compactRuns(dir, SSTState.NEW, List.of(2L, 3L));
 
             assertTrue(compaction.progressed());
-            assertEquals(1, compaction.groups().size());
-            assertEquals(List.of(2L, 3L), compaction.groups().get(0).inputRunIds());
-            assertEquals(2L, compaction.groups().get(0).outputRun().minFlushId());
-            assertEquals(3L, compaction.groups().get(0).outputRun().maxFlushId());
+            assertEquals(List.of(2L, 3L), compaction.group().orElseThrow().inputRunIds());
+            assertEquals(2L, compaction.group().orElseThrow().outputRun().minFlushId());
+            assertEquals(3L, compaction.group().orElseThrow().outputRun().maxFlushId());
             assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000001.sst")));
             assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000003.sst")));
             assertEquals(SinkFlightSnapshot.Status.PREPARED_RETRY, dir.stateSnapshot().sinkFlight().status());
@@ -1240,10 +1359,10 @@ class PMSBucketDirectorImplTest {
             dir.flushImmutableMemTable();
 
             assertCompletesWhileHoldingWriteMutex(dir, () ->
-                assertTrue(dir.compactLocalSSTs().progressed())
+                assertTrue(compactAllRuns(dir, SSTState.NEW).progressed())
             );
             assertCompletesWhileHoldingWriteMutex(dir, () ->
-                assertTrue(dir.sinkToPaimon().progressed())
+                assertTrue(dir.sinkToPaimon(SinkSelection.allAvailable()).progressed())
             );
             assertCompletesWhileHoldingWriteMutex(dir, () ->
                 assertTrue(dir.evictOldestSinkedSST().progressed())
@@ -1328,7 +1447,7 @@ class PMSBucketDirectorImplTest {
         AtomicReference<Throwable> sinkFailure = new AtomicReference<>();
         Thread sinkThread = new Thread(() -> {
             try {
-                dir.sinkToPaimon();
+                dir.sinkToPaimon(SinkSelection.allAvailable());
             } catch (Throwable failure) {
                 sinkFailure.set(failure);
             }
@@ -1397,6 +1516,30 @@ class PMSBucketDirectorImplTest {
         return entries.stream()
             .map(entry -> new String(entry.key().bytes(), StandardCharsets.UTF_8))
             .toList();
+    }
+
+    private static CompactionResult compactAllRuns(PMSBucketDirectorImpl director, SSTState state) {
+        List<Long> runIds = director.stateSnapshot().localRuns().stream()
+            .filter(run -> run.state() == state)
+            .map(LocalRunSnapshot::runId)
+            .toList();
+        return compactRuns(director, state, runIds);
+    }
+
+    private static void flushEntry(
+            PMSBucketDirectorImpl director,
+            String key,
+            String value) {
+        director.put(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8));
+        director.freezeCurMemTable();
+        director.flushImmutableMemTable();
+    }
+
+    private static CompactionResult compactRuns(
+            PMSBucketDirectorImpl director,
+            SSTState state,
+            List<Long> runIds) {
+        return director.compactLocalSSTs(new CompactionSelection(state, runIds));
     }
 
     private static List<String> values(List<Entry> entries) {

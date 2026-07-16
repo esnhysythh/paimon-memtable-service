@@ -312,15 +312,6 @@ public class FileLocalStorageManager implements LocalStorageManager {
         Files.deleteIfExists(sstMetaStore.metaPath(meta));
     }
 
-    @Override
-    public synchronized Optional<SSTMeta> evictOldestSinkedSST() {
-        Optional<SSTMeta> oldest = metas.values().stream()
-            .filter(meta -> meta.state() == SSTState.SINKED)
-            .min(Comparator.comparingLong(SSTMeta::maxFlushId).thenComparingLong(SSTMeta::minFlushId));
-        oldest.ifPresent(this::deleteSST);
-        return oldest;
-    }
-
     private void updateState(SSTMeta meta, SSTState target) {
         SSTMeta updated = meta.withPathAndState(meta.path(), target);
         try {
