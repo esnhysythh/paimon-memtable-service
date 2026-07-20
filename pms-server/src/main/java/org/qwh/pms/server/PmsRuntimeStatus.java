@@ -3,7 +3,7 @@ package org.qwh.pms.server;
 public enum PmsRuntimeStatus {
     NEW,
     RUNNING,
-    DRAINING,
+    SHUTTING_DOWN,
     STOPPED,
     FAILED
 }

@@ -149,18 +149,18 @@ public final class PmsServerRuntime implements AutoCloseable {
         return service().prefixLocalRaw(prefix, config.protocol().maxBatchEntries());
     }
 
-    public void flush() {
-        requireStarted();
-        scheduler().flushToCurrent();
+    public long flush() {
+        requireRunning();
+        return scheduler().requestFlushToCurrent();
     }
 
-    public void sink() {
-        requireStarted();
-        scheduler().sinkAvailable();
+    public long sink() {
+        requireRunning();
+        return scheduler().requestSinkToCurrent();
     }
 
     public void reconcileNow() {
-        requireStarted();
+        requireRunning();
         scheduler().reconcileNow();
     }
 
@@ -192,7 +192,7 @@ public final class PmsServerRuntime implements AutoCloseable {
             return;
         }
         LOG.info("PMS server runtime shutdown requested, status={}", status);
-        status = PmsRuntimeStatus.DRAINING;
+        status = PmsRuntimeStatus.SHUTTING_DOWN;
         stoppingAt = now();
         Exception failure = null;
 
@@ -200,16 +200,6 @@ public final class PmsServerRuntime implements AutoCloseable {
         httpServer = null;
 
         if (scheduler != null) {
-            try {
-                scheduler.beginDrain();
-                LOG.info("PMS server runtime final scheduler drain started");
-                scheduler.drainToPaimon();
-                LOG.info("PMS server runtime final scheduler drain completed");
-            } catch (Exception e) {
-                failure = e;
-                markFailed(e);
-                LOG.error("PMS server runtime final scheduler drain failed", e);
-            }
             closeQuietly(scheduler);
             scheduler = null;
         }
@@ -255,7 +245,7 @@ public final class PmsServerRuntime implements AutoCloseable {
         }
         status = PmsRuntimeStatus.STOPPED;
         stoppedAt = now();
-        LOG.warn("PMS server runtime aborted without final flush/sink");
+        LOG.warn("PMS server runtime aborted without graceful request coordination");
     }
 
     private boolean acceptingWrites() {
@@ -271,8 +261,8 @@ public final class PmsServerRuntime implements AutoCloseable {
         }
     }
 
-    private void requireStarted() {
-        if (service == null || status == PmsRuntimeStatus.NEW || status == PmsRuntimeStatus.STOPPED) {
+    private void requireRunning() {
+        if (service == null || status != PmsRuntimeStatus.RUNNING) {
             throw new PmsServiceUnavailableException("PMS server is not running, status=" + status);
         }
     }
