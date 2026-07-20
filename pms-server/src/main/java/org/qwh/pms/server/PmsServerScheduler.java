@@ -33,6 +33,27 @@ import org.qwh.pms.core.storage.SSTState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Coordinates background and synchronous maintenance for one PMS table.
+ * 为单个 PMS 表协调后台维护与同步维护操作.
+ *
+ * <p>The scheduler owns two independent single-threaded execution domains: Flush only advances
+ * immutable MemTables to local SSTs, while maintenance serializes visibility fences, Paimon Sink,
+ * local compaction, and eviction. Core snapshots remain the source of truth; the scheduler keeps
+ * only the active Paimon visibility fence and worker lifecycle/diagnostic state.
+ *
+ * <p>调度器拥有两个相互独立的单线程执行域: Flush 仅负责将 ImmutableMemTable 推进为本地
+ * SST;Maintenance 则串行执行可见性 fence、Paimon Sink、本地 compact 和淘汰.Core 快照始终
+ * 是事实来源;调度器只保存当前生效的 Paimon 可见性 fence, 以及 worker 生命周期和诊断状态.
+ *
+ * <p>Automatic reconciliation is sliced by {@link #MAX_ACTIONS_PER_RUN} for fairness. Management
+ * commands instead drain a fixed sequence target to completion (or fail on no progress), so their
+ * semantics are not truncated by the background-worker budget.
+ *
+ * <p>自动调和按照 {@link #MAX_ACTIONS_PER_RUN} 划分执行片段, 以保证调度公平性.管理命令则会
+ * 持续推进固定的 sequence 目标, 直至完成;如果无法取得进展则明确失败, 因此其语义不会被后台
+ * worker 的单轮动作预算截断.
+ */
 public final class PmsServerScheduler implements AutoCloseable {
     static final String ACTION_LOG_MARKER = "PMS_SCHEDULER_ACTION";
     private static final Logger LOG = LoggerFactory.getLogger(PmsServerScheduler.class);
@@ -59,6 +80,8 @@ public final class PmsServerScheduler implements AutoCloseable {
     private volatile ScheduledFuture<?> maintenancePeriodicTask;
     private volatile boolean flushRunning;
     private volatile boolean maintenanceRunning;
+    // The only cross-operation plan state. Zero means no visibility fence is active.
+    // 唯一跨 Operation 保留的计划状态; 零表示当前没有生效的可见性 fence.
     private volatile long pendingPaimonFenceSequenceId;
     private volatile long flushRetryNotBeforeMillis;
     private volatile long maintenanceRetryNotBeforeMillis;
@@ -201,7 +224,18 @@ public final class PmsServerScheduler implements AutoCloseable {
         });
     }
 
-    /** Runs both reconciliation paths synchronously for management and deterministic tests. */
+    /**
+     * Runs both reconciliation paths synchronously for management and deterministic tests.
+     * 为管理操作和确定性测试同步执行两条调和路径.
+     *
+     * <p>The first maintenance pass may establish a visibility fence, Flush materializes that
+     * fence, and the second maintenance pass can then Sink it. The ordering is therefore part of
+     * the method's behavior rather than three interchangeable wakeups.
+     *
+     * <p>第一次 Maintenance 可能建立可见性 fence, 随后 Flush 将该 fence 对应的数据物化为 SST, 
+     * 第二次 Maintenance 才能继续完成 Sink.因此, 这一执行顺序属于方法语义的一部分, 不能将其
+     * 视为三次可以任意互换的唤醒.
+     */
     public void reconcileNow() {
         ensureOpen();
         callMaintenance(() -> {
@@ -271,6 +305,10 @@ public final class PmsServerScheduler implements AutoCloseable {
         if (!running || closed) {
             return;
         }
+        // Periodic ticks and maintenance signals may race. Collapse them into the current pass plus
+        // at most one follow-up pass instead of growing an unbounded executor queue.
+        // 周期 tick 和 Maintenance signal 可能并发到达; 将它们合并为当前轮加至多一轮后续执行,
+        // 避免 executor 队列无界增长.
         if (!flushQueuedOrRunning.compareAndSet(false, true)) {
             flushRerunRequested.set(true);
             return;
@@ -291,6 +329,10 @@ public final class PmsServerScheduler implements AutoCloseable {
         if (!running || closed) {
             return;
         }
+        // Use the same coalescing rule as the Flush worker; one rerun is enough because every pass
+        // starts from a fresh BucketStateSnapshot.
+        // 使用与 Flush worker 相同的信号合并规则; 由于每轮都会从最新 BucketStateSnapshot 开始,
+        // 因此至多保留一次 rerun 即可.
         if (!maintenanceQueuedOrRunning.compareAndSet(false, true)) {
             maintenanceRerunRequested.set(true);
             return;
@@ -353,6 +395,10 @@ public final class PmsServerScheduler implements AutoCloseable {
 
     private void drainFlush(String reason, boolean background) {
         for (int actions = 0; actions < MAX_ACTIONS_PER_RUN; actions++) {
+            // A background slice yields promptly once draining starts. Synchronous callers pass
+            // background=false and are governed by their fixed target instead.
+            // 进入 draining 后, 后台执行片段应尽快让出; 同步调用方传入 background=false, 改由其
+            // 固定目标约束执行过程.
             if (background && !running) {
                 return;
             }
@@ -410,12 +456,20 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private void reconcileMaintenance(boolean background) {
+        // This is a priority reconciliation loop, not a precomputed plan. Every progressed action
+        // invalidates the old snapshot, so the loop rereads state and starts again at priority 1.
+        // 这是按优先级执行的调和循环, 而不是预先计算好的计划. 每个取得进展的动作都会使旧快照
+        // 失效, 因此循环必须重新读取状态, 并从最高优先级重新判断.
         for (int actions = 0; actions < MAX_ACTIONS_PER_RUN; actions++) {
             if (background && !running) {
                 return;
             }
             BucketStateSnapshot state = operations.stateSnapshot();
 
+            // A durable prepared Sink must be resolved before starting any other SST maintenance.
+            // Flush remains independent and may continue on its own worker.
+            // durable prepared Sink 必须先得到解决, 才能启动其他 SST 维护; Flush 保持独立, 仍可
+            // 在自己的 worker 上继续执行.
             if (state.sinkFlight().status() == SinkFlightSnapshot.Status.PREPARED_RETRY) {
                 SinkOperationResult result = executePreparedRetry(state);
                 if (!result.progressed()) {
@@ -426,14 +480,24 @@ public final class PmsServerScheduler implements AutoCloseable {
 
             long fence = pendingPaimonFenceSequenceId;
             if (fence > 0) {
+                // Persisted coverage satisfies the fence; discard controller state and reconsider
+                // ordinary count maintenance from a new snapshot.
+                // persisted boundary 覆盖 fence 后, 该目标即已满足;清除 controller 状态, 并基于
+                // 新快照重新判断常规的数量维护.
                 if (state.lastPersistedSequenceId() >= fence) {
                     pendingPaimonFenceSequenceId = 0;
                     continue;
                 }
+                // Sink cannot cover the fence until Flush has materialized its complete prefix.
+                // 在 Flush 将 fence 对应的完整前缀物化为 SST 之前, Sink 无法覆盖该 fence.
                 if (state.lastFlushedSequenceId() < fence) {
                     requestFlush();
                     return;
                 }
+                // One Sink call is deliberately bounded by batch count/bytes. Keep the same fence
+                // across calls until lastPersistedSequenceId reaches it.
+                // 单次 Sink 调用有意受到 batch 数量和字节数限制; 在 lastPersistedSequenceId 达到
+                // fence 之前, 多次调用必须始终推进同一个 fence.
                 SinkOperationResult result = executeSink(state, fence, "PAIMON_VISIBILITY_FENCE");
                 if (!result.progressed()) {
                     return;
@@ -442,6 +506,10 @@ public final class PmsServerScheduler implements AutoCloseable {
             }
 
             if (visibilityDue(state)) {
+                // Freeze atomically captures the current write boundary. Newer writes land beyond
+                // this fence and therefore do not prolong the current visibility objective.
+                // Freeze 会原子捕获当前写入边界; 后续新写入位于 fence 之后, 因此不会延长本轮
+                // 可见性目标的完成时间.
                 FreezeResult freeze = executeFreeze("PAIMON_VISIBILITY_LAG", state);
                 pendingPaimonFenceSequenceId = freeze.fenceSequenceId();
                 requestFlush();
@@ -449,6 +517,10 @@ public final class PmsServerScheduler implements AutoCloseable {
             }
 
             if (state.newSSTCount() > config.newSstMaxCount()) {
+                // Prefer reducing local read amplification. If no adjacent NEW runs fit within the
+                // compaction byte limit, advance the oldest stable prefix to Paimon instead.
+                // 优先通过 compact 降低本地点查放大; 如果没有相邻 NEW run 能满足 compact 字节上限,
+                // 则改为将最老的稳定前缀推进到 Paimon.
                 Optional<CompactionSelection> selection = selectCompaction(state, SSTState.NEW);
                 if (selection.isPresent()) {
                     CompactionResult result = executeCompaction(state, selection.get(), "NEW_SST_COUNT");
@@ -469,6 +541,10 @@ public final class PmsServerScheduler implements AutoCloseable {
             }
 
             if (state.sinkedSSTCount() > config.sinkedSstMaxCount()) {
+                // SINKED runs are safe to retire, but first compact any eligible adjacent group to
+                // reduce local run count; otherwise fall back to oldest-first eviction.
+                // SINKED run 可以安全退役, 但应先 compact 符合条件的相邻分组以减少本地 run 数量;
+                // 如果不存在可 compact 分组, 再回退到从最老 run 开始淘汰.
                 Optional<CompactionSelection> selection = selectCompaction(state, SSTState.SINKED);
                 if (selection.isPresent()) {
                     CompactionResult result = executeCompaction(state, selection.get(), "SINKED_SST_COUNT");
@@ -491,6 +567,10 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private void drainSinkTarget(String reason, long targetSequenceId) {
+        // Unlike automatic reconciliation, a synchronous command owns a fixed target and is not
+        // action-budgeted. Monotonic persisted progress bounds the loop; NOOP is an explicit error.
+        // 与自动调和不同, 同步命令持有固定目标, 不受单轮动作预算限制. persisted boundary 的单调
+        // 推进保证循环有界; 如果 Operation 返回 NOOP, 则将其作为明确错误处理.
         while (targetSequenceId > 0) {
             BucketStateSnapshot state = operations.stateSnapshot();
             if (state.lastPersistedSequenceId() >= targetSequenceId) {
@@ -598,6 +678,10 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private Optional<CompactionSelection> selectCompaction(BucketStateSnapshot state, SSTState targetState) {
+        // localRuns are ordered oldest-first by flush range. Greedily choose the first adjacent
+        // group of at least two runs whose total input fits the configured byte ceiling.
+        // localRuns 按 flush range 从老到新排列.使用贪心策略选择第一个相邻分组: 至少包含两个
+        // run, 并且输入总大小不超过配置的字节上限.
         List<LocalRunSnapshot> runs = state.localRuns().stream()
             .filter(run -> run.state() == targetState)
             .toList();
@@ -629,6 +713,10 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private boolean visibilityDue(BucketStateSnapshot state) {
+        // Recovery must not wait for possibly stale/missing wall-clock ages: any recovered data not
+        // known to be in Paimon establishes a new visibility fence immediately.
+        // 恢复流程不能等待可能已失真或缺失的 wall-clock age; 只要恢复出的数据尚不能确认已进入
+        // Paimon, 就应立即建立新的可见性 fence.
         if (state.recoveredUnpersistedData()) {
             return true;
         }
