@@ -40,20 +40,21 @@ import org.qwh.pms.lookup.routing.ThresholdFileLookupRouterStats;
 import org.qwh.pms.lookup.view.CandidatePlanner;
 import org.qwh.pms.lookup.view.LiveFileIndex;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
-import org.qwh.pms.core.bucket.LocalRunSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
 import org.qwh.pms.core.bucket.RecoverySummary;
-import org.qwh.pms.core.bucket.SinkFlightSnapshot;
+import org.qwh.pms.core.bucket.operation.CompactionResult;
 import org.qwh.pms.core.bucket.operation.CompactionSelection;
+import org.qwh.pms.core.bucket.operation.EvictionResult;
+import org.qwh.pms.core.bucket.operation.FlushResult;
+import org.qwh.pms.core.bucket.operation.FreezeResult;
+import org.qwh.pms.core.bucket.operation.SinkOperationResult;
 import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.config.FlowControlConfig;
-import org.qwh.pms.core.config.StorageConfig;
 import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.sink.SinkManager;
 import org.qwh.pms.core.storage.FileLocalStorageManager;
-import org.qwh.pms.core.storage.SSTState;
 import org.qwh.pms.sink.paimon.PaimonCommitPayloadCodec;
 import org.qwh.pms.sink.paimon.PaimonSinkManager;
 import org.qwh.pms.protocol.api.LookupResultType;
@@ -77,7 +78,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
-public final class PmsTableService implements AutoCloseable {
+public final class PmsTableService implements PmsServerScheduler.Operations, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(PmsTableService.class);
     private static final AtomicInteger LOOKUP_BUILD_THREAD_ID = new AtomicInteger();
 
@@ -92,11 +93,8 @@ public final class PmsTableService implements AutoCloseable {
     private final List<String> primaryKeys;
     private final int writerSchemaId;
     private final PmsTableSchema protocolTableSchema;
-    private final StorageConfig storageConfig;
     private final FlowControlConfig flowControlConfig;
     private final Object paimonCommitPublishLock = new Object();
-    /** Serializes each retention check-and-evict loop without blocking Flush or Paimon Sink I/O. */
-    private final Object retentionMutex = new Object();
     private final PaimonKeyValueLookupService paimonLookup;
     private final ThresholdFileLookupRouter lookupRouter;
     private final LocalCacheDirectory lookupCacheDirectory;
@@ -122,7 +120,6 @@ public final class PmsTableService implements AutoCloseable {
         this.table = loadedTable.table();
         this.fileStoreTable = validateLookupProfile(table);
         this.director = director;
-        this.storageConfig = config.coreConfig().storage();
         this.flowControlConfig = config.coreConfig().flowcontrol();
         RowType rowType = table.rowType();
         this.primaryKeys = List.copyOf(table.primaryKeys());
@@ -321,28 +318,47 @@ public final class PmsTableService implements AutoCloseable {
         );
     }
 
-    public void flush() {
-        LOG.info("PMS flush started");
-        director.freezeCurMemTable();
-        director.flushImmutableMemTable();
-        LOG.info("PMS flush completed");
+    @Override
+    public BucketStateSnapshot stateSnapshot() {
+        return director.stateSnapshot();
     }
 
-    public void sink() {
-        LOG.info("PMS sink started");
+    @Override
+    public FreezeResult freezeCurMemTable() {
+        return director.freezeCurMemTable();
+    }
+
+    @Override
+    public FlushResult flushImmutableMemTable() {
+        return director.flushImmutableMemTable();
+    }
+
+    @Override
+    public SinkOperationResult sinkToPaimon(SinkSelection selection) {
         synchronized (paimonCommitPublishLock) {
-            var state = director.stateSnapshot();
-            var result = state.sinkFlight().status() == SinkFlightSnapshot.Status.PREPARED_RETRY
-                ? director.commitPreparedSink()
-                : director.sinkToPaimon(SinkSelection.allAvailable());
+            SinkOperationResult result = director.sinkToPaimon(selection);
             result.commitResult().ifPresent(this::publishCommittedLookupDelta);
+            return result;
         }
-        retainLocalSSTsUntilWithinLimits();
-        LOG.info("PMS sink completed");
     }
 
-    public void retainLocalSSTs() {
-        retainLocalSSTsUntilWithinLimits();
+    @Override
+    public SinkOperationResult commitPreparedSink() {
+        synchronized (paimonCommitPublishLock) {
+            SinkOperationResult result = director.commitPreparedSink();
+            result.commitResult().ifPresent(this::publishCommittedLookupDelta);
+            return result;
+        }
+    }
+
+    @Override
+    public CompactionResult compactLocalSSTs(CompactionSelection selection) {
+        return director.compactLocalSSTs(selection);
+    }
+
+    @Override
+    public EvictionResult evictOldestSinkedSST() {
+        return director.evictOldestSinkedSST();
     }
 
     public Map<String, Object> state() {
@@ -622,90 +638,6 @@ public final class PmsTableService implements AutoCloseable {
 
     private static long elapsedMillis(long startedNanos) {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
-    }
-
-    private void retainLocalSSTsUntilWithinLimits() {
-        synchronized (retentionMutex) {
-            int evictedCount = 0;
-            while (true) {
-                BucketStateSnapshot state = director.stateSnapshot();
-                if (!shouldEvictSinkedSST(state)) {
-                    break;
-                }
-                if (state.sinkedSSTCount() > storageConfig.sinkedMaxCount()) {
-                    Optional<CompactionSelection> compaction = selectSinkedCompaction(state);
-                    if (compaction.isPresent()) {
-                        director.compactLocalSSTs(compaction.get());
-                        state = director.stateSnapshot();
-                        if (!shouldEvictSinkedSST(state)) {
-                            continue;
-                        }
-                    }
-                }
-                var evicted = director.evictOldestSinkedSST().evictedRun();
-                if (evicted.isEmpty()) {
-                    break;
-                }
-                evictedCount++;
-                LOG.info(
-                    "Evicted sinked SST by retention: runId={}, fileSize={}, entryCount={}",
-                    evicted.get().runId(),
-                    evicted.get().fileSizeBytes(),
-                    evicted.get().entryCount()
-                );
-            }
-            if (evictedCount > 0) {
-                LOG.info("PMS local SST retention completed, evictedSinkedSSTCount={}", evictedCount);
-            }
-        }
-    }
-
-    private Optional<CompactionSelection> selectSinkedCompaction(BucketStateSnapshot state) {
-        List<LocalRunSnapshot> sinkedRuns = state.localRuns().stream()
-            .filter(run -> run.state() == SSTState.SINKED)
-            .toList();
-        if (sinkedRuns.size() < storageConfig.compactMinFiles()) {
-            return Optional.empty();
-        }
-        long maxInputBytes = storageConfig.compactThresholdMb() * 1024L * 1024L;
-        List<Long> selectedRunIds = new ArrayList<>();
-        long selectedBytes = 0;
-        long previousMaxFlushId = -1;
-        for (LocalRunSnapshot run : sinkedRuns) {
-            boolean continuous = selectedRunIds.isEmpty()
-                || previousMaxFlushId + 1 == run.minFlushId();
-            boolean fits = run.fileSizeBytes() <= maxInputBytes
-                && run.fileSizeBytes() <= maxInputBytes - selectedBytes;
-            if (!continuous || !fits) {
-                if (selectedRunIds.size() >= storageConfig.compactMinFiles()) {
-                    break;
-                }
-                selectedRunIds.clear();
-                selectedBytes = 0;
-                previousMaxFlushId = -1;
-            }
-            if (run.fileSizeBytes() <= maxInputBytes) {
-                selectedRunIds.add(run.runId());
-                selectedBytes += run.fileSizeBytes();
-                previousMaxFlushId = run.maxFlushId();
-            }
-        }
-        return selectedRunIds.size() >= storageConfig.compactMinFiles()
-            ? Optional.of(new CompactionSelection(SSTState.SINKED, selectedRunIds))
-            : Optional.empty();
-    }
-
-    private boolean shouldEvictSinkedSST(BucketStateSnapshot state) {
-        if (state.sinkedSSTCount() <= 0) {
-            return false;
-        }
-        long localSSTCount = (long) state.newSSTCount() + state.sinkedSSTCount();
-        long localSSTBytes = state.newSSTTotalBytes() + state.sinkedSSTTotalBytes();
-        long localSSTRows = state.newSSTTotalRows() + state.sinkedSSTTotalRows();
-        long maxBytes = storageConfig.sinkedMaxSizeMb() * 1024L * 1024L;
-        return localSSTBytes > maxBytes
-            || localSSTCount > storageConfig.sinkedMaxCount()
-            || (storageConfig.localSstMaxRows() > 0 && localSSTRows > storageConfig.localSstMaxRows());
     }
 
     @Override

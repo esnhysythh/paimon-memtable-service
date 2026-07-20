@@ -29,6 +29,7 @@ public final class ConfigManager {
     public PmsServerConfig from(Properties props) {
         Properties normalized = new Properties();
         normalized.putAll(props);
+        rejectRemovedSchedulerKeys(normalized);
         String database = getString(normalized, "pms.paimon.database", null);
         String table = getString(normalized, "pms.paimon.table", null);
         if (getString(normalized, "pms.paimon.table_path", null) == null
@@ -47,7 +48,7 @@ public final class ConfigManager {
             table,
             getString(normalized, "pms.server.commit_user", "pms-server"),
             protocolConfig(normalized),
-            schedulerConfig(normalized, coreConfig),
+            schedulerConfig(normalized),
             lookupConfig(normalized, coreConfig, database, table),
             coreConfig
         );
@@ -67,12 +68,62 @@ public final class ConfigManager {
         return config;
     }
 
-    private static PmsSchedulerConfig schedulerConfig(Properties props, PMSConfig coreConfig) {
+    private static PmsSchedulerConfig schedulerConfig(Properties props) {
         return new PmsSchedulerConfig(
             getBoolean(props, "pms.server.scheduler.enabled", PmsSchedulerConfig.DEFAULT_ENABLED),
-            getInt(props, "pms.server.scheduler.flush_interval_ms", PmsSchedulerConfig.DEFAULT_FLUSH_INTERVAL_MS),
-            getInt(props, "pms.server.scheduler.sink_interval_ms", coreConfig.sink().intervalMs())
+            getInt(
+                props,
+                "pms.server.scheduler.flush_reconcile_interval_ms",
+                PmsSchedulerConfig.DEFAULT_FLUSH_RECONCILE_INTERVAL_MS
+            ),
+            getInt(
+                props,
+                "pms.server.scheduler.maintenance_reconcile_interval_ms",
+                PmsSchedulerConfig.DEFAULT_MAINTENANCE_RECONCILE_INTERVAL_MS
+            ),
+            getInt(
+                props,
+                "pms.server.scheduler.failure_retry_delay_ms",
+                PmsSchedulerConfig.DEFAULT_FAILURE_RETRY_DELAY_MS
+            ),
+            getLong(
+                props,
+                "pms.paimon.visibility.max_delay_ms",
+                PmsSchedulerConfig.DEFAULT_VISIBILITY_MAX_DELAY_MS
+            ),
+            getInt(props, "pms.storage.new_sst.max_count", PmsSchedulerConfig.DEFAULT_NEW_SST_MAX_COUNT),
+            getInt(props, "pms.storage.sinked_sst.max_count", PmsSchedulerConfig.DEFAULT_SINKED_SST_MAX_COUNT),
+            getInt(props, "pms.operation.sink.batch_max_ssts", PmsSchedulerConfig.DEFAULT_SINK_BATCH_MAX_SSTS),
+            getInt(
+                props,
+                "pms.operation.sink.batch_max_bytes_mb",
+                PmsSchedulerConfig.DEFAULT_SINK_BATCH_MAX_BYTES_MB
+            ),
+            getInt(
+                props,
+                "pms.operation.compact.max_input_size_mb",
+                PmsSchedulerConfig.DEFAULT_COMPACT_MAX_INPUT_SIZE_MB
+            )
         );
+    }
+
+    private static void rejectRemovedSchedulerKeys(Properties props) {
+        String[] removedKeys = {
+            "pms.server.scheduler.flush_interval_ms",
+            "pms.server.scheduler.sink_interval_ms",
+            "pms.sink.interval_ms",
+            "pms.sink.max_pending_ssts",
+            "pms.storage.sinked_max_size_mb",
+            "pms.storage.sinked_max_count",
+            "pms.storage.local_sst_max_rows",
+            "pms.storage.compact_threshold_mb",
+            "pms.storage.compact_min_files"
+        };
+        for (String key : removedKeys) {
+            if (props.containsKey(key)) {
+                throw new IllegalArgumentException("Removed scheduler config key is no longer supported: " + key);
+            }
+        }
     }
 
     private static PmsProtocolConfig protocolConfig(Properties props) {
@@ -186,6 +237,14 @@ public final class ConfigManager {
             return defaultValue;
         }
         return Integer.parseInt(value.trim());
+    }
+
+    private static long getLong(Properties props, String key, long defaultValue) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        return Long.parseLong(value.trim());
     }
 
     private static long getBytes(Properties props, String key, long defaultValue) {

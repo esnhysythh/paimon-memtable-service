@@ -36,7 +36,13 @@ public record PmsServerConfig(
             protocol = PmsProtocolConfig.defaults();
         }
         if (scheduler == null) {
-            scheduler = PmsSchedulerConfig.disabled(coreConfig.sink().intervalMs());
+            scheduler = PmsSchedulerConfig.defaults();
+        }
+        if (scheduler.newSstMaxCount() >= coreConfig.flowcontrol().overloadedPendingSstCount()) {
+            throw new IllegalArgumentException(
+                "pms.storage.new_sst.max_count must be lower than "
+                    + "pms.flowcontrol.overloaded_pending_sst_count"
+            );
         }
         if (lookup == null) {
             lookup = new PmsLookupConfig(

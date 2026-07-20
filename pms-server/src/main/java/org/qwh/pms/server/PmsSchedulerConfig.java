@@ -2,22 +2,71 @@ package org.qwh.pms.server;
 
 public record PmsSchedulerConfig(
     boolean enabled,
-    int flushIntervalMs,
-    int sinkIntervalMs
+    int flushReconcileIntervalMs,
+    int maintenanceReconcileIntervalMs,
+    int failureRetryDelayMs,
+    long visibilityMaxDelayMs,
+    int newSstMaxCount,
+    int sinkedSstMaxCount,
+    int sinkBatchMaxSsts,
+    int sinkBatchMaxBytesMb,
+    int compactMaxInputSizeMb
 ) {
-    public static final boolean DEFAULT_ENABLED = false;
-    public static final int DEFAULT_FLUSH_INTERVAL_MS = 0;
+    public static final boolean DEFAULT_ENABLED = true;
+    public static final int DEFAULT_FLUSH_RECONCILE_INTERVAL_MS = 1_000;
+    public static final int DEFAULT_MAINTENANCE_RECONCILE_INTERVAL_MS = 30_000;
+    public static final int DEFAULT_FAILURE_RETRY_DELAY_MS = 5_000;
+    public static final long DEFAULT_VISIBILITY_MAX_DELAY_MS = 600_000L;
+    public static final int DEFAULT_NEW_SST_MAX_COUNT = 10;
+    public static final int DEFAULT_SINKED_SST_MAX_COUNT = 10;
+    public static final int DEFAULT_SINK_BATCH_MAX_SSTS = 4;
+    public static final int DEFAULT_SINK_BATCH_MAX_BYTES_MB = 1_024;
+    public static final int DEFAULT_COMPACT_MAX_INPUT_SIZE_MB = 1_024;
 
     public PmsSchedulerConfig {
-        if (flushIntervalMs < 0) {
-            throw new IllegalArgumentException("Invalid scheduler flush interval: " + flushIntervalMs);
+        requirePositive("flush reconcile interval", flushReconcileIntervalMs);
+        requirePositive("maintenance reconcile interval", maintenanceReconcileIntervalMs);
+        requirePositive("failure retry delay", failureRetryDelayMs);
+        if (visibilityMaxDelayMs <= 0) {
+            throw new IllegalArgumentException("Invalid Paimon visibility max delay: " + visibilityMaxDelayMs);
         }
-        if (sinkIntervalMs < 0) {
-            throw new IllegalArgumentException("Invalid scheduler sink interval: " + sinkIntervalMs);
-        }
+        requirePositive("NEW SST max count", newSstMaxCount);
+        requirePositive("SINKED SST max count", sinkedSstMaxCount);
+        requirePositive("Sink batch max SSTs", sinkBatchMaxSsts);
+        requirePositive("Sink batch max bytes", sinkBatchMaxBytesMb);
+        requirePositive("compact max input size", compactMaxInputSizeMb);
     }
 
-    public static PmsSchedulerConfig disabled(int sinkIntervalMs) {
-        return new PmsSchedulerConfig(false, DEFAULT_FLUSH_INTERVAL_MS, sinkIntervalMs);
+    public static PmsSchedulerConfig defaults() {
+        return new PmsSchedulerConfig(
+            DEFAULT_ENABLED,
+            DEFAULT_FLUSH_RECONCILE_INTERVAL_MS,
+            DEFAULT_MAINTENANCE_RECONCILE_INTERVAL_MS,
+            DEFAULT_FAILURE_RETRY_DELAY_MS,
+            DEFAULT_VISIBILITY_MAX_DELAY_MS,
+            DEFAULT_NEW_SST_MAX_COUNT,
+            DEFAULT_SINKED_SST_MAX_COUNT,
+            DEFAULT_SINK_BATCH_MAX_SSTS,
+            DEFAULT_SINK_BATCH_MAX_BYTES_MB,
+            DEFAULT_COMPACT_MAX_INPUT_SIZE_MB
+        );
+    }
+
+    public long sinkBatchMaxBytes() {
+        return mebibytes(sinkBatchMaxBytesMb);
+    }
+
+    public long compactMaxInputBytes() {
+        return mebibytes(compactMaxInputSizeMb);
+    }
+
+    private static long mebibytes(int value) {
+        return Math.multiplyExact((long) value, 1024L * 1024L);
+    }
+
+    private static void requirePositive(String name, int value) {
+        if (value <= 0) {
+            throw new IllegalArgumentException("Invalid " + name + ": " + value);
+        }
     }
 }
