@@ -151,12 +151,17 @@ public final class PmsServerRuntime implements AutoCloseable {
 
     public void flush() {
         requireStarted();
-        service().flush();
+        scheduler().flushToCurrent();
     }
 
     public void sink() {
         requireStarted();
-        service().sink();
+        scheduler().sinkAvailable();
+    }
+
+    public void reconcileNow() {
+        requireStarted();
+        scheduler().reconcileNow();
     }
 
     public Map<String, Object> state() {
@@ -193,20 +198,23 @@ public final class PmsServerRuntime implements AutoCloseable {
 
         closeQuietly(httpServer);
         httpServer = null;
-        closeQuietly(scheduler);
-        scheduler = null;
 
-        if (service != null) {
+        if (scheduler != null) {
             try {
-                LOG.info("PMS server runtime final flush/sink started");
-                service.flush();
-                service.sink();
-                LOG.info("PMS server runtime final flush/sink completed");
+                scheduler.beginDrain();
+                LOG.info("PMS server runtime final scheduler drain started");
+                scheduler.drainToPaimon();
+                LOG.info("PMS server runtime final scheduler drain completed");
             } catch (Exception e) {
                 failure = e;
                 markFailed(e);
-                LOG.error("PMS server runtime final flush/sink failed", e);
+                LOG.error("PMS server runtime final scheduler drain failed", e);
             }
+            closeQuietly(scheduler);
+            scheduler = null;
+        }
+
+        if (service != null) {
             try {
                 service.close();
             } catch (Exception e) {
@@ -267,6 +275,13 @@ public final class PmsServerRuntime implements AutoCloseable {
         if (service == null || status == PmsRuntimeStatus.NEW || status == PmsRuntimeStatus.STOPPED) {
             throw new PmsServiceUnavailableException("PMS server is not running, status=" + status);
         }
+    }
+
+    private PmsServerScheduler scheduler() {
+        if (scheduler == null) {
+            throw new PmsServiceUnavailableException("PMS server scheduler is not available, status=" + status);
+        }
+        return scheduler;
     }
 
     void failFatalAsync(PmsFatalWriteException failure) {

@@ -165,6 +165,10 @@ public final class PMSTestServer implements AutoCloseable {
         runtime().sink();
     }
 
+    public void reconcileNow() {
+        runtime().reconcileNow();
+    }
+
     public Map<Integer, String> readIntStringRows() throws Exception {
         ReadBuilder readBuilder = table.newReadBuilder();
         Map<Integer, String> rows = new TreeMap<>();

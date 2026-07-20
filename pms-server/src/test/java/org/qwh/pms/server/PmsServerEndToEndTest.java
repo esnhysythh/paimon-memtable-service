@@ -19,6 +19,7 @@ import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.core.bucket.PMSBucketDirector;
 import org.qwh.pms.core.bucket.PmsFatalWriteException;
 import org.qwh.pms.core.bucket.SinkFlightSnapshot;
+import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
 import org.qwh.pms.core.sink.SinkCommitResult;
@@ -435,9 +436,9 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void sinkRetiresOldestSinkedSSTAndGetFallsThroughToPaimonAfterRetirement() throws Exception {
+    void sinkedCountCompactsAllFittingRunsBeforeConsideringOldestEviction() throws Exception {
         Properties props = baseProperties();
-        props.setProperty("pms.storage.local_sst_max_rows", "2");
+        props.setProperty("pms.storage.sinked_sst.max_count", "2");
         PmsServerConfig config = new ConfigManager().from(props);
 
         try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
@@ -459,14 +460,16 @@ class PmsServerEndToEndTest {
             server.write(Map.of("id", 3, "marker", "retained-3"));
             server.flush();
             server.sink();
+            server.reconcileNow();
 
             Map<String, Object> state = server.getJson("/state");
             assertEquals(0L, number(state, "newSSTTotalRows"));
-            assertEquals(2L, number(state, "sinkedSSTTotalRows"));
-            assertEquals(2L, number(state, "sinkedSSTCount"));
+            assertEquals(3L, number(state, "sinkedSSTTotalRows"));
+            assertEquals(1L, number(state, "sinkedSSTCount"));
             assertFalse(Files.exists(oldestSinked));
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000002.sst")));
-            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000003-000003.sst")));
+            assertFalse(Files.exists(tempDir.resolve("storage").resolve("sst-000002-000002.sst")));
+            assertFalse(Files.exists(tempDir.resolve("storage").resolve("sst-000003-000003.sst")));
+            assertTrue(Files.exists(tempDir.resolve("storage").resolve("sst-000001-000003.sst")));
 
             assertEquals(
                 Map.of("id", 1, "marker", "retained-1"),
@@ -479,8 +482,7 @@ class PmsServerEndToEndTest {
     @Test
     void sinkRetentionCompactsAnExplicitSinkedRunGroupBeforeEviction() throws Exception {
         Properties props = baseProperties();
-        props.setProperty("pms.storage.sinked_max_count", "1");
-        props.setProperty("pms.storage.compact_min_files", "2");
+        props.setProperty("pms.storage.sinked_sst.max_count", "1");
         PmsServerConfig config = new ConfigManager().from(props);
 
         try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
@@ -490,6 +492,7 @@ class PmsServerEndToEndTest {
             server.flush();
 
             server.sink();
+            server.reconcileNow();
 
             Map<String, Object> state = server.getJson("/state");
             assertEquals(0L, number(state, "newSSTCount"));
@@ -793,8 +796,9 @@ class PmsServerEndToEndTest {
     void schedulerAutomaticallyFlushesAndSinks() throws Exception {
         Properties props = baseProperties();
         props.setProperty("pms.server.scheduler.enabled", "true");
-        props.setProperty("pms.server.scheduler.flush_interval_ms", "50");
-        props.setProperty("pms.server.scheduler.sink_interval_ms", "50");
+        props.setProperty("pms.server.scheduler.flush_reconcile_interval_ms", "25");
+        props.setProperty("pms.server.scheduler.maintenance_reconcile_interval_ms", "25");
+        props.setProperty("pms.paimon.visibility.max_delay_ms", "50");
         PmsServerConfig config = new ConfigManager().from(props);
 
         try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
@@ -806,7 +810,7 @@ class PmsServerEndToEndTest {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> scheduler = (Map<String, Object>) state.get("scheduler");
                     return Map.of(1, "auto-a").equals(server.readIntStringRows())
-                        && number(scheduler, "sinkSuccessCount") > 0;
+                        && actionCount(scheduler, "actionSuccessCounts", "SINK") > 0;
                 } catch (Exception e) {
                     return false;
                 }
@@ -817,20 +821,20 @@ class PmsServerEndToEndTest {
             Map<String, Object> scheduler = (Map<String, Object>) state.get("scheduler");
             assertEquals(true, scheduler.get("enabled"));
             assertEquals(true, scheduler.get("running"));
-            assertTrue((Integer) scheduler.get("flushIntervalMs") > 0);
-            assertTrue((Integer) scheduler.get("sinkIntervalMs") > 0);
+            assertEquals(25L, number(scheduler, "flushReconcileIntervalMs"));
+            assertEquals(25L, number(scheduler, "maintenanceReconcileIntervalMs"));
             assertTrue(scheduler.get("flushRunning") instanceof Boolean);
-            assertTrue(scheduler.get("sinkRunning") instanceof Boolean);
-            assertTrue(number(scheduler, "flushSuccessCount") > 0);
-            assertTrue(number(scheduler, "sinkSuccessCount") > 0);
-            assertEquals(0L, number(scheduler, "flushFailureCount"));
-            assertEquals(0L, number(scheduler, "sinkFailureCount"));
+            assertTrue(scheduler.get("maintenanceRunning") instanceof Boolean);
+            assertTrue(actionCount(scheduler, "actionSuccessCounts", "FLUSH") > 0);
+            assertTrue(actionCount(scheduler, "actionSuccessCounts", "SINK") > 0);
+            assertEquals(0L, actionCount(scheduler, "actionFailureCounts", "FLUSH"));
+            assertEquals(0L, actionCount(scheduler, "actionFailureCounts", "SINK"));
             assertTrue(scheduler.containsKey("lastFlushStartedAt"));
             assertTrue(scheduler.containsKey("lastFlushCompletedAt"));
-            assertTrue(scheduler.containsKey("lastSinkStartedAt"));
-            assertTrue(scheduler.containsKey("lastSinkCompletedAt"));
+            assertTrue(scheduler.containsKey("lastMaintenanceStartedAt"));
+            assertTrue(scheduler.containsKey("lastMaintenanceCompletedAt"));
             assertTrue(number(scheduler, "lastFlushDurationMs") >= 0);
-            assertTrue(number(scheduler, "lastSinkDurationMs") >= 0);
+            assertTrue(number(scheduler, "lastMaintenanceDurationMs") >= 0);
         }
     }
 
@@ -850,12 +854,13 @@ class PmsServerEndToEndTest {
                 BlockingPrepareSinkManager sinkManager = sinkManagerRef.get();
                 assertNotNull(sinkManager);
                 service.write(Map.of("id", 1, "marker", "before-sink"));
-                service.flush();
+                service.freezeCurMemTable();
+                service.flushImmutableMemTable();
 
                 AtomicReference<Throwable> sinkFailure = new AtomicReference<>();
                 Thread sinkThread = new Thread(() -> {
                     try {
-                        service.sink();
+                        sinkAllAvailable(service);
                     } catch (Throwable failure) {
                         sinkFailure.set(failure);
                     }
@@ -863,7 +868,8 @@ class PmsServerEndToEndTest {
                 AtomicReference<Throwable> flushFailure = new AtomicReference<>();
                 Thread flushThread = new Thread(() -> {
                     try {
-                        service.flush();
+                        service.freezeCurMemTable();
+                        service.flushImmutableMemTable();
                     } catch (Throwable failure) {
                         flushFailure.set(failure);
                     }
@@ -890,7 +896,7 @@ class PmsServerEndToEndTest {
                 assertEquals(1L, number(afterFirstSink, "newSSTCount"));
                 assertEquals(1L, number(afterFirstSink, "sinkedSSTCount"));
 
-                service.sink();
+                sinkAllAvailable(service);
                 Map<String, Object> afterSecondSink = service.state();
                 assertEquals(0L, number(afterSecondSink, "newSSTCount"));
                 assertEquals(2L, number(afterSecondSink, "sinkedSSTCount"));
@@ -918,8 +924,11 @@ class PmsServerEndToEndTest {
         assertEquals("128mb", config.coreConfig().paimon().manifestCacheSmallFileMemory());
         assertEquals("1mb", config.coreConfig().paimon().manifestCacheSmallFileThreshold());
         assertFalse(config.scheduler().enabled());
-        assertEquals(0, config.scheduler().flushIntervalMs());
-        assertEquals(30000, config.scheduler().sinkIntervalMs());
+        assertEquals(1000, config.scheduler().flushReconcileIntervalMs());
+        assertEquals(30000, config.scheduler().maintenanceReconcileIntervalMs());
+        assertEquals(5000, config.scheduler().failureRetryDelayMs());
+        assertEquals(600000, config.scheduler().visibilityMaxDelayMs());
+        assertEquals(20, config.coreConfig().flowcontrol().overloadedPendingSstCount());
         assertTrue(config.protocol().strictHttp2());
         assertEquals(PmsProtocolConfig.DEFAULT_MAX_KEY_BYTES, config.protocol().maxKeyBytes());
         assertEquals(PmsProtocolConfig.DEFAULT_MAX_ROW_BYTES, config.protocol().maxRowBytes());
@@ -945,6 +954,34 @@ class PmsServerEndToEndTest {
             () -> new ConfigManager().from(props)
         );
         assertTrue(error.getMessage().contains("must not be the same directory"));
+    }
+
+    @Test
+    void configManagerRejectsRemovedFixedDelaySchedulerKeys() {
+        Properties props = baseProperties();
+        props.setProperty("pms.server.scheduler.sink_interval_ms", "1000");
+
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> new ConfigManager().from(props)
+        );
+
+        assertTrue(error.getMessage().contains("Removed scheduler config key"));
+    }
+
+    @Test
+    void configManagerRequiresNewSstTargetBelowWriteHardLimit() {
+        Properties props = baseProperties();
+        props.setProperty("pms.storage.new_sst.max_count", "10");
+        props.setProperty("pms.flowcontrol.overloaded_pending_sst_count", "10");
+
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> new ConfigManager().from(props)
+        );
+
+        assertTrue(error.getMessage().contains("new_sst.max_count"));
+        assertTrue(error.getMessage().contains("overloaded_pending_sst_count"));
     }
 
     @Test
@@ -1159,6 +1196,7 @@ class PmsServerEndToEndTest {
         props.setProperty("pms.wal.dir", rootDir.resolve("wal").toString());
         props.setProperty("pms.storage.dir", rootDir.resolve("storage").toString());
         props.setProperty("pms.lookup.cache.dir", rootDir.resolve("target").resolve("lookup-cache").toString());
+        props.setProperty("pms.server.scheduler.enabled", "false");
         return props;
     }
 
@@ -1188,6 +1226,20 @@ class PmsServerEndToEndTest {
 
     private static long number(Map<String, Object> map, String key) {
         return ((Number) map.get(key)).longValue();
+    }
+
+    private static long actionCount(Map<String, Object> scheduler, String metric, String action) {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> counts = (Map<String, Object>) scheduler.get(metric);
+        Object value = counts.get(action);
+        return value == null ? 0 : ((Number) value).longValue();
+    }
+
+    private static void sinkAllAvailable(PmsTableService service) {
+        long targetSequenceId = service.stateSnapshot().newSSTMaxSequenceId();
+        if (targetSequenceId > 0) {
+            service.sinkToPaimon(new SinkSelection(targetSequenceId, Integer.MAX_VALUE, Long.MAX_VALUE));
+        }
     }
 
     private static String rootCauseMessage(Throwable error) {

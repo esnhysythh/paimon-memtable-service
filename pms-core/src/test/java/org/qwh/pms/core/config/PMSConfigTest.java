@@ -38,6 +38,10 @@ class PMSConfigTest {
 
         // Flow control defaults
         assertEquals(FlowControlConfig.DEFAULT_OVERLOADED_IMMUTABLE_COUNT, config.flowcontrol().overloadedImmutableCount());
+        assertEquals(
+            FlowControlConfig.DEFAULT_OVERLOADED_PENDING_SST_COUNT,
+            config.flowcontrol().overloadedPendingSstCount()
+        );
 
         // Paimon required field
         assertEquals("/tmp/table", config.paimon().tablePath());
