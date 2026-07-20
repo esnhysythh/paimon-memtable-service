@@ -1,7 +1,6 @@
 package org.qwh.pms.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -13,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
@@ -162,29 +162,34 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void synchronousDrainIsNotLimitedByAutomaticActionBudget() {
+    void manualFlushReturnsFenceBeforeBlockedFlushCompletes() throws Exception {
         MutableOperations operations = new MutableOperations();
-        for (long sequenceId = 1; sequenceId <= 65; sequenceId++) {
-            operations.addImmutable(sequenceId);
-        }
+        operations.currentEntries = 1;
+        operations.lastAssignedSequenceId = 5;
+        operations.blockNextFlush();
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 1_000, 30_000, 600_000, 100, 100, 1, 1_024, 1_024),
-            fixedTimeSource(Instant.ofEpochMilli(10_000))
+            config(false, 60_000, 60_000, 600_000, 10, 10, 1, 1_024, 1_024),
+            systemLikeTimeSource()
         );
         try {
-            scheduler.flushToCurrent();
-            scheduler.sinkAvailable();
+            scheduler.start();
+            long fence = scheduler.requestFlushToCurrent();
+
+            assertEquals(5, fence);
+            assertTrue(operations.flushStarted.await(5, TimeUnit.SECONDS));
+            assertEquals(0, operations.lastFlushedSequenceId);
+            operations.releaseFlush();
+            waitUntil(() -> operations.lastFlushedSequenceId >= fence);
         } finally {
+            operations.releaseFlush();
             scheduler.close();
         }
 
-        assertEquals(65, operations.flushCalls);
-        assertEquals(65, operations.sinkCalls);
-        assertEquals(65, operations.lastFlushedSequenceId);
-        assertEquals(65, operations.lastPersistedSequenceId);
-        assertEquals(0, operations.count(SSTState.NEW));
-        assertEquals(65, operations.count(SSTState.SINKED));
+        assertEquals(1, operations.freezeCalls);
+        assertEquals(1, operations.flushCalls);
+        assertEquals(5, operations.lastFlushedSequenceId);
+        assertEquals(0, operations.lastPersistedSequenceId);
     }
 
     @Test
@@ -219,37 +224,32 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void drainingStopsBackgroundMaintenanceButKeepsFinalDrainAvailable() throws Exception {
+    void manualSinkReusesVisibilityFenceAndCompletesAsynchronously() throws Exception {
         MutableOperations operations = new MutableOperations();
+        operations.currentEntries = 1;
+        operations.lastAssignedSequenceId = 3;
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(true, 60_000, 1, 600_000, 2, 10, 4, 1_024, 1_024),
+            config(true, 60_000, 60_000, 600_000, 10, 10, 1, 1_024, 1_024),
             systemLikeTimeSource()
         );
         try {
             scheduler.start();
-            waitUntil(() -> (Long) scheduler.state().get("maintenanceRunCount") > 0);
-            scheduler.beginDrain();
-            long maintenanceRunsAtDrain = (Long) scheduler.state().get("maintenanceRunCount");
+            long fence = scheduler.requestSinkToCurrent();
 
-            operations.addRun(SSTState.NEW, 1, 100);
-            operations.addRun(SSTState.NEW, 2, 100);
-            operations.addRun(SSTState.NEW, 3, 100);
-            operations.lastFlushedSequenceId = 3;
-            Thread.sleep(25);
-
-            assertEquals(maintenanceRunsAtDrain, scheduler.state().get("maintenanceRunCount"));
-            assertEquals(0, operations.compactCalls);
-            assertEquals(0, operations.sinkCalls);
-            assertFalse((Boolean) scheduler.state().get("running"));
-            assertTrue((Boolean) scheduler.state().get("draining"));
-
-            scheduler.drainToPaimon();
-            assertEquals(1, operations.sinkCalls);
-            assertEquals(0, operations.count(SSTState.NEW));
+            assertEquals(3, fence);
+            waitUntil(() -> operations.lastPersistedSequenceId >= fence
+                && (Long) scheduler.state().get("pendingPaimonFenceSequenceId") == 0L);
         } finally {
             scheduler.close();
         }
+
+        assertEquals(1, operations.freezeCalls);
+        assertEquals(1, operations.flushCalls);
+        assertEquals(1, operations.sinkCalls);
+        assertEquals(3, operations.lastFlushedSequenceId);
+        assertEquals(3, operations.lastPersistedSequenceId);
+        assertEquals(0L, scheduler.state().get("pendingPaimonFenceSequenceId"));
     }
 
     @Test
@@ -380,6 +380,8 @@ class PmsServerSchedulerTest {
         private int compactCalls;
         private int evictCalls;
         private RuntimeException flushFailure;
+        private volatile CountDownLatch flushStarted;
+        private volatile CountDownLatch flushRelease;
         private boolean recoveredUnpersistedData;
         private SinkFlightSnapshot sinkFlight = SinkFlightSnapshot.idle();
         private final ArrayDeque<Long> immutableMaxSequenceIds = new ArrayDeque<>();
@@ -457,6 +459,17 @@ class PmsServerSchedulerTest {
             flushCalls++;
             if (flushFailure != null) {
                 throw flushFailure;
+            }
+            if (flushStarted != null) {
+                flushStarted.countDown();
+                try {
+                    flushRelease.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("blocked Flush interrupted", e);
+                }
+                flushStarted = null;
+                flushRelease = null;
             }
             immutableCount--;
             long flushedSequenceId = immutableMaxSequenceIds.isEmpty()
@@ -601,6 +614,18 @@ class PmsServerSchedulerTest {
             immutableCount++;
             immutableMaxSequenceIds.addLast(maxSequenceId);
             lastAssignedSequenceId = Math.max(lastAssignedSequenceId, maxSequenceId);
+        }
+
+        private synchronized void blockNextFlush() {
+            flushStarted = new CountDownLatch(1);
+            flushRelease = new CountDownLatch(1);
+        }
+
+        private void releaseFlush() {
+            CountDownLatch release = flushRelease;
+            if (release != null) {
+                release.countDown();
+            }
         }
 
         private synchronized int count(SSTState state) {

@@ -12,7 +12,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,8 +33,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Coordinates background and synchronous maintenance for one PMS table.
- * 为单个 PMS 表协调后台维护与同步维护操作.
+ * Coordinates background maintenance and asynchronous fence requests for one PMS table.
+ * 为单个 PMS 表协调后台维护和异步 fence 请求.
  *
  * <p>The scheduler owns two independent single-threaded execution domains: Flush only advances
  * immutable MemTables to local SSTs, while maintenance serializes visibility fences, Paimon Sink,
@@ -47,12 +46,12 @@ import org.slf4j.LoggerFactory;
  * 是事实来源;调度器只保存当前生效的 Paimon 可见性 fence, 以及 worker 生命周期和诊断状态.
  *
  * <p>Automatic reconciliation is sliced by {@link #MAX_ACTIONS_PER_RUN} for fairness. Management
- * commands instead drain a fixed sequence target to completion (or fail on no progress), so their
- * semantics are not truncated by the background-worker budget.
+ * requests establish a sequence fence and return without waiting for Flush or Sink I/O; the same
+ * workers advance that fence and expose completion through the durable sequence boundaries.
  *
- * <p>自动调和按照 {@link #MAX_ACTIONS_PER_RUN} 划分执行片段, 以保证调度公平性.管理命令则会
- * 持续推进固定的 sequence 目标, 直至完成;如果无法取得进展则明确失败, 因此其语义不会被后台
- * worker 的单轮动作预算截断.
+ * <p>自动调和按照 {@link #MAX_ACTIONS_PER_RUN} 划分执行片段, 以保证调度公平性.管理请求只建立
+ * sequence fence, 不等待 Flush 或 Sink I/O; 同一组 worker 负责推进 fence, 客户端通过可靠的
+ * sequence boundary 观察完成状态.
  */
 public final class PmsServerScheduler implements AutoCloseable {
     static final String ACTION_LOG_MARKER = "PMS_SCHEDULER_ACTION";
@@ -74,10 +73,7 @@ public final class PmsServerScheduler implements AutoCloseable {
     private final ConcurrentHashMap<String, AtomicLong> actionFailureCounts = new ConcurrentHashMap<>();
 
     private volatile boolean running;
-    private volatile boolean draining;
     private volatile boolean closed;
-    private volatile ScheduledFuture<?> flushPeriodicTask;
-    private volatile ScheduledFuture<?> maintenancePeriodicTask;
     private volatile boolean flushRunning;
     private volatile boolean maintenanceRunning;
     // The only cross-operation plan state. Zero means no visibility fence is active.
@@ -136,22 +132,19 @@ public final class PmsServerScheduler implements AutoCloseable {
             return;
         }
         ensureOpen();
-        if (draining) {
-            throw new IllegalStateException("PMS server scheduler is draining");
-        }
+        running = true;
         if (!config.enabled()) {
-            LOG.info("PMS server scheduler disabled");
+            LOG.info("PMS server automatic reconciliation disabled; manual fence requests remain available");
             return;
         }
-        running = true;
-        flushPeriodicTask = flushExecutor.scheduleWithFixedDelay(
-            this::requestFlush,
+        flushExecutor.scheduleWithFixedDelay(
+            this::signalFlush,
             0,
             config.flushReconcileIntervalMs(),
             TimeUnit.MILLISECONDS
         );
-        maintenancePeriodicTask = maintenanceExecutor.scheduleWithFixedDelay(
-            this::requestMaintenance,
+        maintenanceExecutor.scheduleWithFixedDelay(
+            this::signalMaintenance,
             0,
             config.maintenanceReconcileIntervalMs(),
             TimeUnit.MILLISECONDS
@@ -164,63 +157,26 @@ public final class PmsServerScheduler implements AutoCloseable {
         );
     }
 
-    /** Stops background reconciliation while keeping both executors available for final drain. */
-    public synchronized void beginDrain() {
-        ensureOpen();
-        if (draining) {
-            return;
-        }
-        draining = true;
-        running = false;
-        cancel(flushPeriodicTask);
-        cancel(maintenancePeriodicTask);
-        flushPeriodicTask = null;
-        maintenancePeriodicTask = null;
-        flushRerunRequested.set(false);
-        maintenanceRerunRequested.set(false);
-        LOG.info("PMS server scheduler entered draining mode; background reconciliation stopped");
-    }
-
-    /** Freezes the current write boundary and synchronously flushes every immutable covering it. */
-    public void flushToCurrent() {
-        ensureOpen();
-        FreezeResult freeze = callMaintenance(() -> executeFreeze("MANUAL_FLUSH", operations.stateSnapshot()));
-        long fence = freeze.fenceSequenceId();
-        callFlush(() -> {
-            drainFlushTarget("MANUAL_FLUSH", fence);
-            BucketStateSnapshot state = operations.stateSnapshot();
-            if (state.lastFlushedSequenceId() < fence) {
-                throw new IllegalStateException(
-                    "manual Flush did not reach fence " + fence + ", lastFlushed=" + state.lastFlushedSequenceId()
-                );
-            }
-            return null;
+    /** Establishes a local Flush fence and returns without waiting for SST I/O. */
+    public long requestFlushToCurrent() {
+        ensureRunning();
+        return callMaintenance(() -> {
+            FreezeResult freeze = executeFreeze("MANUAL_FLUSH_REQUEST", operations.stateSnapshot());
+            signalFlush();
+            return freeze.fenceSequenceId();
         });
     }
 
-    /** Synchronously sinks the stable NEW prefix visible when this command starts. */
-    public void sinkAvailable() {
-        ensureOpen();
-        callMaintenance(() -> {
-            BucketStateSnapshot initial = operations.stateSnapshot();
-            long targetSequenceId = initial.newSSTMaxSequenceId();
-            drainSinkTarget("MANUAL_SINK", targetSequenceId);
-            return null;
-        });
-    }
-
-    /** Establishes one final fence and synchronously Flushes and Sinks through it. */
-    public void drainToPaimon() {
-        ensureOpen();
-        FreezeResult freeze = callMaintenance(() -> executeFreeze("DRAIN_TO_PAIMON", operations.stateSnapshot()));
-        long fence = freeze.fenceSequenceId();
-        callFlush(() -> {
-            drainFlushTarget("DRAIN_TO_PAIMON", fence);
-            return null;
-        });
-        callMaintenance(() -> {
-            drainSinkTarget("DRAIN_TO_PAIMON", fence);
-            return null;
+    /** Establishes or extends the Paimon visibility fence and returns without waiting for I/O. */
+    public long requestSinkToCurrent() {
+        ensureRunning();
+        return callMaintenance(() -> {
+            FreezeResult freeze = executeFreeze("MANUAL_SINK_REQUEST", operations.stateSnapshot());
+            long fence = freeze.fenceSequenceId();
+            pendingPaimonFenceSequenceId = Math.max(pendingPaimonFenceSequenceId, fence);
+            signalFlush();
+            signalMaintenance();
+            return fence;
         });
     }
 
@@ -243,7 +199,7 @@ public final class PmsServerScheduler implements AutoCloseable {
             return null;
         });
         callFlush(() -> {
-            drainFlush("RECONCILE_NOW", false);
+            reconcileFlush("RECONCILE_NOW", false);
             return null;
         });
         callMaintenance(() -> {
@@ -256,7 +212,6 @@ public final class PmsServerScheduler implements AutoCloseable {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("enabled", config.enabled());
         result.put("running", running);
-        result.put("draining", draining);
         result.put("flushReconcileIntervalMs", config.flushReconcileIntervalMs());
         result.put("maintenanceReconcileIntervalMs", config.maintenanceReconcileIntervalMs());
         result.put("failureRetryDelayMs", config.failureRetryDelayMs());
@@ -294,14 +249,13 @@ public final class PmsServerScheduler implements AutoCloseable {
             return;
         }
         running = false;
-        draining = true;
         closed = true;
         shutdown(flushExecutor, "Flush");
         shutdown(maintenanceExecutor, "maintenance");
         LOG.info("PMS server scheduler stopped");
     }
 
-    private void requestFlush() {
+    private void signalFlush() {
         if (!running || closed) {
             return;
         }
@@ -319,13 +273,13 @@ public final class PmsServerScheduler implements AutoCloseable {
             } finally {
                 flushQueuedOrRunning.set(false);
                 if (flushRerunRequested.getAndSet(false)) {
-                    requestFlush();
+                    signalFlush();
                 }
             }
         });
     }
 
-    private void requestMaintenance() {
+    private void signalMaintenance() {
         if (!running || closed) {
             return;
         }
@@ -343,7 +297,7 @@ public final class PmsServerScheduler implements AutoCloseable {
             } finally {
                 maintenanceQueuedOrRunning.set(false);
                 if (maintenanceRerunRequested.getAndSet(false)) {
-                    requestMaintenance();
+                    signalMaintenance();
                 }
             }
         });
@@ -358,7 +312,7 @@ public final class PmsServerScheduler implements AutoCloseable {
         lastFlushStartedAt = now();
         flushRunCount++;
         try {
-            drainFlush("IMMUTABLE_BACKLOG", true);
+            reconcileFlush("IMMUTABLE_BACKLOG", true);
             flushRetryNotBeforeMillis = 0;
         } catch (RuntimeException e) {
             recordWorkerFailure("flush", "FLUSH", e);
@@ -393,12 +347,12 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
     }
 
-    private void drainFlush(String reason, boolean background) {
+    private void reconcileFlush(String reason, boolean background) {
         for (int actions = 0; actions < MAX_ACTIONS_PER_RUN; actions++) {
-            // A background slice yields promptly once draining starts. Synchronous callers pass
-            // background=false and are governed by their fixed target instead.
-            // 进入 draining 后, 后台执行片段应尽快让出; 同步调用方传入 background=false, 改由其
-            // 固定目标约束执行过程.
+            // A background slice yields promptly once shutdown starts. Deterministic management
+            // reconciliation passes background=false but retain the same per-pass action budget.
+            // shutdown 开始后, 后台执行片段应尽快让出; 确定性管理调和传入 background=false,
+            // 但仍服从相同的单轮动作预算.
             if (background && !running) {
                 return;
             }
@@ -411,36 +365,11 @@ public final class PmsServerScheduler implements AutoCloseable {
                 return;
             }
             if (running) {
-                requestMaintenance();
+                signalMaintenance();
             }
         }
         if (background && running && operations.stateSnapshot().immutableMemTableCount() > 0) {
-            requestFlush();
-        }
-    }
-
-    private void drainFlushTarget(String reason, long targetSequenceId) {
-        while (targetSequenceId > 0) {
-            BucketStateSnapshot state = operations.stateSnapshot();
-            if (state.lastFlushedSequenceId() >= targetSequenceId) {
-                return;
-            }
-            if (state.immutableMemTableCount() == 0) {
-                throw new IllegalStateException(
-                    "Flush has no immutable MemTable before target " + targetSequenceId
-                        + ", lastFlushed=" + state.lastFlushedSequenceId()
-                );
-            }
-            FlushResult result = executeFlush(state, reason);
-            if (!result.progressed()) {
-                throw new IllegalStateException(
-                    "Flush made no progress toward target " + targetSequenceId
-                        + ", lastFlushed=" + state.lastFlushedSequenceId()
-                );
-            }
-            if (running) {
-                requestMaintenance();
-            }
+            signalFlush();
         }
     }
 
@@ -491,7 +420,7 @@ public final class PmsServerScheduler implements AutoCloseable {
                 // Sink cannot cover the fence until Flush has materialized its complete prefix.
                 // 在 Flush 将 fence 对应的完整前缀物化为 SST 之前, Sink 无法覆盖该 fence.
                 if (state.lastFlushedSequenceId() < fence) {
-                    requestFlush();
+                    signalFlush();
                     return;
                 }
                 // One Sink call is deliberately bounded by batch count/bytes. Keep the same fence
@@ -512,7 +441,7 @@ public final class PmsServerScheduler implements AutoCloseable {
                 // 可见性目标的完成时间.
                 FreezeResult freeze = executeFreeze("PAIMON_VISIBILITY_LAG", state);
                 pendingPaimonFenceSequenceId = freeze.fenceSequenceId();
-                requestFlush();
+                signalFlush();
                 continue;
             }
 
@@ -562,36 +491,7 @@ public final class PmsServerScheduler implements AutoCloseable {
             return;
         }
         if (background && running) {
-            requestMaintenance();
-        }
-    }
-
-    private void drainSinkTarget(String reason, long targetSequenceId) {
-        // Unlike automatic reconciliation, a synchronous command owns a fixed target and is not
-        // action-budgeted. Monotonic persisted progress bounds the loop; NOOP is an explicit error.
-        // 与自动调和不同, 同步命令持有固定目标, 不受单轮动作预算限制. persisted boundary 的单调
-        // 推进保证循环有界; 如果 Operation 返回 NOOP, 则将其作为明确错误处理.
-        while (targetSequenceId > 0) {
-            BucketStateSnapshot state = operations.stateSnapshot();
-            if (state.lastPersistedSequenceId() >= targetSequenceId) {
-                return;
-            }
-            if (state.sinkFlight().status() == SinkFlightSnapshot.Status.PREPARED_RETRY) {
-                if (!executePreparedRetry(state).progressed()) {
-                    throw new IllegalStateException(
-                        "prepared Sink made no progress toward target " + targetSequenceId
-                            + ", lastPersisted=" + state.lastPersistedSequenceId()
-                    );
-                }
-                continue;
-            }
-            SinkOperationResult result = executeSink(state, targetSequenceId, reason);
-            if (!result.progressed()) {
-                throw new IllegalStateException(
-                    "Sink made no progress toward target " + targetSequenceId
-                        + ", lastPersisted=" + state.lastPersistedSequenceId()
-                );
-            }
+            signalMaintenance();
         }
     }
 
@@ -800,14 +700,14 @@ public final class PmsServerScheduler implements AutoCloseable {
 
     private void scheduleFlushRetry() {
         if (running && !closed) {
-            flushExecutor.schedule(this::requestFlush, config.failureRetryDelayMs(), TimeUnit.MILLISECONDS);
+            flushExecutor.schedule(this::signalFlush, config.failureRetryDelayMs(), TimeUnit.MILLISECONDS);
         }
     }
 
     private void scheduleMaintenanceRetry() {
         if (running && !closed) {
             maintenanceExecutor.schedule(
-                this::requestMaintenance,
+                this::signalMaintenance,
                 config.failureRetryDelayMs(),
                 TimeUnit.MILLISECONDS
             );
@@ -850,12 +750,6 @@ public final class PmsServerScheduler implements AutoCloseable {
         return snapshot;
     }
 
-    private static void cancel(Future<?> task) {
-        if (task != null) {
-            task.cancel(false);
-        }
-    }
-
     private static void shutdown(ScheduledExecutorService executor, String role) {
         executor.shutdown();
         try {
@@ -872,6 +766,13 @@ public final class PmsServerScheduler implements AutoCloseable {
     private void ensureOpen() {
         if (closed) {
             throw new IllegalStateException("PMS server scheduler is closed");
+        }
+    }
+
+    private void ensureRunning() {
+        ensureOpen();
+        if (!running) {
+            throw new IllegalStateException("PMS server scheduler is not running");
         }
     }
 

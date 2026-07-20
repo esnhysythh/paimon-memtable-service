@@ -81,9 +81,22 @@ class PmsServerEndToEndTest {
 
             assertJson(server.post("/write", "{\"id\":1,\"marker\":\"old-a\"}"), "\"status\":\"OK\"");
             assertJson(server.post("/get", "{\"id\":1}"), "\"found\":true");
-            assertJson(server.post("/flush", "{}"), "\"status\":\"OK\"");
-            assertJson(server.post("/sink", "{}"), "\"status\":\"OK\"");
-            assertJson(server.get("/state"), "\"sinkedSSTCount\":1");
+            PMSTestServer.HttpResult flushResponse = server.postResult("/flush", "{}");
+            assertEquals(202, flushResponse.statusCode());
+            Map<String, Object> flushAccepted = flushResponse.jsonObject();
+            assertEquals("ACCEPTED", flushAccepted.get("status"));
+            assertEquals("FLUSH", flushAccepted.get("operation"));
+            long flushFence = number(flushAccepted, "fenceSequenceId");
+            waitUntil(() -> boundaryReached(server, "lastFlushedSequenceId", flushFence));
+
+            PMSTestServer.HttpResult sinkResponse = server.postResult("/sink", "{}");
+            assertEquals(202, sinkResponse.statusCode());
+            Map<String, Object> sinkAccepted = sinkResponse.jsonObject();
+            assertEquals("ACCEPTED", sinkAccepted.get("status"));
+            assertEquals("SINK", sinkAccepted.get("operation"));
+            long sinkFence = number(sinkAccepted, "fenceSequenceId");
+            waitUntil(() -> boundaryReached(server, "lastPersistedSequenceId", sinkFence));
+            assertEquals(1L, number(server.getJson("/state"), "sinkedSSTCount"));
 
             assertEquals(Map.of(1, "old-a"), server.readIntStringRows());
 
@@ -97,7 +110,7 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void runtimeCloseFlushesAndSinksRemainingData() throws Exception {
+    void runtimeCloseReliesOnWalRecoveryWithoutFlushingOrSinking() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "close-a"));
 
@@ -105,11 +118,19 @@ class PmsServerEndToEndTest {
             runtime.close();
 
             assertEquals(PmsRuntimeStatus.STOPPED, runtime.status());
-            assertEquals(Map.of(1, "close-a"), server.readIntStringRows());
+            assertEquals(Map.of(), server.readIntStringRows());
             assertThrows(
                 PmsServiceUnavailableException.class,
                 () -> runtime.write(Map.of("id", 2, "marker", "rejected"))
             );
+
+            server.restart();
+            assertEquals(
+                Map.of("id", 1, "marker", "close-a"),
+                server.get(Map.of("id", 1)).orElseThrow()
+            );
+            Map<String, Object> recovery = recovery(server.getJson("/state"));
+            assertEquals(1L, number(recovery, "recoveredDataRecords"));
         }
     }
 
@@ -133,7 +154,7 @@ class PmsServerEndToEndTest {
     void flushedUnsinkedSstIsRecoveredAfterAbortRestart() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "sst-a"));
-            server.flush();
+            flushAndWait(server);
 
             server.abortAndRestart();
 
@@ -144,7 +165,7 @@ class PmsServerEndToEndTest {
             assertEquals(1L, number(recovery, "lastFlushedSequenceId"));
             assertEquals(1L, number(recovery, "newSSTCount"));
 
-            server.sink();
+            sinkAndWait(server);
             assertEquals(Map.of(1, "sst-a"), server.readIntStringRows());
         }
     }
@@ -160,10 +181,12 @@ class PmsServerEndToEndTest {
 
             try {
                 failingRuntime.write(Map.of("id", 1, "marker", "prepared-a"));
-                failingRuntime.flush();
-
-                RuntimeException error = assertThrows(RuntimeException.class, failingRuntime::sink);
-                assertTrue(rootCauseMessage(error).contains("forced commit failure after prepare"));
+                failingRuntime.sink();
+                waitUntil(() -> sinkFlight(failingRuntime) == SinkFlightSnapshot.Status.PREPARED_RETRY);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> schedulerState = (Map<String, Object>) failingRuntime.state().get("scheduler");
+                assertTrue(String.valueOf(schedulerState.get("lastErrorMessage"))
+                    .contains("forced commit failure after prepare"));
             } finally {
                 failingRuntime.abort();
             }
@@ -191,7 +214,10 @@ class PmsServerEndToEndTest {
     @Test
     void preparedSinkCommitRetriesInSameRuntimeWithoutPreparingAgain() throws Exception {
         AtomicReference<FailOnceAfterPrepareSinkManager> sinkManagerRef = new AtomicReference<>();
-        try (PMSTestServer server = PMSTestServer.create(tempDir, schema())) {
+        Properties props = baseProperties();
+        props.setProperty("pms.server.scheduler.failure_retry_delay_ms", "25");
+        PmsServerConfig config = new ConfigManager().from(props);
+        try (PMSTestServer server = PMSTestServer.create(config, schema())) {
             PmsServerRuntime runtime = new PmsServerRuntime(
                 server.config(),
                 (table, commitUser, storage) -> {
@@ -204,20 +230,14 @@ class PmsServerEndToEndTest {
             ).start();
             try {
                 runtime.write(Map.of("id", 1, "marker", "online-retry-a"));
-                runtime.flush();
-
-                RuntimeException failure = assertThrows(RuntimeException.class, runtime::sink);
-                assertTrue(rootCauseMessage(failure).contains("forced first commit failure after prepare"));
+                long fence = runtime.sink();
                 FailOnceAfterPrepareSinkManager manager = sinkManagerRef.get();
                 assertNotNull(manager);
-                assertEquals(1, manager.prepareCalls);
-                assertEquals(1, manager.commitCalls);
-                assertEquals(
-                    SinkFlightSnapshot.Status.PREPARED_RETRY,
-                    ((SinkFlightSnapshot) runtime.state().get("sinkFlight")).status()
-                );
-
-                runtime.sink();
+                waitUntil(() -> manager.commitCalls >= 2 && boundaryReached(
+                    runtime,
+                    "lastPersistedSequenceId",
+                    fence
+                ));
 
                 assertEquals(1, manager.prepareCalls);
                 assertEquals(2, manager.commitCalls);
@@ -244,8 +264,8 @@ class PmsServerEndToEndTest {
     void sinkSuccessWalStateIsRecoveredAfterAbortRestart() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "success-a"));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
 
             server.abortAndRestart();
 
@@ -265,7 +285,7 @@ class PmsServerEndToEndTest {
     void missingFlushedSstFailsStartupInsteadOfDroppingData() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "missing-a"));
-            server.flush();
+            flushAndWait(server);
             server.abortRuntime();
         }
 
@@ -281,7 +301,7 @@ class PmsServerEndToEndTest {
     void corruptFlushedSstFailsStartupWithDiagnosticError() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "corrupt-a"));
-            server.flush();
+            flushAndWait(server);
             server.abortRuntime();
         }
 
@@ -316,13 +336,13 @@ class PmsServerEndToEndTest {
     void deleteByPrimaryKeySinksTombstoneToPaimon() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "old-a"));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
             assertEquals(Map.of(1, "old-a"), server.readIntStringRows());
 
             server.delete(Map.of("id", 1));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
 
             assertEquals(Map.of(), server.readIntStringRows());
         }
@@ -337,8 +357,8 @@ class PmsServerEndToEndTest {
         );
         try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
             writer.write(Map.of("id", 1, "marker", "paimon-a"));
-            writer.flush();
-            writer.sink();
+            flushAndWait(writer);
+            sinkAndWait(writer);
             assertEquals(Map.of(1, "paimon-a"), writer.readIntStringRows());
         }
 
@@ -368,8 +388,8 @@ class PmsServerEndToEndTest {
         );
         try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
             writer.write(Map.of("id", 1, "marker", "cache-a"));
-            writer.flush();
-            writer.sink();
+            flushAndWait(writer);
+            sinkAndWait(writer);
         }
 
         PmsServerConfig readerConfig = new ConfigManager().from(
@@ -405,8 +425,8 @@ class PmsServerEndToEndTest {
         );
         try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
             writer.write(Map.of("id", 1, "marker", "paimon-a"));
-            writer.flush();
-            writer.sink();
+            flushAndWait(writer);
+            sinkAndWait(writer);
             assertEquals(Map.of(1, "paimon-a"), writer.readIntStringRows());
         }
 
@@ -443,12 +463,12 @@ class PmsServerEndToEndTest {
 
         try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "retained-1"));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
 
             server.write(Map.of("id", 2, "marker", "retained-2"));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
 
             Path oldestSinked = tempDir.resolve("storage").resolve("sst-000001-000001.sst");
             assertTrue(Files.exists(oldestSinked));
@@ -458,8 +478,8 @@ class PmsServerEndToEndTest {
             );
 
             server.write(Map.of("id", 3, "marker", "retained-3"));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
             server.reconcileNow();
 
             Map<String, Object> state = server.getJson("/state");
@@ -487,11 +507,11 @@ class PmsServerEndToEndTest {
 
         try (PMSTestServer server = PMSTestServer.create(config, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "compact-1"));
-            server.flush();
+            flushAndWait(server);
             server.write(Map.of("id", 2, "marker", "compact-2"));
-            server.flush();
+            flushAndWait(server);
 
-            server.sink();
+            sinkAndWait(server);
             server.reconcileNow();
 
             Map<String, Object> state = server.getJson("/state");
@@ -518,12 +538,12 @@ class PmsServerEndToEndTest {
             server.write(Map.of("id", 1, "sub_id", 1, "marker", "old-1"));
             server.write(Map.of("id", 1, "sub_id", 2, "marker", "old-2"));
             server.write(Map.of("id", 2, "sub_id", 1, "marker", "outside"));
-            server.flush();
-            server.sink();
+            flushAndWait(server);
+            sinkAndWait(server);
 
             server.write(Map.of("id", 1, "sub_id", 1, "marker", "new-1"));
             server.delete(Map.of("id", 1, "sub_id", 2));
-            server.flush();
+            flushAndWait(server);
 
             server.write(Map.of("id", 1, "sub_id", 3, "marker", "cur-3"));
 
@@ -758,8 +778,8 @@ class PmsServerEndToEndTest {
         );
         try (PMSTestServer writer = PMSTestServer.create(writerConfig, schema()).start()) {
             writer.write(Map.of("id", 1, "marker", "paimon-binary"));
-            writer.flush();
-            writer.sink();
+            flushAndWait(writer);
+            sinkAndWait(writer);
         }
 
         PmsServerConfig readerConfig = new ConfigManager().from(
@@ -1215,6 +1235,38 @@ class PmsServerEndToEndTest {
         assertTrue(condition.getAsBoolean(), "condition did not become true before timeout");
     }
 
+    private static long flushAndWait(PMSTestServer server) throws Exception {
+        long fenceSequenceId = server.flush();
+        waitUntil(() -> boundaryReached(server, "lastFlushedSequenceId", fenceSequenceId));
+        return fenceSequenceId;
+    }
+
+    private static long sinkAndWait(PMSTestServer server) throws Exception {
+        long fenceSequenceId = server.sink();
+        waitUntil(() -> boundaryReached(server, "lastPersistedSequenceId", fenceSequenceId));
+        return fenceSequenceId;
+    }
+
+    private static boolean boundaryReached(PMSTestServer server, String boundary, long fenceSequenceId) {
+        try {
+            return number(server.getJson("/state"), boundary) >= fenceSequenceId;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean boundaryReached(PmsServerRuntime runtime, String boundary, long fenceSequenceId) {
+        try {
+            return number(runtime.state(), boundary) >= fenceSequenceId;
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static SinkFlightSnapshot.Status sinkFlight(PmsServerRuntime runtime) {
+        return ((SinkFlightSnapshot) runtime.state().get("sinkFlight")).status();
+    }
+
     private static boolean httpServerStopped(PmsServerRuntime runtime) {
         try {
             runtime.port();
@@ -1240,14 +1292,6 @@ class PmsServerEndToEndTest {
         if (targetSequenceId > 0) {
             service.sinkToPaimon(new SinkSelection(targetSequenceId, Integer.MAX_VALUE, Long.MAX_VALUE));
         }
-    }
-
-    private static String rootCauseMessage(Throwable error) {
-        Throwable current = error;
-        while (current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current.getMessage();
     }
 
     private static String causalMessages(Throwable error) {
@@ -1286,10 +1330,10 @@ class PmsServerEndToEndTest {
 
     private static final class FailOnceAfterPrepareSinkManager implements SinkManager {
         private final SinkManager delegate;
-        private int prepareCalls;
-        private int commitCalls;
-        private PreparedSinkCommit firstCommit;
-        private PreparedSinkCommit secondCommit;
+        private volatile int prepareCalls;
+        private volatile int commitCalls;
+        private volatile PreparedSinkCommit firstCommit;
+        private volatile PreparedSinkCommit secondCommit;
 
         private FailOnceAfterPrepareSinkManager(SinkManager delegate) {
             this.delegate = delegate;

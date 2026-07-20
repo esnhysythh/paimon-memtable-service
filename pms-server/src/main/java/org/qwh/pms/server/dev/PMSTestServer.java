@@ -157,12 +157,12 @@ public final class PMSTestServer implements AutoCloseable {
         return runtime().prefixLocal(primaryKeyPrefix);
     }
 
-    public void flush() {
-        runtime().flush();
+    public long flush() {
+        return runtime().flush();
     }
 
-    public void sink() {
-        runtime().sink();
+    public long sink() {
+        return runtime().sink();
     }
 
     public void reconcileNow() {
@@ -219,7 +219,7 @@ public final class PMSTestServer implements AutoCloseable {
 
     public record HttpResult(int statusCode, String body) {
         public HttpResult requireOk() {
-            if (statusCode != 200) {
+            if (statusCode < 200 || statusCode >= 300) {
                 throw new IllegalStateException(
                     "HTTP request failed with status " + statusCode + ": " + body
                 );

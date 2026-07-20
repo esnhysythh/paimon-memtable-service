@@ -187,12 +187,22 @@ public final class PmsHttpServer implements AutoCloseable {
                         return ok(responseBody);
                     });
                     case "/flush" -> handleJson(request, response, callback, "POST", () -> {
-                        runtime.flush();
-                        return ok(Map.of("status", "OK"));
+                        long fenceSequenceId = runtime.flush();
+                        return accepted(Map.of(
+                            "status", "ACCEPTED",
+                            "operation", "FLUSH",
+                            "fenceSequenceId", fenceSequenceId,
+                            "completionBoundary", "lastFlushedSequenceId"
+                        ));
                     });
                     case "/sink" -> handleJson(request, response, callback, "POST", () -> {
-                        runtime.sink();
-                        return ok(Map.of("status", "OK"));
+                        long fenceSequenceId = runtime.sink();
+                        return accepted(Map.of(
+                            "status", "ACCEPTED",
+                            "operation", "SINK",
+                            "fenceSequenceId", fenceSequenceId,
+                            "completionBoundary", "lastPersistedSequenceId"
+                        ));
                     });
                     case "/state" -> handleJson(request, response, callback, "GET", () -> ok(runtime.state()));
                     default -> {
@@ -509,6 +519,10 @@ public final class PmsHttpServer implements AutoCloseable {
 
     private static ResponseBody ok(Map<String, Object> body) {
         return new ResponseBody(HttpStatus.OK_200, body);
+    }
+
+    private static ResponseBody accepted(Map<String, Object> body) {
+        return new ResponseBody(HttpStatus.ACCEPTED_202, body);
     }
 
     private static boolean isContentType(String actual, String expected) {
