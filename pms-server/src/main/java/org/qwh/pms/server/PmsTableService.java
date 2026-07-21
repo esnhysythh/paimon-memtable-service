@@ -202,7 +202,10 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
     }
 
     public boolean isWriteOverloaded() {
-        BucketStateSnapshot snapshot = director.stateSnapshot();
+        return isWriteOverloaded(director.stateSnapshot());
+    }
+
+    private boolean isWriteOverloaded(BucketStateSnapshot snapshot) {
         return snapshot.immutableMemTableCount()
                 >= flowControlConfig.overloadedImmutableCount()
             || snapshot.newSSTCount()
@@ -362,7 +365,9 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
     }
 
     public Map<String, Object> state() {
-        Map<String, Object> state = stateToMap(director.stateSnapshot());
+        BucketStateSnapshot snapshot = director.stateSnapshot();
+        Map<String, Object> state = stateToMap(snapshot);
+        state.put("writeOverloaded", isWriteOverloaded(snapshot));
         appendLookupState(state);
         return state;
     }

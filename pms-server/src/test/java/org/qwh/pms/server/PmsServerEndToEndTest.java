@@ -123,6 +123,8 @@ class PmsServerEndToEndTest {
                 PmsServiceUnavailableException.class,
                 () -> runtime.write(Map.of("id", 2, "marker", "rejected"))
             );
+            assertThrows(PmsServiceUnavailableException.class, runtime::flush);
+            assertThrows(PmsServiceUnavailableException.class, runtime::sink);
 
             server.restart();
             assertEquals(
@@ -680,6 +682,7 @@ class PmsServerEndToEndTest {
             assertEquals(PmsStatus.OVERLOADED, client.putDetailed(row2.key(), row2.row()).status());
             assertEquals(LookupResultType.HIT, client.getLocal(row1.key()).type());
             assertEquals(LookupResultType.MISS, client.getLocal(row2.key()).type());
+            assertEquals(true, server.getJson("/state").get("writeOverloaded"));
         }
     }
 
