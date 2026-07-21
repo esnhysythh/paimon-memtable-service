@@ -163,6 +163,7 @@ minKey               bytes
 maxKey               bytes
 minSequenceId        int64
 maxSequenceId        int64
+oldestWriteAtMillis  int64
 createdAtMillis      int64
 hasTombstone         boolean
 compressionType      byte     // V1 = NONE
@@ -183,13 +184,13 @@ record SSTMeta(
     Key maxKey,
     long minSequenceId,
     long maxSequenceId,
+    long oldestWriteAtMillis,
     long createdAtMillis,
-    SSTState state,
-    long refCount
+    SSTState state
 ) {}
 ```
 
-`SSTState` 初期可包含 `NEW` 和 `SINKED`；带 Mem 缓存的状态由 BucketDirector 的状态条目表达，而不是写进 SST 文件。SST 数据文件 publish 后不再 rename, 文件名只包含稳定的 `flushId` range, 例如 `sst-000001-000001.sst`。可靠状态来源是 metadata 和 SinkMeta, 而不是文件名或 Footer。
+`SSTState` 包含 `NEW` 和 `SINKED`。ImmutableMemTable 在 Flush 发布后退出查询状态，不存在需要写入 SST 的 Mem cache 状态。SST 数据文件 publish 后不再 rename, 文件名只包含稳定的 `flushId` range, 例如 `sst-000001-000001.sst`。可靠状态来源是 metadata 和 SinkMeta, 而不是文件名或 Footer。
 
 ## 10. Footer 格式
 

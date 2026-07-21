@@ -40,9 +40,9 @@ record SSTMeta(
     Key maxKey,
     long minSequenceId,
     long maxSequenceId,
+    long oldestWriteAtMillis,
     long createdAtMillis,
-    SSTState state,
-    long refCount
+    SSTState state
 ) {}
 ```
 
@@ -166,15 +166,15 @@ Compact 输出约束：
 
 ## 9. 调度建议
 
-第一版 compact 调度保持简单：
+V1 不设置独立的 `compactMinFiles` 或“小文件大小阈值”。调度只维护 NEW/SINKED 两个 run 数量水位：
 
-- 分别扫描 `newRuns` 和 `sinkedRuns`。
-- 从老到新贪心选择连续小 run。
-- 达到 `compactMinFiles` 且候选组总大小不超过 `compactThresholdMb` 时触发 compact。
-- 当前实现用同一把本地 SST 维护锁串行化 sink、local compact 和 sinked evict，避免 compact 正在参与 sink 的 new run。
-- 第一阶段尚未引入 `persistedFlushId`，通过 `NEW` / `SINKED` 状态边界禁止跨 sink 高水位 compact；后续引入 `persistedFlushId` 后，compact 还必须显式拒绝跨该 flush 高水位。
+- `NEW count > pms.storage.new_sst.max_count` 时，优先从老到新选择第一个至少包含两个 run、连续且总输入不超过 `pms.operation.compact.max_input_size_mb` 的 NEW 分组；不存在候选组时 Sink 最老 NEW 前缀。
+- `SINKED count > pms.storage.sinked_sst.max_count` 时，以相同规则优先 compact SINKED；不存在候选组时淘汰最老 SINKED run。
+- 每次只执行一个操作；取得进展后重新读取完整状态并从最高优先级判断。
+- Sink、local compact 和 sinked evict 使用同一把本地 SST maintenance mutex 串行化，但不持有写入提交锁。
+- active/prepared Sink 会保护其固定前缀，NEW compact 不得跨越该边界；SINKED compact 不受已完成 Sink 的限制。
 
-后续可以引入更多触发条件，例如 BloomFilter 检查次数、点查 miss 放大、总文件数水位等。
+该策略把单次 compact 的最大输出规模与 run 数量上限组合起来，近似约束本地窗口，同时避免为 MVP 引入总字节数、磁盘 free space 或查询放大反馈控制。后续有真实指标后，可再引入 BloomFilter 检查次数、点查 miss 放大等触发条件。
 
 ## 10. Sink 与 Compact 融合优化
 

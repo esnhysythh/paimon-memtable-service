@@ -33,6 +33,10 @@ curl -H 'Content-Type: application/json' -X POST http://127.0.0.1:19090/sink -d 
 curl http://127.0.0.1:19090/state
 ```
 
+`/flush` and `/sink` are asynchronous management requests. They return HTTP 202 with a
+`fenceSequenceId`; poll `/state` until `lastFlushedSequenceId` or `lastPersistedSequenceId`
+respectively reaches that fence. They do not synchronously drain all data.
+
 `/get` is the default full point lookup and may fall through to Paimon after a PMS-local miss.
 `/getLocal` only reads PMS-local layers and returns `result=HIT|DELETED|MISS`.
 `/prefixLocal` only reads PMS-local layers. `/prefix` is reserved for future full prefix lookup and returns `NOT_SUPPORTED` in V1.
@@ -65,8 +69,8 @@ directories and the target Paimon table.
 | `pms.wal.file_size_mb` | `256` | WAL segment size. |
 | `pms.wal.use_mmap` | `false` | Whether WAL uses mmap writer. |
 | `pms.storage.dir` | required | Local SST/state directory. |
-| `pms.storage.new_sst.max_count` | `10` | Daily maintenance target for NEW local SST count. |
-| `pms.storage.sinked_sst.max_count` | `10` | Daily maintenance target for retained SINKED local SST count. |
+| `pms.storage.new_sst.max_count` | `10` | Maintenance target for NEW local SST count. |
+| `pms.storage.sinked_sst.max_count` | `10` | Maintenance target for retained SINKED local SST count. |
 | `pms.operation.sink.batch_max_bytes_mb` | `1024` | Maximum input bytes for one Sink batch; one oversized oldest run may progress alone. |
 | `pms.operation.compact.max_input_size_mb` | `1024` | Maximum input bytes for one local compaction. |
 | `pms.paimon.warehouse` | required | Paimon warehouse path. |

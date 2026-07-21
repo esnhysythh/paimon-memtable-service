@@ -135,8 +135,8 @@ storage/
   "maxKeyBase64": "...",
   "minSequenceId": 1,
   "maxSequenceId": 1000,
+  "oldestWriteAtMillis": 1709999999000,
   "createdAtMillis": 1710000000000,
-  "refCount": 0,
   "metaCrc32": 987654321
 }
 ```
@@ -147,6 +147,7 @@ storage/
 - `runId` 是物理唯一标识，只用于 reader cache、删除和排障；逻辑新旧顺序由 `minFlushId/maxFlushId` 表达。
 - `sstFile` 是稳定 SST 数据文件名；恢复时按 `minFlushId/maxFlushId` 查找实际存在的 SST 文件，并由 SinkMeta success 修正 metadata 中的 `state`。
 - `minKeyBase64/maxKeyBase64` 保持 JSON 可读结构，同时避免二进制 key 破坏文本格式。
+- `oldestWriteAtMillis` 随 Flush 与 compact 保留该 run 中最早写入时间，供 server 计算 Paimon 可见性 lag。
 - SST 数据文件完整性仍由 SST footer 中的 full-file CRC 校验；启动时还会对比 `.meta.json` 与 SST properties 中的关键字段。
 - `metaCrc32` 覆盖 metadata 中除自身外的稳定字段，用于发现半写或人工误改。
 

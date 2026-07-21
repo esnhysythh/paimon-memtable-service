@@ -3,92 +3,40 @@
 ## 1. 模块定位
 单机 LSM 缓冲引擎，完全不依赖任何 RPC 框架、Web 容器或外部配置中心。`pms-core` 负责数据的内存管理、本地持久化、WAL 协调、SST 生命周期和内部 sink 状态机边界。
 
-`pms-core` 的运行语义服务于 Paimon，但接口保持 byte-oriented：`byte[] key`、`byte[] value` 和 `delete(key)`。Paimon `InternalRow`、`RowType`、字段投影和主键编码由后续独立的 `pms-codec` 模块负责，上层组合模块把 codec 输出接入 `pms-core`。
+`pms-core` 的运行语义服务于 Paimon，但接口保持 byte-oriented：`byte[] key`、`byte[] value` 和 `delete(key)`。Paimon `InternalRow`、`RowType`、字段投影和主键编码由独立的 `pms-codec` 模块负责，上层组合模块把 codec 输出接入 `pms-core`。
 
 ## 2. 配置契约
 
-pms-core 定义所有核心配置的类型和默认值。配置的加载与解析由 pms-server 的 ConfigManager 负责，core 本身不知道配置来源（YAML / Properties / 环境变量）。
+core 组件通过构造函数接收纯 Java Record，不读取文件、环境变量或全局配置。生产配置由 `pms-server` 的 `ConfigManager` 解析并一次性注入；V1 不支持热更新。
 
-### 2.1 设计原则
+配置所有权按“谁做决策，谁拥有配置”划分：
 
-- **谁消费配置，谁定义类型**：core 消费配置，所以配置类定义在 core 中。
-- **纯 Record**：配置类无外部依赖，仅包含字段、默认值和校验逻辑。
-- **构造时注入**：core 组件通过构造函数接收 `PMSConfig` 对象，不主动查找配置。V1 不支持运行时热更新，配置变更需重启。
+- core 拥有 MemTable 容量、WAL、本地 storage 路径、flow-control 和 Paimon 连接等操作所需配置。
+- server 拥有 Paimon 可见性目标、NEW/SINKED 数量水位、worker 周期以及单次 Sink/Compact 字节上限。
+- Freeze/Flush/Sink/Compact/Evict API 不读取调度阈值，只执行调用方明确请求的一步。
 
-### 2.2 配置类
+生产路径支持的 core 配置如下；完整 server/scheduler 配置见 [pms-server.md](pms-server.md) § 3。
 
-采用分层配置结构：各模块定义自己的配置 Record，顶层 `PMSConfig` 组合各子配置，并提供 `from(Properties)` 工厂方法统一加载。
+| 键名 | 默认值 | 用途 |
+|------|--------|------|
+| `pms.memtable.max_entries` | `1_000_000` | CurMemTable 自动 Freeze 条目水位 |
+| `pms.memtable.max_size_mb` | `256` | CurMemTable 自动 Freeze 字节水位 |
+| `pms.wal.dir` | 必填 | WAL 目录 |
+| `pms.wal.file_size_mb` | `256` | WAL segment 大小 |
+| `pms.wal.use_mmap` | `false` | WAL mmap writer 开关 |
+| `pms.storage.dir` | 必填 | SST、flush boundary 与 SinkMeta 本地目录 |
+| `pms.flowcontrol.overloaded_immutable_count` | `4` | Immutable backlog 写入拒绝水位 |
+| `pms.flowcontrol.overloaded_pending_sst_count` | `20` | NEW backlog 写入拒绝水位 |
+| `pms.paimon.table_path` | 必填/由 server 补全 | core 表标识 |
+| `pms.paimon.warehouse` | 必填 | Paimon warehouse |
+| `pms.paimon.cache_enabled` | `true` | Paimon catalog cache |
+| `pms.paimon.manifest_cache_small_file_memory` | `128mb` | manifest small-file cache |
+| `pms.paimon.manifest_cache_small_file_threshold` | `1mb` | small manifest 判定阈值 |
+| `pms.paimon.manifest_cache_max_memory` | 未设置 | 可选 manifest 总缓存预算 |
 
-```java
-// 各模块配置
-record MemTableConfig(int maxEntries, int maxSizeMb) { ... }   // 默认 1_000_000 / 256
-record WalConfig(String dir, int fileSizeMb, boolean useMmap) { ... }  // 必填 dir / 默认 256 / false
-record StorageConfig(String dir, long sinkedMaxSizeMb, int sinkedMaxCount,
-                     long localSstMaxRows, int compactThresholdMb, int compactMinFiles) { ... }
-record SinkConfig(int intervalMs, int maxPendingSsts) { ... }  // 默认 30000 / 8
-record FlowControlConfig(int overloadedImmutableCount,
-                         int overloadedPendingSstCount) { ... }  // 默认 4 / 20
-record PaimonConfig(
-    String tablePath,
-    String warehouse,
-    boolean cacheEnabled,
-    String manifestCacheSmallFileMemory,
-    String manifestCacheSmallFileThreshold,
-    String manifestCacheMaxMemory
-) { ... }  // 必填 tablePath
+当前 Java `StorageConfig` / `SinkConfig` 类型仍包含早期调度字段，但生产 `ConfigManager` 明确拒绝相应旧键，scheduler 也不读取这些字段。它们不是受支持的产品配置；后续可随 core 配置类型清理移除，不能据此恢复旧的定时 Sink、总大小淘汰或 `compactMinFiles` 行为。
 
-// 顶层组合
-record PMSConfig(
-    MemTableConfig memtable,
-    WalConfig wal,
-    StorageConfig storage,
-    SinkConfig sink,
-    FlowControlConfig flowcontrol,
-    PaimonConfig paimon
-) {
-    static PMSConfig from(Properties props) { ... }
-}
-```
-
-**配置键映射**（`from(Properties)` 使用的键名）：
-
-| 键名 | 子配置 | 字段 | 默认值 |
-|------|--------|------|--------|
-| `pms.memtable.max_entries` | MemTableConfig | maxEntries | 1_000_000 |
-| `pms.memtable.max_size_mb` | MemTableConfig | maxSizeMb | 256 |
-| `pms.wal.dir` | WalConfig | dir | 必填 |
-| `pms.wal.file_size_mb` | WalConfig | fileSizeMb | 256 |
-| `pms.wal.use_mmap` | WalConfig | useMmap | false |
-| `pms.storage.dir` | StorageConfig | dir | 必填 |
-| `pms.storage.sinked_max_size_mb` | StorageConfig | sinkedMaxSizeMb | 10240 |
-| `pms.storage.sinked_max_count` | StorageConfig | sinkedMaxCount | 100 |
-| `pms.storage.local_sst_max_rows` | StorageConfig | localSstMaxRows | 0（禁用） |
-| `pms.storage.compact_threshold_mb` | StorageConfig | compactThresholdMb | 32 |
-| `pms.storage.compact_min_files` | StorageConfig | compactMinFiles | 4 |
-| `pms.sink.interval_ms` | SinkConfig | intervalMs | 30000 |
-| `pms.sink.max_pending_ssts` | SinkConfig | maxPendingSsts | 8 |
-| `pms.flowcontrol.overloaded_immutable_count` | FlowControlConfig | overloadedImmutableCount | 4 |
-| `pms.flowcontrol.overloaded_pending_sst_count` | FlowControlConfig | overloadedPendingSstCount | 20 |
-| `pms.paimon.table_path` | PaimonConfig | tablePath | 必填 |
-| `pms.paimon.warehouse` | PaimonConfig | warehouse | — |
-| `pms.paimon.cache_enabled` | PaimonConfig | cacheEnabled | true |
-| `pms.paimon.manifest_cache_small_file_memory` | PaimonConfig | manifestCacheSmallFileMemory | 128mb |
-| `pms.paimon.manifest_cache_small_file_threshold` | PaimonConfig | manifestCacheSmallFileThreshold | 1mb |
-| `pms.paimon.manifest_cache_max_memory` | PaimonConfig | manifestCacheMaxMemory | — |
-
-### 2.3 组件构造方式
-
-core 组件通过构造函数接收各自需要的子配置：
-
-```java
-class SkipListCurMemTable implements CurMemTable {
-    SkipListCurMemTable(MemTableConfig config) { ... }
-}
-
-class WALManagerImpl implements WALManager {
-    WALManagerImpl(PMSConfig config) { ... }  // 内部使用 config.wal()
-}
-```
+`pms.wal.dir`、`pms.storage.dir` 和 lookup cache 必须隔离，避免删除/恢复协议互相影响。
 
 ## 3. 核心组件与接口定义
 
@@ -103,13 +51,13 @@ sequence 的边界语义：
 - Paimon `snapshotId` 表示外部提交结果；WAL 安全截断以 SinkMeta 中的 PMS 内部 `persistedSequenceId` 为主边界。
 - V1 不保存同 Key 多版本；未来如果要支持 MVCC，可将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。
 
-**Value 编码语义**：PMS 不是通用 KV 存储，MemTable 中的 `Value.bytes` 不是任意用户字节值，而是一条 Paimon `InternalRow` 的序列化结果。非删除记录必须由后续 RowCodec/序列化管理器生成，代表完整的行编码。即使业务列全部为 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 或其他必要元信息，因此设计语义上不应为空 `byte[]`。`Value.bytes == null` 专用于 tombstone/delete，不表示业务层 NULL。
+**Value 编码语义**：PMS 不是通用 KV 存储，MemTable 中的 `Value.bytes` 不是任意用户字节值，而是一条 Paimon `InternalRow` 的序列化结果。非删除记录必须由 `pms-codec` 生成，代表完整的行编码。即使业务列全部为 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 或其他必要元信息，因此设计语义上不应为空 `byte[]`。`Value.bytes == null` 专用于 tombstone/delete，不表示业务层 NULL。
 
 RowCodec 不在 value 内部表达 delete。进入 `pms-core` 前，调用方必须将 `INSERT/UPDATE_AFTER` 归一化为 `put(key, rowValueBytes)`，将 `DELETE/UPDATE_BEFORE` 归一化为 `delete(key)`。WAL 和 SST 层继续用 `valueLen = -1` 表达 tombstone。
 
 ### 3.1 MemTableEngine
 
-管理内存中的数据缓冲，基于 SkipList 实现。接口拆分为 `CurMemTable`（可写）和 `ImmutableMemTable`（只读 + 引用计数），由 `CurMemTable.freeze()` 产生 `ImmutableMemTable`。
+管理内存中的写缓冲，基于 SkipList 实现。接口拆分为 `CurMemTable`（可写）和 `ImmutableMemTable`（等待 Flush 的只读对象），由 `CurMemTable.freeze()` 产生 `ImmutableMemTable`。
 
 **CurMemTable 接口**：
 
@@ -128,7 +76,7 @@ interface CurMemTable {
 ```
 
 - Schema 校验由上层处理，不在此接口传递。V1 中 PMS 绑定单表，Schema 不变（变更即 Fatal Error）。
-- Key 使用无符号字节比较（与 Paimon 主键序一致），参见 [paimon-primary-key-encoding.md](../../references/paimon-primary-key-encoding.md)。
+- Key 使用无符号字节比较（与 Paimon 主键序一致），参见 [paimon-primary-key-encoding.md](../references/paimon-primary-key-encoding.md)。
 - 删除不通过 `CurMemTable.delete(Key)` 表达，而是写入 `Value.tombstone(sequenceId)`。这样 tombstone 与普通 upsert 一样携带明确的 sequence 边界。
 
 **ImmutableMemTable 接口**：
@@ -137,13 +85,12 @@ interface CurMemTable {
 interface ImmutableMemTable {
     Value get(Key key);
     Iterator<Entry> iterator();
+    Iterator<Entry> iterator(Key startInclusive, Optional<Key> endExclusive);
     long estimatedSize();
     int estimatedEntryCount();
     long minSequenceId();
     long maxSequenceId();
-    void incrementRef();
-    void decrementRef();
-    long refCount();
+    long oldestWriteAtMillis();
 }
 ```
 
@@ -151,16 +98,16 @@ interface ImmutableMemTable {
 
 - **SkipListCurMemTable**：当前活跃的可写 MemTable。
   - 底层 `ConcurrentSkipListMap<Key, Value>`，线程安全。
-  - 写入后检查是否达到 Freeze 阈值（`estimatedEntryCount() >= config.maxEntries()` 或 `estimatedSize() >= config.maxSizeBytes()`），达到则触发 Freeze。不拒绝写入，不阻塞写入路径。
+  - 写入后检查是否达到 Freeze 阈值（`estimatedEntryCount() >= config.maxEntries()` 或 `estimatedSize() >= config.maxSizeBytes()`），在完整 batch apply 后触发 Freeze。
   - `estimatedEntryCount` 和 `estimatedSize` 均为启发式估算值，非精确计数：高并发下 `volatile int ++` 可能丢失增量，误差在可接受范围内。
+  - 第一次成功写入记录 `oldestWriteAtMillis`，用于 Paimon 可见性 lag；不沿写入调用链传递 wall-clock 时间。
   - 跟踪当前 MemTable 的 `minSequenceId/maxSequenceId`，作为 freeze 后的边界元数据。
-  - `freeze()` 原子替换内部 Map 引用，返回持有旧 Map 与 sequence 边界的 `SkipListImmutableMemTable`。
+  - `freeze()` 封存当前对象并返回持有原 SkipList 与边界的 `SkipListImmutableMemTable`；BucketDirector 创建新的 CurMemTable，并通过不可变 `MemTableState` 原子发布对象切换，不原地复用旧 CurMemTable。
 
 - **SkipListImmutableMemTable**：冻结后的只读 MemTable。
-  - 构造时接收 `SkipListCurMemTable` 的内部 SkipList 引用（浅拷贝，零开销）。
+  - 构造时接收旧 CurMemTable 的内部 SkipList 引用（浅拷贝，零开销）。
   - 暴露 `minSequenceId/maxSequenceId`，供后续 Flush/Sink/WAL 截断推进安全边界。
-  - 维护 `AtomicLong refCount`，查询进入时 `incrementRef()`，离开时 `decrementRef()`。
-  - `refCount` 归零后可安全退役（释放内存）。
+  - 只在等待 Flush 时参与查询。Flush 将目标 SST 完整发布后，它立即退出可见状态并由 GC 回收，不作为 SST cache 保留。
 
 **容量阈值**（来自 `PMSConfig`）：
 - `memtableMaxEntries`：条目数上限，默认 1,000,000。
@@ -188,14 +135,14 @@ interface LocalStorageManager {
     // snapshot 注册 read epoch, 保护调用方已经选中的 SST 列表不被物理删除。
     SSTReadSnapshot readSnapshot(List<SSTMeta> metas);
 
+    // 原子捕获当前全部可见 SST，并进入对应 read epoch。lookup/scan 使用此入口。
+    SSTReadSnapshot readVisibleSnapshot();
+
     // 多路归并合并多个 SST，保留最新 Key
     SSTMeta compactSSTs(List<SSTMeta> metas);
 
-    // 删除指定 SST 文件
+    // 从可见集合退役指定 SST；活跃 read epoch 结束后物理删除。
     void deleteSST(SSTMeta meta);
-
-    // 淘汰最老的 sinkedSST（确认无引用后删除）
-    Optional<SSTMeta> evictOldestSinkedSST();
 }
 ```
 
@@ -211,9 +158,8 @@ interface SSTReadSnapshot extends AutoCloseable {
 ```
 
 `SSTReadSnapshot` 的语义是 read epoch, 不是文件级 reader lease。创建 snapshot 时记录当前 SST 可见集合 epoch, 删除和 compact 会先从可见集合移除旧 SST, 推进 epoch, 再把旧 SST 放入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于某个 retired SST 的 `retireEpoch` 时, storage 才会关闭对应 reader 并删除 data/meta 文件。这样点查仍可按 SST 顺序按需读取并在命中后停止, 不需要提前获取列表中所有 SST 的 reader lease。
-```
 
-**SSTMeta** 至少包含 `runId`、`minFlushId/maxFlushId`、文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、createdAtMillis、状态和引用计数。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
+**SSTMeta** 至少包含 `runId`、`minFlushId/maxFlushId`、文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、`oldestWriteAtMillis`、`createdAtMillis` 和状态。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
 
 SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` 表达稳定的 `minFlushId/maxFlushId` 范围。`NEW` / `SINKED` 状态写入 `sst-*.meta.json`, 可靠状态来源是 SST metadata 和 SinkMeta success, 不是数据文件名。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
 
@@ -303,16 +249,16 @@ interface ReplayCallback {
 **WAL 截断策略**：
 - 安全截断条件：SinkMeta 中存在已成功提交的 `persistedSequenceId`。
 - 截断时删除所有 `maxSequenceId <= persistedSequenceId` 的 WAL 文件，正在写入的文件永不删除。
-- 截断触发：当前在 sink success 或 recovered prepare commit 后即时触发；后续可增加 `BackgroundTaskScheduler` 定期补偿和 WAL 配额水位触发。
+- 截断触发：当前在 sink success 或 recovered prepare commit 后即时触发；后续可增加 server scheduler 定期补偿和 WAL 配额水位触发。
 
 **WAL 恢复时校验**：
 - 传输层：由 LevelDB LogReader 逐 chunk 校验 CRC32C。尾部不完整 chunk 自动截断，中间 chunk 校验失败报告损坏。
 - 应用层：解析 PMS Payload 时校验 sequenceId、keyLen/valueLen 范围。
 - 中间记录校验失败 → 磁盘损坏 → 报错，人工介入（V1 单盘无法从备盘恢复）。
 
-### 3.4 SinkManager 与后续 Paimon Sink
+### 3.4 SinkManager 与 Paimon Sink
 
-封装 PMS 内部 sink 边界。当前实现为 `MockSinkManager`，只用于打通 BucketDirector、SST 状态转换和 WAL 记录；后续真实实现再封装 Paimon 底层 API，并严格遵循 2PC 流程。
+`SinkManager` 是 core 的 Paimon 写入 SPI。生产环境由 `pms-sink-paimon` 注入真实实现；core 测试可注入 fake/mock。BucketDirector 与 `SinkCoordinator` 负责可靠的 2PC metadata 顺序，不依赖具体 Paimon row 类型。
 
 **2PC 流程**：
 
@@ -335,14 +281,14 @@ interface SinkManager {
 }
 ```
 
-当前实现使用 `SinkCoordinator` 编排 `SinkManager` 与 `SinkMetaStore`；默认 `MockSinkManager` 可跑通 PMS 内部状态流转，真实 Paimon sink 由 `pms-sink-paimon` 注入。
+当前实现使用 `SinkCoordinator` 编排 `SinkManager` 与 `SinkMetaStore`。一次操作只 Sink `SinkSelection` 选出的最老连续 NEW 前缀；单批受输入字节数约束，但不受 SST 个数限制。commit 临时失败留下的 durable prepare 可由 `commitPreparedSink()` 在线重试，成功后与普通 Sink 共用 NEW → SINKED 和 WAL truncate 路径，并返回相同的 commit result 供 server 发布 lookup delta。
 
 **Compaction 集成**：
 - PMS 不自己实现 Paimon 文件合并算法；由 `pms-sink-paimon` 调用 Paimon 原生 `TableWrite.compact(partition, bucket, fullCompaction)`，再通过 `prepareCommit(waitCompaction=true, commitIdentifier)` 和 `TableCommit` 提交 compact 结果。
 - Paimon `Table` 本身没有面向 Java Program API 的 `compact()` 入口，compact 是 partition/bucket 级的 write operation。该决策来自 Paimon 1.4.x 源码：`TableWrite` 暴露 `compact(...)`，`StreamTableWrite` 暴露带 `commitIdentifier` 的 `prepareCommit(...)`。
 - 为了让 PMS 掌控 snapshot 生成，写入 sink 与显式 compaction 应拆成两个 Paimon table view：写入路径使用 `table.copy(Map.of("write-only", "true"))` 关闭写入端隐式 compaction；compaction 路径使用 `table.copy(Map.of("write-only", "false"))` 执行显式 compact。这样 PMS 的普通 sink 只产生数据写入 snapshot，Paimon compact snapshot 只由 PMS compaction scheduler 产生。
 - Compaction 不改变 PMS 本地 SST/WAL 边界，也不推进 `persistedSequenceId`；它只改变 Paimon manifest 中的数据文件布局。因此恢复 metadata 不应复用 `SinkMeta` 的 `sstIds/persistedSequenceId` 语义，而应由 `pms-sink-paimon` 或 `pms-server` 维护独立的 prepared/success compaction metadata。
-- 触发时机：由 `BackgroundTaskScheduler` 枚举 Paimon partition/bucket 候选，按文件数、L0/level 分布、距上次 compact 时间或手动 full compact 请求触发。V1 可先按 bucket 文件数阈值做保守触发。
+- 触发时机：未来由 server scheduler 枚举 Paimon partition/bucket 候选，按文件数、L0/level 分布、距上次 compact 时间或手动 full compact 请求触发；当前 MVP 暂不实现显式 Paimon compaction scheduler。
 - Compaction 与 Sink 在 PMS 内串行提交 Paimon snapshot，避免同一 PMS 进程内的 commit identifier 顺序和 Paimon manifest commit 竞争复杂化；实际文件 rewrite 可在 Paimon compact executor 中异步执行，但提交阶段必须纳入 PMS recovery。
 
 **Paimon 历史点查**：
@@ -359,7 +305,7 @@ interface SinkManager {
 **核心职责**：
 - 管理 `curMemTable → ImmutableMemTable → newSST → sinkedSST` 的状态机流转。
 - 编排查询路径的多层穿透。
-- 协调 Freeze、Flush、Sink、Evict 各阶段。
+- 协调 Freeze、Flush、Sink、Compact、Evict 各阶段。
 - 向上层暴露统一的 byte-oriented `put` / `delete` / `writeBatch` / `get` 接口；`writeBatch` 是写入提交边界，单条写入是 size=1 batch 的便捷入口。
 
 ### 3.6 Statistic
@@ -432,44 +378,45 @@ Freeze 并到达水位，后台 Flush 也可以并发发布新的 NEW run。该�
 
 ### 5.1 核心原则
 
-- **写入顺序临界区**：WAL 写入、sequence 分配和 MemTable 可见顺序必须保持一致。当前 V1 为保证本地 SST 列表切换简单，local compact 会在本地 SST 维护路径中串行化 sink/compact/evict，并短期阻塞写入状态更新；后续可通过 SST 引用计数和 manifest 切换缩短该临界区。
-- **Volatile 引用切换**：状态变更通过 volatile 引用的原子替换实现，而非就地修改。
-- **文件删除边界**：compact 输入 SST 数据文件第一阶段不立即删除，只删除旧 meta 并在恢复时作为 covered orphan 忽略；sinkedSST evict 当前直接删除最老 sinked 文件，后续应补充 SST 引用计数或延迟删除队列。
-- **初期简化**：查询时直接读 volatile 引用遍历，不做快照拷贝。引用计数仅在 Evict 删除文件时检查。
+- **写入短临界区**：`writeMutex` 只保护 writer queue、WAL/sequence/MemTable 提交顺序、Freeze 对象切换与写入前 backlog 复查。
+- **慢 IO 不持写锁**：Flush、Sink、local compact、Evict 和查询不获取 `writeMutex`。
+- **不可变状态发布**：Cur/Immutable 通过 `MemTableState`，NEW/SINKED 通过 `RunState` 整体替换；调用方不会看到半更新列表。
+- **SST 生命周期由 read epoch 保护**：查询、scan、sink 与 compact 先获取 `SSTReadSnapshot`。被替换或淘汰的文件进入 retired queue，最后一个可能看到它的 epoch 结束后才物理删除。
+- **SST maintenance 串行化**：`sstMaintenanceMutex` 只串行化 Sink、prepared retry、compact 与 evict，防止它们选择并发布互相冲突的 run 集合；新写入和 Flush 不因此停顿。
 
 ### 5.2 关键场景的并发控制
 
 **并发写入 curMemTable**：底层 `ConcurrentSkipListMap` 本身线程安全；但写入提交顺序由 WALManager 分配的 `sequenceId` 确定，调用方必须保证 WAL record 与 MemTable value 使用同一个 sequence。
 
 **Freeze（curMemTable → ImmutableMemTable）**：
-- `curMemTable` 字段用 `volatile` 修饰。
-- `freeze()` 时先构造新的空 `CurMemTable`，再原子替换引用。
-- 不需要 Copy-on-Write：Freeze 后原 MemTable 天然变为只读。
+- Freeze 与写入提交使用同一个 `writeMutex`，因此旧对象不会在边界发布后继续接受写入。
+- 创建新的 CurMemTable，将旧对象封存为 immutable，再通过一个新的 `MemTableState` 原子发布 current + immutable 列表。
+- 查询可能看到切换前或切换后的完整视图；两者都能找到该数据，不需要查询获取写锁。
 
 **查询穿透过程中的并发**：
-- 初期方案：直接遍历 volatile 列表，不做快照拷贝。
-- 层列表通过 volatile 引用替换整个列表（不是就地修改），查询线程看到的要么是旧列表要么是新列表，不会看到半更新状态。
-- 最坏情况：查 curMemTable 时数据刚被 Freeze，查 immutableList 时列表已更新包含了该 MemTable，结果正确。
-- 后续扩展：如果查询一致性要求更严格，可引入快照读 + 防御性拷贝 + 引用计数。
+- MemTable 查询使用一次获取的不可变 `MemTableState`。
+- 点查与 scan 使用 `readVisibleSnapshot()` 获取原子可见集合与 read epoch；Sink/compact 对明确选择的文件集合使用 `readSnapshot(...)`。
+- 已成功返回的写入对之后开始的 lookup 可见；真正并发的 lookup 可观察写前或写后状态。
+- V1 scan 为 weakly consistent，不承诺 batch-atomic MVCC snapshot。
 
-**Sink 过程中查询正在归并的 SST**：
-- 归并操作不影响查询——查询读的是归并前的 SST 文件，文件内容不变。
-- 归并完成后，BucketDirector 原子替换列表（newSST → sinkedSST）。
+**Flush/Sink/Compact 的层级迁移**：
+- 目标层完整落盘后才发布，源层在同一次状态切换中或其后移除。
+- 查询看到旧源、旧源 + 新目标或新目标均可得到相同最新值，不允许出现两边都不可见的窗口。
+- Sink 只改变 NEW/SINKED 生命周期，不重写 SST data file；compact 输出完整发布后再替换输入 run。
 
 **Evict 删除磁盘文件**：
-- 淘汰 sinkedSST 时，目标语义是确认文件不被任何查询正在读取。
-- 当前 V1 尚未实现 SST `refCount()` 检查，evict 会直接删除最老 sinked 文件；这一点应在后续与 SST 延迟删除机制一起补齐。
+- 只从可见集合移除最老 SINKED run。
+- storage 记录 `retireEpoch`；活跃 read snapshot 释放后再关闭 reader 并删除 data/meta 文件。
 
 ### 5.3 内存可见性总结
 
 | 变量 | 类型 | 写入方 | 读取方 | 可见性保证 |
 |------|------|--------|--------|-----------|
-| `curMemTable` | volatile 引用 | Freeze 线程 | 写入线程 / 查询线程 | volatile 读写 |
-| `newImmutableList` | volatile 引用 | Freeze 线程 | 查询线程 | volatile 读写 |
-| `newSSTList` | volatile 引用 | Flush/Sink 线程 | 查询线程 | volatile 读写 |
-| `sinkedSSTList` | volatile 引用 | Sink/Evict 线程 | 查询线程 | volatile 读写 |
+| `memTables` | volatile `MemTableState` | 写入/Freeze/Flush | 写入线程 / 查询线程 / state snapshot | 整体不可变发布 |
+| `runState` | volatile `RunState` | Flush/Sink/Compact/Evict | maintenance | 整体不可变发布 |
 | SkipList 内部 | ConcurrentSkipListMap | 写入线程 | 查询线程 | ConcurrentMap 内部保证 |
-| `refCount` | AtomicLong | Evict 线程 | Evict 线程 | Atomic 操作 |
+| storage visible metas | storage-owned snapshot | Flush/Compact/Evict | 查询 / scan / sink / state snapshot | read epoch + retired queue |
+| `sinkFlight` | volatile immutable snapshot | Sink/recovery | scheduler / state snapshot | 整体替换 |
 
 ### 5.4 崩溃恢复流程
 
@@ -517,19 +464,15 @@ curMemTable ──freeze──► ImmutableMemTable (new)
                           │
                         flush
                           ▼
-                      newSSTWithMem
+                         newSST
                           │
                         sink
-                          ▼
-                     sinkedSSTWithMem
-                          │
-                      mem退役
                           ▼
                        sinkedSST
                           │
                        evict
                           ▼
-                       [删除]
+                      Paimon only
 ```
 
-> 注：newSSTWithMem 和 sinkedSSTWithMem 中的 Mem 缓存是纯性能优化，可在内存不足时随时退化为不带 Mem 的状态（newSST / sinkedSST），详见 [pms-core-bucket-director.md](pms-core-bucket-director.md)。
+ImmutableMemTable 仅在等待 Flush 时参与查询；NEW SST 发布后源 MemTable 退出可见状态。NEW 与 SINKED 分别保留在独立的 local run 集合中，只允许同状态 compact。Sink 与 compact 正交：NEW Sink 后成为 SINKED，仍可继续与相邻 SINKED run 合并。
