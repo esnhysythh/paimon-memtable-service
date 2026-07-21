@@ -13,8 +13,8 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 1. 数据通过 RPC 写入 `curMemTable`（基于 SkipList）。
 2. Bucket 内部分配单调递增的 `sequenceId`，WAL 与 MemTable 同时记录该值。V1 使用轻量级 sequence：只确定写入边界，不提供 MVCC 快照读。
-3. `curMemTable` 满后或达到时间阈值，冻结为 `ImmutableMemTable`，冻结结果携带 `minSequenceId/maxSequenceId`，异步刷盘生成 SST。
-4. 触发 Sink 流程时，选择待 sink 的 `newSST` 形成 `SinkBatch`，后续通过有序 iterator 与 RowCodec 对接 Paimon 2PC。Sink prepare/success 写入独立 `SinkMeta`，其中的 `sstIds/persistedSequenceId` 用于恢复 SST sinked 状态和未来 WAL 截断；Paimon snapshotId 只表示外部提交结果。
+3. `curMemTable` 达到条目数或字节数上限时自动冻结为 `ImmutableMemTable`；Paimon 可见性或手动管理请求也可以建立固定 sequence fence 并触发冻结。冻结结果携带 `minSequenceId/maxSequenceId`，由独立 Flush worker 异步刷盘生成 SST。V1 不按固定时间周期制造小 MemTable/SST。
+4. 触发 Sink 流程时，选择待 sink 的 `newSST` 形成 `SinkBatch`，后续通过有序 iterator 与 RowCodec 对接 Paimon 2PC。Sink prepare/success 写入独立 `SinkMeta`，其中的 `sstIds/persistedSequenceId` 用于恢复 SST sinked 状态和安全 WAL 截断；Paimon snapshotId 只表示外部提交结果。
 
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
@@ -25,10 +25,13 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 > direct Parquet 查询、普通 sink delta 发布、server 切换与热点 value SST cache 的 server 集成已实现。显式 compaction、压测和更细粒度指标仍按 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) 后续阶段推进。
 
-### 2.3 缓存与淘汰
-- **内存淘汰**：ImmutableMemTable 维护引用计数，归零后退役释放内存。带 Mem 缓存的双持状态（newSSTWithMem / sinkedSSTWithMem）可在内存不足时退化为不带 Mem 的状态。
-- **本地 SST 淘汰**：按本地 SST 总大小、总文件数或总物理 entry 数触发；实际只对已 Sink 的 `sinkedSST` 采用"只淘汰最老"策略，规避幽灵数据问题。
-- **小文件合并**：对较小/零碎的 SST（含带 Mem 缓存的 SSTWithMem）进行多路归并合并，减少文件数量，提升查询效率。本地 SST 不按传统 LSM level 理解，而按连续 `flushId` 范围组织为 local run；详见 [pms-core-local-run-compaction.md](docs/pms-core-local-run-compaction.md)。
+### 2.3 分层保留与淘汰
+- **MemTable 是写缓冲，不是长期缓存**：ImmutableMemTable 只在等待 Flush 时参与查询。SST 完整落盘并原子发布后，源 ImmutableMemTable 从可见状态移除；不维护 `SST + MemTable` 双持缓存。
+- **本地 SST 分为 NEW 与 SINKED**：NEW 只存在于 PMS 本地与 WAL 恢复链路中；SINKED 已确认进入 Paimon，仍可作为本地热点窗口保留。
+- **同状态合并**：NEW 只与 NEW 合并，SINKED 只与 SINKED 合并。Sink 与本地 compact 相互独立，已经 Sink 的 SST 仍可继续 compact。
+- **最老优先淘汰**：只有 SINKED run 可以被淘汰，并且每次只淘汰最老的一个。V1 分别通过 NEW/SINKED 文件数量水位维护本地窗口，不在进程内实现磁盘剩余空间调度；部署侧为 storage 目录提供独立磁盘或配额与外部告警。
+
+调度器由独立的 Flush worker 与 Maintenance worker 驱动。Maintenance 每次基于最新状态按固定优先级只选择一个操作，完成后重新采样，避免维护目的与 core 操作 API 耦合。详见 [pms-server.md](docs/pms-server.md) § 2.4。
 
 ## 3. 关键机制
 
@@ -43,8 +46,9 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | 行编码与 Schema 兼容 | `pms-codec` 负责 Paimon `InternalRow` 与 PMS KV bytes 的转换；delete/tombstone 由 KV 层表达，不写入 row value。 | [pms-codec.md](docs/pms-codec.md) |
 | 外部协议 | `pms-protocol` 定义 HTTP/2 binary hot path 的 raw bytes wire contract、handshake、status 与 batch envelope；不解释 key/value bytes。 | [pms-protocol.md](docs/pms-protocol.md) |
 | 流控 | 两层水位线：NORMAL（正常）/ OVERLOADED（拒绝写入） | [pms-core.md](docs/pms-core.md) § 4 |
-| 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；flush/sink 等慢路径异步执行，初期不做快照读 | [pms-core.md](docs/pms-core.md) § 5 |
-| 优雅停机 | Drain → Quiesce → Shutdown 三阶段 | [pms-server.md](docs/pms-server.md) § 2.5 |
+| 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；Freeze 使用对象切换；SST 查询通过 read epoch 快照隔离 compact/evict；慢 IO 不持写入锁 | [pms-core.md](docs/pms-core.md) § 5 |
+| 后台调度 | Flush 与 Maintenance 两个单线程 worker；按 Paimon 可见性 fence 和 NEW/SINKED 数量水位执行单步调和 | [pms-server.md](docs/pms-server.md) § 2.4 |
+| 停机 | 进入 `SHUTTING_DOWN` 后停止接收请求并关闭 scheduler，不强制 Freeze/Flush/Sink；未下沉数据由 WAL、本地 SST 和 SinkMeta 在下次启动恢复 | [pms-server.md](docs/pms-server.md) § 2.5 |
 
 > **后续演进**：双盘 WAL（主盘 + 备盘同步写、互恢复）作为后续演进方向，V1 不实现。
 
@@ -53,10 +57,10 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 ### 4.1 pms-core
 核心组件代码，单机 LSM 缓冲引擎，不依赖 RPC 框架、Web 容器或外部配置中心。`pms-core` 的接口保持 byte-oriented：`byte[] key`、`byte[] value` 和 `delete(key)`，不直接暴露 Paimon `InternalRow`。
 - `config`: 配置契约层，定义 `PMSConfig` Record，启动时一次性注入。
-- `memtable-engine`: 管理 SkipList、内存状态机、引用计数。
+- `memtable-engine`: 管理可写 CurMemTable、等待 Flush 的 ImmutableMemTable 与原子状态切换。
 - `local-storage`: 本地行存 SST 的写入/读取/归并/BloomFilter，SST 文件带 Footer CRC 校验。
 - `wal-engine`: V1 单盘 DATA WAL 的写入、索引与重放。
-- `sink`: 定义 `SinkManager` SPI、`SinkBatch`、`PreparedSinkCommit`、`SinkCommitResult` 和 `SinkMetaStore`；当前提供 `MockSinkManager`，真实 Paimon sink 由上层注入实现。
+- `sink`: 定义 `SinkManager` SPI、`SinkBatch`、`PreparedSinkCommit`、`SinkCommitResult` 和 `SinkMetaStore`；生产实现由 `pms-sink-paimon` 注入，core 测试使用 fake/mock。
 - `bucket-director`: 总协调器，管理状态机流转、查询穿透、后台任务协调。详见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 - `statistic`: 可观测性基础设施。TODO: 详细设计待核心组件稳定后再补充。
 - 详见 [pms-core.md](docs/pms-core.md)。
@@ -70,7 +74,7 @@ Paimon 行格式与 PMS KV bytes 的适配层，依赖 Paimon 类型系统，但
 - 详见 [pms-codec.md](docs/pms-codec.md)。
 
 ### 4.3 pms-sink-paimon
-真实 Paimon Sink 适配层，后续用于替换 `pms-core` 中当前的 `MockSinkManager`。
+真实 Paimon Sink 适配层，为 `pms-core` 的 `SinkManager` SPI 提供生产实现。
 - 实现 `pms-core` 定义的 `SinkManager` SPI，由 `pms-server` 注入 `PMSBucketDirectorImpl`。
 - 读取 `pms-core` 暴露的 SST ordered iterator。
 - 使用 `pms-codec` 将 value bytes 解码为 Paimon `InternalRow`。
@@ -82,8 +86,8 @@ PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC �
 - `rpc-server`: 对外暴露写入与点查接口，集成流控水位线；热路径目标为 `pms-protocol` 定义的 HTTP/2 binary raw bytes API。
 - `recovery-manager`: 启动恢复管理器。
 - `config-manager`: 配置管理器，启动时从外部配置源加载配置构造 `PMSConfig`，注入到各核心组件。V1 不支持运行时热更新。
-- `background-task-scheduler`: 定时任务调度，驱动 Freeze/Flush/Sink/Compaction/Evict/WAL 截断。
-- `graceful-shutdown`: 分阶段优雅停机。
+- `background-task-scheduler`: 两个独立 worker 驱动 Immutable Flush、可见性 fence、Sink、local compact 和 Evict；每次从 core 快照重新决策。
+- `shutdown`: 采用 recovery-first 语义，停止入口和后台调度后直接关闭本地组件，不在停机路径执行强制 Drain。
 - 详见 [pms-server.md](docs/pms-server.md)。
 
 ### 4.5 pms-lookup-paimon

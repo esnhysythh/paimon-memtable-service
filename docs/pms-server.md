@@ -1,319 +1,239 @@
 # PMS Server 设计文档
 
 ## 1. 模块定位
-PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC 接口、编排故障恢复流程、暴露可观测性端点。它消费 `pms-core`、`pms-sink-paimon` 与 `pms-lookup-paimon`，本身不包含本地存储或 Paimon 文件查询逻辑。
+
+`pms-server` 是单机 PMS 的可执行外壳。它负责配置解析、表与本地状态恢复、HTTP 服务、写入 admission、Paimon 历史点查、后台调度和进程生命周期；本地 LSM 操作本身由 `pms-core` 实现。
+
+V1 采用一张 Paimon 表对应一个 runtime、PMS 是该表唯一写入者的模型。配置只在启动时加载，不支持热更新。
 
 ## 2. 核心组件
 
-### 2.1 RPCServer (HTTP/2 Binary Hot Path)
+### 2.1 HTTP 与协议入口
 
-依赖 `pms-core` 提供的接口。
+同一 Jetty 端口暴露两类接口：
 
-PMS 对外热路径采用 `pms-protocol` 定义的 HTTP/2 binary raw bytes API：
-server 只解析协议 envelope 和基础限制，不解释 `keyBytes` / `rowBytes` 内部格式。
-JSON 接口只保留为调试、测试或历史兼容路径，不作为高 QPS 写入与点查入口。
+- `/pms/api/v1/...`：`pms-protocol` 定义的 HTTP/2 binary hot path，传输 opaque key/value bytes。
+- 根路径 JSON API：`/health`、`/write`、`/delete`、`/get`、`/getLocal`、`/prefix`、`/prefixLocal`、`/flush`、`/sink`、`/state`，用于调试与管理，不作为高 QPS 主路径。
 
-当前实现使用 Jetty HTTP/1.1 + h2c connector，在同一监听端口同时暴露：
+binary endpoint 默认要求 HTTP/2。h2c client 应先访问 `/pms/api/v1/handshake` 并确认协商结果，再发送带 body 的请求。协议 payload、status 与限制见 [pms-protocol.md](pms-protocol.md)。
 
-- 旧根路径 JSON debug API：`/write`、`/get`、`/getLocal`、`/prefixLocal`、`/flush`、`/sink`、`/state`。
-- 新协议 API：`/pms/api/v1/...`，其中 binary endpoint 在 `strictHttp2=true` 时要求最终进入 handler 的请求协议为 HTTP/2。
+查询语义：
 
-JDK `HttpClient` h2c 首次请求可能需要 HTTP/1.1 upgrade。client 应先对
-`/pms/api/v1/handshake` 执行一次 HTTP/2 handshake 并确认响应版本，再发送带 body 的热路径请求。
+- `get` 先查询 PMS 本地层，本地 MISS 后使用 `pms-lookup-paimon` 查询已提交 Paimon 数据。
+- `getLocal` 返回 HIT / DELETED / MISS 三态。DELETED 必须阻止 Paimon 旧值复活。
+- `prefixLocal` 只查询本地层；完整表 prefix 查询在 V1 返回 `NOT_SUPPORTED`。
+- Paimon lookup 的 UNKNOWN 是可重试失败，不得映射为 MISS。生产查询路径不使用 `ReadBuilder`。
 
-**暴露的服务**：
+写入入口先检查 runtime 必须为 `RUNNING`，再基于 `BucketStateSnapshot` 做一次快速水位判断。core 在 WAL append 前于写入临界区内复查相同水位，覆盖多个并发请求同时通过 server 检查的窗口。两次检查均不做容量预留；目标是及时停止扩大积压，而不是实现精确配额。
 
-| 服务 | 请求 | 响应 | 调用核心接口 |
-|------|------|------|-------------|
-| `local/put` | `RecordBatch(single PUT)` | `WriteResult(status, acceptedCount)` | `PMSBucketDirector.put()` |
-| `local/delete` | `RecordBatch(single DELETE)` | `WriteResult(status, acceptedCount)` | `PMSBucketDirector.delete()` |
-| `local/writeBatch` | `RecordBatch(PUT/DELETE)` | `WriteResult(status, acceptedCount)` | `PMSBucketDirector.writeBatch()` |
-| `full/get` | `KeyBatch(single key)` | `LookupBatchResult` | `PMSBucketDirector.lookup()` + `pms-lookup-paimon` |
-| `local/get` | `KeyBatch(single key)` | `LookupBatchResult` | `PMSBucketDirector.lookup()` |
-| `local/getPrefix` | `KeyBatch(single prefix)` | `LookupBatchResult` | `PMSBucketDirector.prefixScan()` |
-
-**点查接口语义**：
-
-- `get` 是默认完整表点查。`pms-server` 先查询 PMS 本地层，本地完全 miss 后再穿透查询 Paimon。
-- `getLocal` 只查询 PMS 本地层，不穿透 Paimon。响应中的 `result` 必须区分：
-  - `HIT`：本地命中 PUT，返回 `row`。
-  - `DELETED`：本地命中 tombstone，不返回 `row`，调用方不得继续把它当成普通 miss 后查 Paimon。
-  - `MISS`：PMS 本地完全未命中，调用方可自行决定是否查 Paimon。
-- 本地 tombstone 必须阻断后续 Paimon 历史数据查询，避免已删除旧值复活。
-
-**主键前缀查询语义**：
-
-- 请求 JSON 只接受主键字段。
-- 字段必须按 Paimon primary key 定义顺序提供连续前缀。例如主键为 `(id, sub_id, version)` 时，允许 `{ "id": 1 }` 和 `{ "id": 1, "sub_id": 2 }`，不允许跳过 `id` 只传 `sub_id`。
-- 至少提供第一个主键字段。
-- 返回行按 PMS primary key encoded bytes 升序排列。
-- 本地多层数据按 sequence 选择最新版本；最新版本为 tombstone 的 key 不返回，避免旧层数据复活。
-- binary `local/getPrefix` 的成功结果数不超过 handshake `maxBatchEntries`；超过时返回
-  `OVERLOADED`，V1 不截断也不分页。
-- V1 仅支持 `prefixLocal`。`prefix` 作为完整表 prefix 查询接口名预留，当前直接返回 `NOT_SUPPORTED`；未来实现时必须合并 PMS 本地层与 Paimon 结果，并用 PMS 本地 tombstone 覆盖 Paimon 旧值。
-
-**点查 Paimon 历史数据语义（pms-lookup-paimon 接入后的目标）**：
-
-- `pms-server` 先将主键编码为 PMS key，并调用 `PMSBucketDirector.lookup()` 获取本地三态结果。
-- 本地 PUT 命中时直接解码返回；本地 tombstone 命中时直接返回 not found，禁止继续查询历史 Paimon 数据。
-- 只有本地 memTable 与本地 SST 全部 miss 时，才调用 `pms-lookup-paimon`。server 用 `FileStoreTable.createRowKeyExtractor()` 从完整主键请求得到 partition、bucket 与 trimmed primary key，并将它们传入 bucket-scoped lookup primitive。
-- lookup 的 HIT / DELETED / MISS 分别映射为 row / not found / not found。UNKNOWN 映射为可重试的 `PmsLookupUnavailableException`，不得映射为 MISS。
-- 生产路径不使用 Paimon `ReadBuilder` 或 `LocalTableQuery`。`ReadBuilder` 只用于集成测试与压测正确性对照。模块的完整 snapshot、commit delta、恢复和 profile 约束见 [pms-lookup-paimon.md](pms-lookup-paimon.md)。
-
-**写入响应状态**：
-
-| status | 含义 | Client 行为 |
-|--------|------|------------|
+| status | 含义 | 建议行为 |
+|--------|------|----------|
 | `OK` | 写入成功 | 继续写入 |
-| `OVERLOADED` | 系统过载，写入被拒绝 | 反压重试 |
-| `SCHEMA_MISMATCH` | Schema 不一致（V1 中视为 Fatal Error） | 停止写入 |
-| `SHUTTING_DOWN` | 服务正在停机 | 切换到其他节点 |
+| `OVERLOADED` | Immutable/NEW backlog 达到水位，写入未进入 WAL | 退避重试 |
+| `SCHEMA_MISMATCH` | V1 不支持 Schema 变化 | 停止写入并修复部署 |
+| `SHUTTING_DOWN` | runtime 不再接收请求 | 切换实例或稍后重试 |
 
-WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteException`。RPC 不将其
-包装成普通 `INTERNAL_ERROR`，而是终止当前请求、把 runtime 标记为 `FAILED`，并异步停止
-HTTP server、scheduler 和 table service；该批结果按 unknown outcome 处理，等待进程重启恢复。
+WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteException`。此时请求结果是 unknown outcome，runtime 进入 `FAILED` 并异步关闭 HTTP、scheduler 和 table service，等待重启恢复。
 
-完整协议 status、endpoint 和 binary payload 见 [pms-protocol.md](pms-protocol.md)。
+### 2.2 启动与恢复
 
-**流控集成**：server 写入口在进入 core 前读取 `BucketStateSnapshot`。immutable MemTable
-或 newSST 达到配置水位时返回 `OVERLOADED`，请求不会进入 WAL。详见
-[pms-core.md](pms-core.md) § 4。为覆盖已经通过该快速检查并在 core 排队的并发请求，core write leader
-还会在 WAL append 前复查相同水位；core overload 由 runtime 映射为同一个 `OVERLOADED`。
+`PmsTableService.open()` 在对外监听前完成本地状态恢复：
 
-**body 限制**：即使请求未携带 `Content-Length`，server 也在读取过程中执行
-`maxRequestBodyBytes`；成功 binary response 在发送前执行 `maxResponseBodyBytes`。
-
-**查询流控**：查询请求一般不流控（读取不消耗内存配额），但在 OVERLOADED 水位下可限制并发查询数（可选，保护磁盘 IO）。
-
-### 2.2 RecoveryManager (启动恢复管理器)
-
-启动时执行逻辑：
-
-```
-1. 加载 Paimon 表与本地 SST/flush boundary
-2. 初始化 WALManager，扫描 DATA WAL 文件并恢复 sequence 水位
-3. 重放 DATA_RECORD：结合本地 `lastFlushedSequenceId` 恢复边界，只重放尚未被 SST 承载的 DATA 记录
-4. 初始化 SinkMetaStore，扫描 prepare/success metadata：
-   - 若本地有 prepare 但无 success：
-     使用 SinkMeta 中保存的 prepared commit payload、batch 信息和 fileRefs 恢复未完成提交；真实 Paimon sink 接入后应先校验 data file refs，再重试 commit。
-   - 若存在 success：
-     通过 success.sstIds 与 persistedSequenceId 推导 sinkedSST，并修正 SST metadata state。
-5. 创建 `pms-lookup-paimon` stack 并取得其独立 cache directory 的所有权；不恢复 live file view，也不回放历史 delta。
-6. 恢复完毕，启动 RPCServer 和定时 Flush/Compact 线程。首次访问每个 bucket 时从完整最新 snapshot 安装其 view。
+```text
+load/validate Paimon table and fixed schema
+  -> initialize local storage and flush boundary
+  -> initialize SinkMeta and derive NEW/SINKED state
+  -> initialize WAL and replay data beyond lastFlushedSequenceId
+  -> restore pending prepared Sink, if any
+  -> initialize Paimon lookup stack
+  -> create scheduler and HTTP server
+  -> status = RUNNING
+  -> start HTTP, then scheduler
 ```
 
-**启动顺序**：
+启动时的 metadata 损坏、Schema mismatch、SST/flush boundary 不一致或非法 prepared 状态属于确定性错误，必须拒绝启动。恢复出的、尚未由 `lastPersistedSequenceId` 覆盖的数据会使 scheduler 尽快建立新的 Paimon 可见性 fence，而不是等待可能失真的 wall-clock age。
 
+### 2.3 配置管理
+
+`ConfigManager` 读取 Java properties，完成默认值、目录隔离、跨配置约束和已移除配置检查，再构造：
+
+- `PMSConfig`：MemTable、WAL、本地 storage 路径、flow control 与 Paimon core 配置。
+- `PmsSchedulerConfig`：server 的调度目的与单次操作边界。
+- `PmsProtocolConfig`、`PmsLookupConfig`：协议和 Paimon lookup 配置。
+
+调度阈值属于 server，而不是 core 操作 API。配置名表达“需要维护的状态”或“单次操作上限”，不把调度目的写成某个固定动作。
+
+### 2.4 Scheduler
+
+#### 2.4.1 目标与边界
+
+Scheduler 同时服务两个独立目的：
+
+1. 维护本地 MemTable/SST 层的文件数量和查询放大。
+2. 控制写入进入 Paimon 的正常可见性延迟。
+
+core 只提供 Freeze、Flush、Sink、Compact、Evict 等单步操作。Scheduler 不预先生成多步 plan，也不维护 `Intent/Decision` 模型；它每次读取 `BucketStateSnapshot`，选择一个最高优先级动作，动作取得进展后丢弃旧快照并从头判断。
+
+#### 2.4.2 两个 worker
+
+| worker | 默认周期 | 职责 |
+|--------|----------|------|
+| Flush worker | 1 秒 | 连续处理等待中的 ImmutableMemTable，每次 Flush 一个；不执行 Sink/Compact/Evict |
+| Maintenance worker | 30 秒 | 串行推进 prepared retry、Paimon fence、NEW/SINKED compact、Sink 与 Evict |
+
+两个 worker 各使用一个单线程 executor，信号会合并为当前轮加至多一轮 rerun，避免 executor 队列无界增长。Flush 与 SST maintenance 可以并发，但 core 的发布协议保证查询透明；Sink/Compact/Evict 由 core 的 SST maintenance mutex 再次串行化。
+
+每轮最多执行 64 个取得进展的动作，然后主动重新排队，避免一个表的积压长期占用 worker。64 是自动调和的公平性 slice，不是某个管理请求必须同步完成的预算，因为管理 API 本身不执行同步 drain。
+
+#### 2.4.3 Paimon 可见性 fence
+
+`pms.paimon.visibility.max_delay_ms` 表达“写入在正常情况下进入 Paimon 的目标最大等待时间”，默认 10 分钟。Scheduler 从 Cur/Immutable/NEW 的最早写入时间计算 lag；达到目标时：
+
+1. Freeze 当前 MemTable，捕获固定 `fenceSequenceId`。
+2. 将该值发布为 `pendingPaimonFenceSequenceId`。
+3. 请求 Flush worker 推进 `lastFlushedSequenceId`。
+4. 当完整 fence 已成为 NEW SST 后，以一个或多个有界 Sink batch 推进。
+5. `lastPersistedSequenceId >= fence` 后清除 fence。
+
+新写入位于固定 fence 之后，不会无限延长当前可见性目标。由于检查由 Maintenance worker 周期触发，实际正常检测延迟上限约为 `visibility.max_delay + maintenance interval`，默认约 10 分 30 秒，而不是硬实时 SLA。
+
+V1 不设置 `flush.max_delay`：低流量数据留在 CurMemTable，直到容量阈值、可见性 fence 或手动请求需要它下沉，避免固定周期制造小 SST。
+
+#### 2.4.4 Maintenance 优先级
+
+每次循环严格按以下顺序选择一个动作：
+
+1. 存在 durable prepared Sink：调用 `commitPreparedSink()`，成功前不启动其他 SST maintenance。
+2. pending Paimon fence 已由 `lastPersistedSequenceId` 覆盖：清除 controller 状态并重新采样。
+3. 存在 pending fence 且 `lastFlushedSequenceId < fence`：signal Flush worker，本轮退出。
+4. 存在尚未满足、但已经完整 Flush 的 pending fence：Sink 一个受字节上限约束的 NEW 前缀。
+5. Paimon 可见性已到期：Freeze 并建立固定 fence。
+6. `NEW count > new_sst.max_count` 且存在可合并的连续组：Compact NEW。
+7. NEW 超标但无法在 compact 字节上限内选出至少两个连续 run：Sink 最老 NEW 前缀。
+8. `SINKED count > sinked_sst.max_count` 且存在可合并的连续组：Compact SINKED。
+9. SINKED 超标但无法 compact：Evict 最老 SINKED run。
+10. 无动作：退出本轮。
+
+这种单步调和允许一个问题自然转化为下一轮的另一个状态。例如 NEW compact 后仍超标，会再次 compact；无法继续 compact 时会转为 Sink。Evict 不包含隐式 compact，Sink 也不包含隐式 Freeze/Flush。
+
+#### 2.4.5 操作选择
+
+- **Sink**：选择目标 sequence 以内、从最老开始的连续 NEW 前缀，总输入不超过 `batch_max_bytes`；最老单 run 超限时允许单独推进。没有 SST 数量上限。
+- **Compact**：从老到新选择第一个同状态、连续且总输入不超过 `max_input_size` 的至少两个 run。NEW/SINKED 不混合。
+- **Evict**：只调用 `evictOldestSinkedSST()`，不允许任意 run 淘汰。
+
+Sink 与 compact 不冲突：数据 Sink 后仍可在 SINKED 状态 compact。二者需要串行化的是同一时刻的本地 run 集合变更，而不是生命周期上的先后限制。
+
+#### 2.4.6 失败与日志
+
+Flush/Maintenance worker 捕获运行期 `RuntimeException`，记录失败并在下一个周期或已有 signal 重试；不维护单独 retry timer。积压达到 flow-control 水位后，写入会被 `OVERLOADED` 阻止。
+
+V1 不构建复杂的后台 fatal exception taxonomy。确定性配置、Schema 与恢复损坏在启动阶段 fail fast；运行期只对已有明确语义的 fatal write 关闭 runtime。待故障注入与生产样本证明需要后，再增加少量显式 fatal 类型，而不是按异常消息猜测。
+
+所有实际 Flush 或 Maintenance 动作都使用统一日志标记：
+
+```text
+PMS_SCHEDULER_ACTION phase=start|completed|noop|failed
+                     worker=flush|maintenance
+                     action=...
+                     reason=...
 ```
-ConfigManager.load()
-    │
-    ▼
-StorageManager.initialize()
-    │
-    ▼
-SinkMetaStore.initialize()
-    │
-    ▼
-WALManager.initialize()
-    │
-    ▼
-PMSBucketDirector.initialize()
-    │
-    ▼
-BackgroundTaskScheduler.start()
-    │
-    ▼
-RPCServer.start()
+
+运维可以直接 grep `PMS_SCHEDULER_ACTION` 重建调度动作序列。
+
+#### 2.4.7 手动管理请求
+
+`POST /flush` 与 `POST /sink` 是异步 fence API：
+
+- `/flush` Freeze 当前边界并返回 HTTP 202、`fenceSequenceId` 和完成字段 `lastFlushedSequenceId`。
+- `/sink` Freeze 当前边界，建立/扩展 Paimon fence，并返回 HTTP 202、`fenceSequenceId` 和完成字段 `lastPersistedSequenceId`。
+- client 轮询 `/state`，当对应 boundary 大于等于 fence 时视为完成。
+
+V1 不提供同步 drain、回调、task registry 或“停机前全部进入 Paimon”的承诺。异步接口保持实现和故障语义简单，同时仍可观察完成进度。
+
+### 2.5 停机语义
+
+V1 采用 recovery-first shutdown，而不是 Drain/Quiesce/最终 Sink：
+
+```text
+RUNNING
+  -> SHUTTING_DOWN（立即停止接收新请求）
+  -> close HTTP server
+  -> close scheduler，停止周期触发并等待已经开始的 worker action
+  -> close table service / WAL / local storage / Paimon resources
+  -> STOPPED
 ```
 
-### 2.3 ConfigManager
+停机不主动 Freeze、Flush 或 Sink，也不建立最终 fence。尚在 Cur/Immutable/NEW 中的数据由 WAL、本地 SST、flush boundary 与 SinkMeta 在下次启动恢复。代价是停机期间 Paimon 可见性可能暂时落后，重启 replay 可能更慢；这对单机 V1 是可接受的，并显著减少停机路径与正常调和循环的重复状态机。
 
-配置管理器，是 pms-core `PMSConfig` 的生产者。负责从外部配置源读取原始配置，构造 pms-core 定义的 `PMSConfig` 对象，注入到各核心组件中。
+Scheduler `close()` 不设置内部业务超时，而是等待已经开始的单步操作完成，避免在 SST/Paimon publish 中途主动中断。部署系统应在进程级配置 shutdown grace period；超过该时间可以终止进程，恢复协议负责处理边界前后的完整状态。
 
-**职责边界**：
+### 2.6 状态与可观测性
 
+`GET /state` 汇总：
+
+- core 的 MemTable、NEW/SINKED、sequence boundary、local run 与 Sink flight 状态；
+- `writeOverloaded`；
+- scheduler 的运行状态、配置、pending Paimon fence 与 worker running 标记；
+- runtime 的 `status`、时间戳、最近失败与 recovery summary；
+- Paimon lookup cache/view 状态。
+
+age 不存储在 core 快照中；server 在构造 `/state` 响应时由 `observedAtMillis` 与各层 `oldestWriteAtMillis` 即时计算并返回。
+
+## 3. 生产配置
+
+### 3.1 Scheduler 与本地层默认值
+
+| 配置 | 默认值 | 含义 |
+|------|--------|------|
+| `pms.server.scheduler.flush_reconcile_interval_ms` | `1000` | Flush worker 调和周期 |
+| `pms.server.scheduler.maintenance_reconcile_interval_ms` | `30000` | Maintenance worker 调和周期 |
+| `pms.paimon.visibility.max_delay_ms` | `600000` | Paimon 正常可见性目标 |
+| `pms.memtable.max_entries` | `1000000` | CurMemTable 自动 Freeze 条目水位 |
+| `pms.memtable.max_size_mb` | `256` | CurMemTable 自动 Freeze 字节水位 |
+| `pms.storage.new_sst.max_count` | `10` | NEW run 维护目标 |
+| `pms.storage.sinked_sst.max_count` | `10` | 本地保留 SINKED run 维护目标 |
+| `pms.operation.sink.batch_max_bytes_mb` | `1024` | 单次 Sink 输入上限 |
+| `pms.operation.compact.max_input_size_mb` | `1024` | 单次 local compact 输入上限 |
+| `pms.flowcontrol.overloaded_immutable_count` | `4` | Immutable write overload 水位 |
+| `pms.flowcontrol.overloaded_pending_sst_count` | `20` | NEW write overload 水位 |
+
+约束：
+
+- `new_sst.max_count` 必须严格小于 `overloaded_pending_sst_count`，给后台维护保留缓冲区。
+- 所有周期、目标和字节上限必须为正数。
+- `pms.wal.dir` 与 `pms.storage.dir` 必须不同；lookup cache 也不得位于 WAL/storage 或本地 warehouse 子目录内。
+- V1 不在进程内根据磁盘 free space 调度。建议 storage 使用独立卷或明确 quota；按默认 `10 × 1 GiB` SINKED 窗口并考虑 NEW、compact 临时输出及余量，建议至少约 24 GiB，可优先配置 32 GiB，并由外部系统在剩余空间低于约 4 GiB 时告警。
+
+### 3.2 已移除的调度配置
+
+以下键不再受支持，`ConfigManager` 发现后直接拒绝启动，避免旧配置被静默忽略：
+
+```text
+pms.server.scheduler.enabled
+pms.server.scheduler.failure_retry_delay_ms
+pms.server.scheduler.flush_interval_ms
+pms.server.scheduler.sink_interval_ms
+pms.sink.interval_ms
+pms.sink.max_pending_ssts
+pms.storage.sinked_max_size_mb
+pms.storage.sinked_max_count
+pms.storage.local_sst_max_rows
+pms.operation.sink.batch_max_ssts
+pms.storage.compact_threshold_mb
+pms.storage.compact_min_files
 ```
-┌─────────────────────────────────────────────────┐
-│  pms-server: ConfigManager（配置生产者）          │
-│                                                 │
-│  - 从 pms-server.yml / 环境变量 / 启动参数读取   │
-│  - 校验配置项合法性和一致性                       │
-│  - 构造 PMSConfig 对象                           │
-│  - V1 不支持运行时热更新，配置变更需重启           │
-│                                                 │
-└─────────────────────┬───────────────────────────┘
-                      │ 构造并注入
-                      ▼
-┌─────────────────────────────────────────────────┐
-│  pms-core: PMSConfig（配置消费者）                │
-│                                                 │
-│  - 单一平铺 Record，包含所有核心配置字段          │
-│  - 组件通过构造函数接收 PMSConfig                │
-│                                                 │
-└─────────────────────────────────────────────────┘
-```
 
-**配置读取与构造**：
+完整可运行样例见 `pms-server/src/main/resources/pms-server-example.properties`；协议与 lookup 配置见 [pms-server README](../pms-server/README.md)。
 
-```java
-class ConfigManager {
-    private PMSConfig currentConfig;
+## 4. 暂缓项
 
-    // 从外部配置源加载并构造 PMSConfig
-    PMSConfig load(String configPath) {
-        // 1. 读取 pms-server.yml
-        // 2. 校验配置项合法性（如路径不为空等）
-        // 3. 构造 PMSConfig 对象
-        this.currentConfig = buildPMSConfig(rawConfig);
-        return currentConfig;
-    }
-}
-```
+以下内容不属于当前 MVP 完成条件：
 
-**外部配置项与 PMSConfig 字段的映射**：
+- 故障注入矩阵与长时间 benchmark/默认值校准。
+- 基于磁盘剩余空间、精确 SST 总字节数或查询放大的动态调度。
+- 同步管理命令、回调和持久化 task registry。
+- 运行期完整 fatal exception taxonomy。
+- Paimon 显式 compaction scheduler。
 
-| YAML 配置项 | 默认值 | 映射到 PMSConfig 字段 |
-|------------|--------|----------------------|
-| `pms.server.port` | 9090 | server 自有，不在 core 中 |
-| `pms.protocol.strict_http2` | true | binary protocol endpoint 是否拒绝非 HTTP/2 请求 |
-| `pms.protocol.max_key_bytes` | 65536 | 单个 encoded key 最大字节数 |
-| `pms.protocol.max_row_bytes` | 16777216 | 单个 encoded row value 最大字节数 |
-| `pms.protocol.max_batch_entries` | 1024 | `RecordBatch` record 数和 prefix 成功结果数上限，不得超过 core batch 上限 |
-| `pms.protocol.max_concurrent_streams` | 128 | Jetty h2c 最大并发 stream 数 |
-| `pms.protocol.max_request_body_bytes` | 33554432 | 单个 protocol request body 最大字节数 |
-| `pms.protocol.max_response_body_bytes` | 33554432 | 单个 binary response body 最大字节数 |
-| `pms.memtable.max_entries` | 1000000 | `memtableMaxEntries` |
-| `pms.memtable.max_size_mb` | 256 | `memtableMaxSizeMb` |
-| `pms.wal.dir` | - | `walDir` |
-| `pms.wal.file_size_mb` | 256 | `walFileSizeMb` |
-| `pms.storage.dir` | - | `storageDir` |
-| `pms.storage.sinked_max_size_mb` | 10240 | `StorageConfig.sinkedMaxSizeMb` |
-| `pms.storage.sinked_max_count` | 100 | `StorageConfig.sinkedMaxCount` |
-| `pms.storage.local_sst_max_rows` | 0（禁用） | `StorageConfig.localSstMaxRows` |
-| `pms.storage.compact_threshold_mb` | 32 | `storageCompactThresholdMb` |
-| `pms.storage.compact_min_files` | 4 | `storageCompactMinFiles` |
-| `pms.sink.interval_ms` | 30000 | `sinkIntervalMs` |
-| `pms.sink.max_pending_ssts` | 8 | `sinkMaxPendingSsts` |
-| `pms.flowcontrol.overloaded_immutable_count` | 4 | `flowcontrolOverloadedImmutableCount` |
-| `pms.flowcontrol.overloaded_pending_sst_count` | 20 | `flowcontrolOverloadedPendingSstCount` |
-| `pms.paimon.table_path` | - | `paimonTablePath` |
-| `pms.paimon.warehouse` | - | `paimonWarehouse` |
-| `pms.paimon.cache_enabled` | true | `PaimonConfig.cacheEnabled`，透传为 Paimon `cache-enabled` |
-| `pms.paimon.manifest_cache_small_file_memory` | 128mb | `PaimonConfig.manifestCacheSmallFileMemory`，透传为 Paimon `cache.manifest.small-file-memory` |
-| `pms.paimon.manifest_cache_small_file_threshold` | 1mb | `PaimonConfig.manifestCacheSmallFileThreshold`，透传为 Paimon `cache.manifest.small-file-threshold` |
-| `pms.paimon.manifest_cache_max_memory` | - | `PaimonConfig.manifestCacheMaxMemory`，非空时透传为 Paimon `cache.manifest.max-memory` |
-| `pms.lookup.cache.enabled` | true | `PmsLookupConfig.cacheEnabled` |
-| `pms.lookup.cache.dir` | `${java.io.tmpdir}/pms-lookup-cache/<db>.<table>` | `PmsLookupConfig.cacheDir`；不得位于 WAL、storage 或本地 Paimon warehouse 下 |
-| `pms.lookup.cache.max_bytes` | 3gb | `PmsLookupConfig.maxCacheBytes` |
-| `pms.lookup.cache.build_threshold` | 3 | `PmsLookupConfig.buildThreshold` |
-| `pms.lookup.cache.build_threads` | 2 | `PmsLookupConfig.buildThreads`，也作为当前最大在途 build 数 |
-| `pms.lookup.cache.build_timeout_ms` | 30000 | `PmsLookupConfig.buildTimeout` |
-| `pms.lookup.cache.retry_backoff_ms` | 60000 | `PmsLookupConfig.retryBackoff` |
-| `pms.lookup.direct.metadata_cache_entries` | 1024 | direct Parquet lookup 的文件 metadata cache 容量 |
-
-### 2.4 BackgroundTaskScheduler
-
-定时任务调度器，驱动所有后台操作。
-
-**任务列表**：
-
-| 任务 | 默认间隔 | 说明 |
-|------|---------|------|
-| MemTable Freeze 检查 | 1s | 检查 curMemTable 是否达阈值，触发 `freezeCurMemTable()` |
-| Immutable Flush | 立即（Freeze 后） | 将新冻结的 ImmutableMemTable 刷盘为 SST |
-| Sink Paimon | 30s | 检查 newSST 数量，触发 `sinkToPaimon()` |
-| Paimon Compaction | 暂不启用 | 未来由 server 显式掌控 Paimon data-file compaction；V1 初期依赖 Paimon 写入提交中的隐式维护 |
-| 本地 SST 合并 | 300s | 检查小文件数量，触发 `compactLocalSSTs()` |
-| sinkedSST 淘汰 | Sink 后 | 根据本地 SST 总大小、总文件数或总物理 entry 数检查阈值，循环触发 `evictOldestSinkedSST()`；只删除已 sinked 的最老 SST |
-| WAL 截断 | 300s | 检查可安全截断的 WAL 文件，执行 `truncate()` |
-| 水位线检查 | 0.5s | 评估当前水位线，调整后台任务优先级 |
-
-本地 SST 合并当前是 standalone compact，不与 Paimon sink merge 融合。sink、local compact 和 sinkedSST evict 在 core 内串行化，避免 compact 修改正在 sink 的 new run；sink+compact 融合优化暂缓，需等独立恢复状态机设计清楚后再实现。
-
-Paimon compaction 是 Paimon manifest/data-file 层的维护任务，不进入 `pms-core` 的本地 SST 状态机。V1 初期暂不实现显式 Paimon compaction 控制；普通 sink 成功提交 payload 已能覆盖 Paimon 写入提交中可能携带的 data/compact 文件变动。未来显式 compaction 接入时，server 需确保普通 sink commit 与 compact commit 串行化，并复用 `pms-lookup-paimon` 的成功提交 delta 发布协议。
-
-**任务优先级调整**（与流控联动）：
-
-| 水位 | 任务策略 |
-|------|---------|
-| NORMAL | 按默认间隔执行 |
-| OVERLOADED | Flush/Sink 立即触发，加速消化积压 |
-
-### 2.5 GracefulShutdown (优雅停机)
-
-收到停机信号（SIGTERM / 管理API调用）后的分阶段停机流程。
-
-**Phase 1 - Drain（拒绝新请求）**：
-- RPC 立即对新请求返回 `SHUTTING_DOWN`，Client 侧切换到其他节点或重试。
-- 已进入 RPC 处理的写入请求允许完成（drain in-flight）。
-- 停止接受新的 `BackgroundTaskScheduler` 定时任务触发（允许当前正在执行的任务完成）。
-
-**Phase 2 - Quiesce（等待静默）**：
-- 等待正在执行的 Sink 操作完成（设超时，默认 30s）。
-- 如果有 Sink 正在进行，不主动触发新的 Freeze/Flush，让当前 Sink 走完。
-- 关闭 RPC 监听端口，断开 Client 连接。
-
-**Phase 3 - Shutdown（最终清理）**：
-- 强制 Freeze 当前 curMemTable。
-- Flush 所有剩余 ImmutableMemTable 到 SST。
-- 调用 `WALManager.close()`，确保缓冲区刷盘。
-- 释放 Paimon 表资源。
-- 停机完成。
-
-**超时兜底**：整个停机流程设置硬超时（默认 60s），超时后强制退出。此时数据已通过 WAL 保证持久性，下次启动时走恢复流程。
-
-### 2.6 MetricsExporter 实现
-
-`pms-core` 定义了 `MetricsExporter` 接口，`pms-server` 提供具体实现。
-
-初期仅提供：
-- **JmxExporter**：注册 JMX MBean，供 JConsole / VisualVM / Arthas 实时查看。零外部依赖，JDK 自带。
-
-具体指标体系待 [pms-core-statistic.md](pms-core-statistic.md) 详细设计完成后对接。
-
-## 3. 启动与停机完整流程
-
-```
-┌─────────────── 启动 ───────────────┐
-│                                     │
-│  ConfigManager.load()               │
-│       │                             │
-│       ▼                             │
-│  WALManager.initialize()            │
-│       │                             │
-│       ▼                             │
-│  RecoveryManager.recover()          │
-│       │                             │
-│       ▼                             │
-│  PMSBucketDirector.initialize()     │
-│       │                             │
-│       ▼                             │
-│  BackgroundTaskScheduler.start()    │
-│       │                             │
-│       ▼                             │
-│  RPCServer.start()                  │
-│                                     │
-└─────────────────────────────────────┘
-
-┌─────────────── 停机 ───────────────┐
-│                                     │
-│  Signal (SIGTERM / API)             │
-│       │                             │
-│       ▼                             │
-│  Phase 1: Drain                     │
-│  - RPC 返回 SHUTTING_DOWN           │
-│  - 停止定时任务触发                  │
-│       │                             │
-│       ▼                             │
-│  Phase 2: Quiesce (timeout: 30s)    │
-│  - 等待 in-flight Sink 完成         │
-│  - 关闭 RPC 端口                    │
-│       │                             │
-│       ▼                             │
-│  Phase 3: Shutdown (timeout: 60s)   │
-│  - Freeze + Flush 所有 MemTable     │
-│  - WALManager.close()               │
-│  - 释放 Paimon 资源                 │
-│                                     │
-└─────────────────────────────────────┘
-```
+其中故障注入与 benchmark 会在当前结构稳定后单独执行，不影响本文件所述 V1 状态与接口契约。

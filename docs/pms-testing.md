@@ -25,8 +25,8 @@
 | 组件 | 测试要点 |
 |------|---------|
 | CurMemTable | 并发 put/get、容量阈值触发 freeze |
-| ImmutableMemTable | 只读验证、引用计数增减 |
-| LocalStorageManager | SST 写入 → 读取一致性、BloomFilter 构建/查询、`Optional<Value>` 三态语义、多路归并保留最新 Key |
+| ImmutableMemTable | Freeze 后只读、sequence/oldest-write 边界、Flush 发布后退出查询路径 |
+| LocalStorageManager | SST 写入 → 读取一致性、BloomFilter、`Optional<Value>` 三态、read epoch 延迟删除、多路归并保留最新 Key |
 | WALManager | 单盘写入 → 读取、CRC 校验正确性、Magic 检测 partial write |
 | RowCodec / PrimaryKeyCodec | `InternalRow` 编码 → 解码往返正确性、主键编码顺序一致性、schema 不匹配拒绝 |
 | BloomFilter | 假阳性率在预期范围内（如 < 1%）、不同 FPP 配置的效果 |
@@ -49,11 +49,16 @@
 |------|--------|
 | 写入 → Freeze → Flush | curMemTable 数据正确转移为 SST，查询结果不变 |
 | 多次 Freeze + 并发查询 | 查询穿透多层 ImmutableMemTable，数据不丢失不重复 |
-| Sink 流程状态机 | newSST → sinkedSST 状态转换正确，引用计数正确 |
-| 流控水位线 | Immutable 数量达阈值时触发 OVERLOADED，拒绝生效 |
-| 本地 SST 合并 | 多个小 SST 合并为大 SST，查询结果不变 |
-| 双持状态退化 | 内存不足时 Mem 缓存正确退化，查询结果不变 |
+| Freeze/Flush 并发查询 | 对象切换和“目标先发布、源后移除”不产生瞬时 MISS，lookup 不获取写锁 |
+| Sink 流程状态机 | 最老连续 NEW 前缀 → SINKED，固定 sequence fence 可跨多个有界 batch 推进 |
+| Prepared Sink 在线恢复 | commit 临时失败后不重启即可重试同一 durable prepare，且不准备新 batch |
+| 流控水位线 | server 快速检查与 core WAL 前复查都能返回 OVERLOADED，拒绝批次不进入 WAL |
+| 本地 SST 合并 | 只合并同状态连续 run；NEW/SINKED 均可合并，查询与恢复边界不变 |
+| SST 淘汰 | 只淘汰最老 SINKED run，read epoch 结束后才物理删除 |
 | WAL 截断 | SinkMeta success 的 `persistedSequenceId` 覆盖旧 WAL 文件时正确删除 |
+| Scheduler 优先级 | prepared retry、可见性 fence、NEW/SINKED 数量维护按固定优先级单步调和，progress 后重新采样 |
+| Scheduler 生命周期 | 周期信号合并、64-action slice 重排队、close 停止 delayed/periodic task 并等待在途 action |
+| 手动 fence | `/flush`、`/sink` 返回 202；轮询 state boundary 可观察完成，不执行同步 drain |
 
 使用 mock/fake 实现替代 Paimon API：
 
@@ -75,7 +80,7 @@ class FakeSinkManager implements SinkManager {
 | WAL 崩溃恢复 - 正常 | Kill → 重启 → 数据完整、不重复提交 |
 | SinkMeta 崩溃恢复 - prepare 后 | Kill → 重启 → 使用 SinkMeta 中的 prepared payload、batch 和 fileRefs 重试 commit |
 | SinkMeta 崩溃恢复 - success 后 SSTMeta 未更新 | Kill → 重启 → 通过 SinkMeta success 推导 sinkedSST，并修正 SST metadata state |
-| 优雅停机 | 停机 → 所有 in-flight 操作完成 → 重启后数据完整 |
+| Recovery-first 停机 | 停止 HTTP 与 scheduler，不强制 Freeze/Flush/Sink；重启后由 WAL/SST/SinkMeta 恢复数据 |
 
 ### 3.3 测试基础设施
 
@@ -96,3 +101,13 @@ class PMSTestCluster implements AutoCloseable {
 的 db_bench-like macro benchmark, 直接调用内部 byte-oriented API, 用于建立 PMS 本地 LSM/KV 能力基线.
 
 详细说明见 [pms-benchmark.md](pms-benchmark.md)。
+
+## 5. 延后验证
+
+Scheduler 的确定性状态机、并发边界和 API 语义应进入常规单元/集成测试。以下高成本工作按当前计划延后，不作为本轮文档合并的完成门槛：
+
+- 在 Flush data/meta/boundary、Sink prepare/commit/success、compact publish 与 epoch retire 各边界进行进程级故障注入。
+- 长时间混合写入/查询/Sink 压测。
+- 基于真实文件大小、Paimon snapshot 频率与恢复耗时校准默认参数。
+
+延后不代表改变恢复契约；在完成故障注入前，不应把当前默认值描述为最终容量规划结论。
