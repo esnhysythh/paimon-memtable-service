@@ -7,14 +7,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.LocalRunSnapshot;
@@ -73,7 +71,7 @@ public final class PmsServerScheduler implements AutoCloseable {
     private volatile boolean maintenanceRunning;
     // The only cross-operation plan state. Zero means no visibility fence is active.
     // 唯一跨 Operation 保留的计划状态; 零表示当前没有生效的可见性 fence.
-    private volatile long pendingPaimonFenceSequenceId;
+    private final AtomicLong pendingPaimonFenceSequenceId = new AtomicLong();
 
     public PmsServerScheduler(PmsTableService service, PmsSchedulerConfig config) {
         this(requireService(service), config, Clock.systemUTC());
@@ -133,26 +131,22 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     /** Establishes a local Flush fence and returns without waiting for SST I/O. */
-    public long requestFlushToCurrent() {
+    public synchronized long requestFlushToCurrent() {
         ensureRunning();
-        return callMaintenance(() -> {
-            FreezeResult freeze = executeFreeze("MANUAL_FLUSH_REQUEST", operations.stateSnapshot());
-            signalFlush();
-            return freeze.fenceSequenceId();
-        });
+        FreezeResult freeze = executeFreeze("MANUAL_FLUSH_REQUEST", operations.stateSnapshot());
+        signalFlush();
+        return freeze.fenceSequenceId();
     }
 
     /** Establishes or extends the Paimon visibility fence and returns without waiting for I/O. */
-    public long requestSinkToCurrent() {
+    public synchronized long requestSinkToCurrent() {
         ensureRunning();
-        return callMaintenance(() -> {
-            FreezeResult freeze = executeFreeze("MANUAL_SINK_REQUEST", operations.stateSnapshot());
-            long fence = freeze.fenceSequenceId();
-            pendingPaimonFenceSequenceId = Math.max(pendingPaimonFenceSequenceId, fence);
-            signalFlush();
-            signalMaintenance();
-            return fence;
-        });
+        FreezeResult freeze = executeFreeze("MANUAL_SINK_REQUEST", operations.stateSnapshot());
+        long fence = freeze.fenceSequenceId();
+        pendingPaimonFenceSequenceId.accumulateAndGet(fence, Math::max);
+        signalFlush();
+        signalMaintenance();
+        return fence;
     }
 
     public Map<String, Object> state() {
@@ -165,7 +159,7 @@ public final class PmsServerScheduler implements AutoCloseable {
         result.put("sinkedSstMaxCount", config.sinkedSstMaxCount());
         result.put("sinkBatchMaxBytes", config.sinkBatchMaxBytes());
         result.put("compactMaxInputBytes", config.compactMaxInputBytes());
-        result.put("pendingPaimonFenceSequenceId", pendingPaimonFenceSequenceId);
+        result.put("pendingPaimonFenceSequenceId", pendingPaimonFenceSequenceId.get());
         result.put("flushRunning", flushRunning);
         result.put("maintenanceRunning", maintenanceRunning);
         return result;
@@ -178,8 +172,12 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
         running = false;
         closed = true;
-        shutdown(flushExecutor, "Flush");
-        shutdown(maintenanceExecutor, "maintenance");
+        flushExecutor.shutdown();
+        maintenanceExecutor.shutdown();
+        boolean interrupted = awaitTermination(flushExecutor) | awaitTermination(maintenanceExecutor);
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
         LOG.info("PMS server scheduler stopped");
     }
 
@@ -315,14 +313,14 @@ public final class PmsServerScheduler implements AutoCloseable {
                 continue;
             }
 
-            long fence = pendingPaimonFenceSequenceId;
+            long fence = pendingPaimonFenceSequenceId.get();
             if (fence > 0) {
                 // Persisted coverage satisfies the fence; discard controller state and reconsider
                 // ordinary count maintenance from a new snapshot.
                 // persisted boundary 覆盖 fence 后, 该目标即已满足;清除 controller 状态, 并基于
                 // 新快照重新判断常规的数量维护.
                 if (state.lastPersistedSequenceId() >= fence) {
-                    pendingPaimonFenceSequenceId = 0;
+                    pendingPaimonFenceSequenceId.compareAndSet(fence, 0);
                     continue;
                 }
                 // Sink cannot cover the fence until Flush has materialized its complete prefix.
@@ -348,7 +346,7 @@ public final class PmsServerScheduler implements AutoCloseable {
                 // Freeze 会原子捕获当前写入边界; 后续新写入位于 fence 之后, 因此不会延长本轮
                 // 可见性目标的完成时间.
                 FreezeResult freeze = executeFreeze("PAIMON_VISIBILITY_LAG", state);
-                pendingPaimonFenceSequenceId = freeze.fenceSequenceId();
+                pendingPaimonFenceSequenceId.accumulateAndGet(freeze.fenceSequenceId(), Math::max);
                 signalFlush();
                 continue;
             }
@@ -578,39 +576,16 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
     }
 
-    private <T> T callMaintenance(Callable<T> action) {
-        return await(maintenanceExecutor.submit(action));
-    }
-
-    private static <T> T await(Future<T> future) {
-        try {
-            return future.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for PMS scheduler operation", e);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException runtimeException) {
-                throw runtimeException;
+    private static boolean awaitTermination(ScheduledExecutorService executor) {
+        boolean interrupted = false;
+        while (!executor.isTerminated()) {
+            try {
+                executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
             }
-            if (cause instanceof Error error) {
-                throw error;
-            }
-            throw new IllegalStateException("PMS scheduler operation failed", cause);
         }
-    }
-
-    private static void shutdown(ScheduledExecutorService executor, String role) {
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
-                LOG.warn("PMS {} scheduler worker did not stop within timeout; forcing shutdown", role);
-                executor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            executor.shutdownNow();
-        }
+        return interrupted;
     }
 
     private void ensureOpen() {

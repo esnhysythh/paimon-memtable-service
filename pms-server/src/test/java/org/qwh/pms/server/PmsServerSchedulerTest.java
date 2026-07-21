@@ -1,6 +1,8 @@
 package org.qwh.pms.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -16,6 +18,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
@@ -196,6 +199,43 @@ class PmsServerSchedulerTest {
     }
 
     @Test
+    void manualSinkEstablishesFenceWhileMaintenanceSinkIsBlocked() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        operations.addRun(SSTState.NEW, 1, 700L * 1024 * 1024);
+        operations.addRun(SSTState.NEW, 2, 700L * 1024 * 1024);
+        operations.lastFlushedSequenceId = 2;
+        operations.currentEntries = 1;
+        operations.lastAssignedSequenceId = 3;
+        operations.blockNextSink();
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(60_000, 60_000, 600_000, 1, 10, 1_024, 1_024),
+            Clock.systemUTC()
+        );
+        try {
+            scheduler.start();
+            assertTrue(operations.sinkStarted.await(5, TimeUnit.SECONDS));
+
+            long fence = assertTimeoutPreemptively(
+                Duration.ofSeconds(1),
+                scheduler::requestSinkToCurrent
+            );
+
+            assertEquals(3, fence);
+            assertEquals(3L, scheduler.state().get("pendingPaimonFenceSequenceId"));
+            operations.releaseSink();
+            waitUntil(() -> operations.lastPersistedSequenceId >= fence
+                && (Long) scheduler.state().get("pendingPaimonFenceSequenceId") == 0L);
+        } finally {
+            operations.releaseSink();
+            scheduler.close();
+        }
+
+        assertEquals(1, operations.freezeCalls);
+        assertEquals(3, operations.lastPersistedSequenceId);
+    }
+
+    @Test
     void closeDoesNotWaitForNextPeriodicRetry() throws Exception {
         MutableOperations operations = new MutableOperations();
         operations.addImmutable(1);
@@ -221,6 +261,59 @@ class PmsServerSchedulerTest {
         } finally {
             scheduler.close();
         }
+    }
+
+    @Test
+    void closeWaitsForBothRunningWorkersAndDoesNotStartAnotherAction() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        operations.addRun(SSTState.NEW, 1, 700L * 1024 * 1024);
+        operations.addRun(SSTState.NEW, 2, 700L * 1024 * 1024);
+        operations.lastFlushedSequenceId = 2;
+        operations.addImmutable(1);
+        operations.addImmutable(2);
+        operations.blockNextFlush();
+        operations.blockNextSink();
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(1, 1, 600_000, 1, 10, 1_024, 1_024),
+            Clock.systemUTC()
+        );
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        Thread closeThread = new Thread(() -> {
+            try {
+                scheduler.close();
+            } catch (Throwable failure) {
+                closeFailure.set(failure);
+            }
+        });
+        try {
+            scheduler.start();
+            assertTrue(operations.flushStarted.await(5, TimeUnit.SECONDS));
+            assertTrue(operations.sinkStarted.await(5, TimeUnit.SECONDS));
+
+            closeThread.start();
+            waitUntil(() -> !(Boolean) scheduler.state().get("running"));
+            assertTrue(closeThread.isAlive(), "close must wait for both running workers");
+
+            operations.releaseFlush();
+            waitUntil(() -> operations.immutableCount == 1);
+            assertTrue(closeThread.isAlive(), "close must still wait for the running Sink");
+            operations.releaseSink();
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+            assertFalse(closeThread.isAlive());
+            assertNull(closeFailure.get());
+        } finally {
+            operations.releaseFlush();
+            operations.releaseSink();
+            scheduler.close();
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+        }
+
+        assertEquals(1, operations.flushCalls);
+        assertEquals(1, operations.sinkCalls);
+        assertEquals(1, operations.immutableCount);
+        assertThrows(IllegalStateException.class, scheduler::requestFlushToCurrent);
+        assertThrows(IllegalStateException.class, scheduler::requestSinkToCurrent);
     }
 
     @Test
@@ -273,6 +366,72 @@ class PmsServerSchedulerTest {
         assertEquals(1, operations.compactCalls);
         assertEquals(0, operations.sinkCalls);
         assertEquals(1, operations.count(SSTState.NEW));
+    }
+
+    @Test
+    void newCountSinksWhenNoPairFitsCompactLimit() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        operations.addRun(SSTState.NEW, 1, 700L * 1024 * 1024);
+        operations.addRun(SSTState.NEW, 2, 700L * 1024 * 1024);
+        operations.lastFlushedSequenceId = 2;
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(60_000, 1, 600_000, 1, 10, 1_024, 1_024),
+            Clock.systemUTC()
+        );
+        try {
+            scheduler.start();
+            waitUntil(() -> operations.count(SSTState.NEW) == 1);
+        } finally {
+            scheduler.close();
+        }
+
+        assertEquals(0, operations.compactCalls);
+        assertEquals(1, operations.sinkCalls);
+    }
+
+    @Test
+    void lowTrafficDoesNotFreezeBeforeVisibilityDeadline() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        operations.currentEntries = 1;
+        operations.lastAssignedSequenceId = 1;
+        operations.currentOldestWriteAtMillis = 9_500;
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(5, 5, 600_000, 10, 10, 1_024, 1_024),
+            fixedTimeSource(Instant.ofEpochMilli(10_000))
+        );
+        try {
+            scheduler.start();
+            Thread.sleep(50);
+        } finally {
+            scheduler.close();
+        }
+
+        assertEquals(0, operations.freezeCalls);
+        assertEquals(0, operations.flushCalls);
+        assertEquals(0, operations.sinkCalls);
+    }
+
+    @Test
+    void flushBacklogContinuesAcrossActionBudgetSlices() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        for (int sequenceId = 1; sequenceId <= 65; sequenceId++) {
+            operations.addImmutable(sequenceId);
+        }
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(60_000, 60_000, 600_000, 100, 100, 1_024, 1_024),
+            Clock.systemUTC()
+        );
+        try {
+            scheduler.start();
+            waitUntil(() -> operations.immutableCount == 0);
+        } finally {
+            scheduler.close();
+        }
+
+        assertEquals(65, operations.flushCalls);
     }
 
     @Test
@@ -354,6 +513,8 @@ class PmsServerSchedulerTest {
         private RuntimeException flushFailure;
         private volatile CountDownLatch flushStarted;
         private volatile CountDownLatch flushRelease;
+        private volatile CountDownLatch sinkStarted;
+        private volatile CountDownLatch sinkRelease;
         private boolean recoveredUnpersistedData;
         private SinkFlightSnapshot sinkFlight = SinkFlightSnapshot.idle();
         private final ArrayDeque<Long> immutableMaxSequenceIds = new ArrayDeque<>();
@@ -449,7 +610,24 @@ class PmsServerSchedulerTest {
         }
 
         @Override
-        public synchronized SinkOperationResult sinkToPaimon(SinkSelection selection) {
+        public SinkOperationResult sinkToPaimon(SinkSelection selection) {
+            CountDownLatch started = sinkStarted;
+            CountDownLatch release = sinkRelease;
+            if (started != null) {
+                started.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("blocked Sink interrupted", e);
+                }
+                sinkStarted = null;
+                sinkRelease = null;
+            }
+            return sinkToPaimonLocked(selection);
+        }
+
+        private synchronized SinkOperationResult sinkToPaimonLocked(SinkSelection selection) {
             List<LocalRunSnapshot> selected = new ArrayList<>();
             long selectedBytes = 0;
             for (LocalRunSnapshot run : runs(SSTState.NEW)) {
@@ -588,6 +766,18 @@ class PmsServerSchedulerTest {
 
         private void releaseFlush() {
             CountDownLatch release = flushRelease;
+            if (release != null) {
+                release.countDown();
+            }
+        }
+
+        private synchronized void blockNextSink() {
+            sinkStarted = new CountDownLatch(1);
+            sinkRelease = new CountDownLatch(1);
+        }
+
+        private void releaseSink() {
+            CountDownLatch release = sinkRelease;
             if (release != null) {
                 release.countDown();
             }
