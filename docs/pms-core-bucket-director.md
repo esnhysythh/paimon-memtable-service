@@ -193,7 +193,8 @@ V1 batch 语义：
 - 一个 external batch 在 core 中作为一个整体提交：一次 WAL batch append，一段连续 sequence，按 batch 内顺序写入 curMemTable。
 - 同一 batch 内允许重复 key，后出现的 op 分配更大的 sequenceId 并覆盖前面的 op；WAL replay 后必须得到同样结果。
 - `writeBatch` 返回时，整批已经完成 WAL append 且对本地查询可见。V1 不返回 per-record status，也不表达部分成功。
-- 若在 WAL append 前发现参数非法或 batch 超出限制，整批失败且不改变本地状态。
+- 若在 WAL append 前发现参数非法、batch 超出限制或当前 immutable / NEW 水位已经过载，
+  整批失败且不改变本地状态；过载由 `PmsWriteOverloadedException` 明确表达。
 - 若 WAL append 成功后 MemTable apply 失败，PMS 进入不可恢复错误路径；server 不应把该场景映射为普通的 `acceptedCount=0` 失败响应。
 - auto-freeze 只在完整 batch apply 后触发，避免一个 WAL batch 被 freeze 切成不可解释的半批边界。
 

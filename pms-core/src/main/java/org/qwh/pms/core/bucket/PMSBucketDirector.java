@@ -16,10 +16,17 @@ public interface PMSBucketDirector {
 
     int MAX_WRITE_BATCH_COUNT = 1024;
 
+    /** @throws PmsWriteOverloadedException if the maintenance backlog is already overloaded. */
     void put(byte[] key, byte[] value);
 
+    /** @throws PmsWriteOverloadedException if the maintenance backlog is already overloaded. */
     void delete(byte[] key);
 
+    /**
+     * Writes the whole batch or rejects it before WAL append.
+     *
+     * @throws PmsWriteOverloadedException if the maintenance backlog is already overloaded
+     */
     void writeBatch(List<WriteOp> ops);
 
     Optional<byte[]> get(byte[] key);

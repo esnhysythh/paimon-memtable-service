@@ -1,5 +1,6 @@
 package org.qwh.pms.core.bucket;
 
+import org.qwh.pms.core.config.FlowControlConfig;
 import org.qwh.pms.core.config.MemTableConfig;
 import org.qwh.pms.core.config.PMSConfig;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
@@ -58,6 +59,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private static final int MAX_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
 
     private final MemTableConfig memTableConfig;
+    private final FlowControlConfig flowControlConfig;
     private final WALManagerImpl walManager;
     private final FileLocalStorageManager storageManager;
     private final SinkMetaStore sinkMetaStore;
@@ -111,6 +113,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         Objects.requireNonNull(config, "config must not be null");
         Objects.requireNonNull(sinkManagerFactory, "sinkManagerFactory must not be null");
         this.memTableConfig = config.memtable();
+        this.flowControlConfig = config.flowcontrol();
         this.walManager = new WALManagerImpl(config);
         this.storageManager = new FileLocalStorageManager(config.storage());
         this.sinkMetaStore = new SinkMetaStore(Path.of(config.storage().dir()).resolve("sink"));
@@ -680,6 +683,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         boolean walAppended = false;
         try {
             synchronized (writeMutex) {
+                rejectWriteIfOverloadedLocked();
                 List<DataWrite> writes = flattenWrites(batch);
                 long sequenceBegin = walManager.appendDataRecords(writes);
                 walAppended = true;
@@ -700,6 +704,29 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
         for (WriteBatchRequest request : batch) {
             request.complete(failure);
+        }
+    }
+
+    /**
+     * Rechecks the admission watermarks at the actual serialized write boundary. This does
+     * not reserve capacity or prevent a concurrently published Flush result from moving a count;
+     * it only guarantees that a batch observing an already-overloaded state never enters WAL.
+     */
+    private void rejectWriteIfOverloadedLocked() {
+        int immutableCount = memTables.immutables().size();
+        int newSstCount = runState.newRuns().size();
+        if (immutableCount >= flowControlConfig.overloadedImmutableCount()
+                || newSstCount >= flowControlConfig.overloadedPendingSstCount()) {
+            throw new PmsWriteOverloadedException(
+                "PMS write backlog reached the overload watermark: immutableCount="
+                    + immutableCount
+                    + "/"
+                    + flowControlConfig.overloadedImmutableCount()
+                    + ", newSstCount="
+                    + newSstCount
+                    + "/"
+                    + flowControlConfig.overloadedPendingSstCount()
+            );
         }
     }
 

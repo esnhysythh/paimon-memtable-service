@@ -57,7 +57,7 @@ class PMSBucketDirectorImplTest {
             new WalConfig(tempDir.resolve("wal").toString(), 256, false),
             new StorageConfig(tempDir.resolve("storage").toString(), 0, sinkedMaxCount, 0, compactThresholdMb, compactMinFiles),
             new SinkConfig(0, 0),
-            new FlowControlConfig(0, 0),
+            new FlowControlConfig(Integer.MAX_VALUE, Integer.MAX_VALUE),
             new PaimonConfig("dummy", null)
         );
     }
@@ -68,6 +68,20 @@ class PMSBucketDirectorImplTest {
 
     private PMSBucketDirectorImpl newDirector(PMSConfig config, SinkManager sinkManager) {
         return new PMSBucketDirectorImpl(config, storage -> sinkManager);
+    }
+
+    private static PMSConfig withFlowControl(
+            PMSConfig config,
+            int overloadedImmutableCount,
+            int overloadedPendingSstCount) {
+        return new PMSConfig(
+            config.memtable(),
+            config.wal(),
+            config.storage(),
+            config.sink(),
+            new FlowControlConfig(overloadedImmutableCount, overloadedPendingSstCount),
+            config.paimon()
+        );
     }
 
     // ── Write path ──
@@ -209,6 +223,64 @@ class PMSBucketDirectorImplTest {
 
             assertEquals(0L, dir.stateSnapshot().lastAssignedSequenceId());
             assertFalse(dir.get("k1".getBytes()).isPresent());
+        } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void writeAdmissionRejectsBeforeWalAtImmutableWatermarkAndResumesAfterFlush() throws IOException {
+        PMSConfig cfg = withFlowControl(config(1, 256), 1, 20);
+        PMSBucketDirectorImpl dir = newDirector(cfg);
+        dir.init();
+        try {
+            dir.put("accepted-before-flush".getBytes(), "v1".getBytes());
+            assertEquals(1, dir.stateSnapshot().immutableMemTableCount());
+
+            assertThrows(
+                PmsWriteOverloadedException.class,
+                () -> dir.put("rejected".getBytes(), "v2".getBytes())
+            );
+            assertEquals(1, dir.stateSnapshot().lastAssignedSequenceId());
+            assertTrue(dir.get("rejected".getBytes()).isEmpty());
+
+            assertTrue(dir.flushImmutableMemTable().progressed());
+            dir.put("accepted-after-flush".getBytes(), "v3".getBytes());
+            assertEquals(2, dir.stateSnapshot().lastAssignedSequenceId());
+        } finally {
+            dir.close();
+        }
+
+        PMSBucketDirectorImpl recovered = newDirector(cfg);
+        recovered.init();
+        try {
+            assertArrayEquals("v1".getBytes(), recovered.get("accepted-before-flush".getBytes()).orElseThrow());
+            assertTrue(recovered.get("rejected".getBytes()).isEmpty());
+            assertArrayEquals("v3".getBytes(), recovered.get("accepted-after-flush".getBytes()).orElseThrow());
+        } finally {
+            recovered.close();
+        }
+    }
+
+    @Test
+    void writeAdmissionRejectsBeforeWalAtNewSstWatermarkAndResumesAfterSink() throws IOException {
+        PMSConfig cfg = withFlowControl(config(1, 256), 4, 1);
+        PMSBucketDirectorImpl dir = newDirector(cfg);
+        dir.init();
+        try {
+            dir.put("accepted-before-sink".getBytes(), "v1".getBytes());
+            assertTrue(dir.flushImmutableMemTable().progressed());
+            assertEquals(1, dir.stateSnapshot().newSSTCount());
+
+            assertThrows(
+                PmsWriteOverloadedException.class,
+                () -> dir.put("rejected".getBytes(), "v2".getBytes())
+            );
+            assertEquals(1, dir.stateSnapshot().lastAssignedSequenceId());
+
+            assertTrue(dir.sinkToPaimon(allAvailableSinkSelection()).progressed());
+            dir.put("accepted-after-sink".getBytes(), "v3".getBytes());
+            assertEquals(2, dir.stateSnapshot().lastAssignedSequenceId());
         } finally {
             dir.close();
         }

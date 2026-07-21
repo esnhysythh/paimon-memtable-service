@@ -77,7 +77,8 @@ HTTP server、scheduler 和 table service；该批结果按 unknown outcome 处�
 
 **流控集成**：server 写入口在进入 core 前读取 `BucketStateSnapshot`。immutable MemTable
 或 newSST 达到配置水位时返回 `OVERLOADED`，请求不会进入 WAL。详见
-[pms-core.md](pms-core.md) § 4。
+[pms-core.md](pms-core.md) § 4。为覆盖已经通过该快速检查并在 core 排队的并发请求，core write leader
+还会在 WAL append 前复查相同水位；core overload 由 runtime 映射为同一个 `OVERLOADED`。
 
 **body 限制**：即使请求未携带 `Content-Length`，server 也在读取过程中执行
 `maxRequestBodyBytes`；成功 binary response 在发送前执行 `maxResponseBodyBytes`。
@@ -194,7 +195,7 @@ class ConfigManager {
 | `pms.sink.interval_ms` | 30000 | `sinkIntervalMs` |
 | `pms.sink.max_pending_ssts` | 8 | `sinkMaxPendingSsts` |
 | `pms.flowcontrol.overloaded_immutable_count` | 4 | `flowcontrolOverloadedImmutableCount` |
-| `pms.flowcontrol.overloaded_pending_sst_count` | 16 | `flowcontrolOverloadedPendingSstCount` |
+| `pms.flowcontrol.overloaded_pending_sst_count` | 20 | `flowcontrolOverloadedPendingSstCount` |
 | `pms.paimon.table_path` | - | `paimonTablePath` |
 | `pms.paimon.warehouse` | - | `paimonWarehouse` |
 | `pms.paimon.cache_enabled` | true | `PaimonConfig.cacheEnabled`，透传为 Paimon `cache-enabled` |

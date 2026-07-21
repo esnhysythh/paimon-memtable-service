@@ -27,7 +27,7 @@ record StorageConfig(String dir, long sinkedMaxSizeMb, int sinkedMaxCount,
                      long localSstMaxRows, int compactThresholdMb, int compactMinFiles) { ... }
 record SinkConfig(int intervalMs, int maxPendingSsts) { ... }  // 默认 30000 / 8
 record FlowControlConfig(int overloadedImmutableCount,
-                         int overloadedPendingSstCount) { ... }  // 默认 4 / 16
+                         int overloadedPendingSstCount) { ... }  // 默认 4 / 20
 record PaimonConfig(
     String tablePath,
     String warehouse,
@@ -68,7 +68,7 @@ record PMSConfig(
 | `pms.sink.interval_ms` | SinkConfig | intervalMs | 30000 |
 | `pms.sink.max_pending_ssts` | SinkConfig | maxPendingSsts | 8 |
 | `pms.flowcontrol.overloaded_immutable_count` | FlowControlConfig | overloadedImmutableCount | 4 |
-| `pms.flowcontrol.overloaded_pending_sst_count` | FlowControlConfig | overloadedPendingSstCount | 16 |
+| `pms.flowcontrol.overloaded_pending_sst_count` | FlowControlConfig | overloadedPendingSstCount | 20 |
 | `pms.paimon.table_path` | PaimonConfig | tablePath | 必填 |
 | `pms.paimon.warehouse` | PaimonConfig | warehouse | — |
 | `pms.paimon.cache_enabled` | PaimonConfig | cacheEnabled | true |
@@ -390,7 +390,7 @@ Write Request ──│─►│  NORMAL    │  │ OVERLOADED │  │
 | 维度 | 阈值 | 默认值 |
 |------|------|--------|
 | Immutable MemTable 数量 | >= `PMSConfig.flowcontrolOverloadedImmutableCount` | 4 |
-| 待 Sink 的 newSST 数量 | >= `PMSConfig.flowcontrolOverloadedPendingSstCount` | 16 |
+| 待 Sink 的 newSST 数量 | >= `PMSConfig.flowcontrolOverloadedPendingSstCount` | 20 |
 
 **响应策略**：
 - **NORMAL**：正常接受写入，RPC 返回 `OK`。
@@ -399,21 +399,27 @@ Write Request ──│─►│  NORMAL    │  │ OVERLOADED │  │
 ### 4.2 实现
 
 `pms-core` 通过 `BucketStateSnapshot` 暴露水位所需状态，保持 byte-oriented 存储边界；
-`pms-server` 在所有写入口进入 core 前读取 snapshot 并执行 admission：
+`pms-server` 在所有写入口进入 core 前读取 snapshot 并执行快速 admission：
 
 - `immutableMemTableCount >= overloadedImmutableCount` 时拒绝。
 - `newSSTCount >= overloadedPendingSstCount` 时拒绝。
-- 被拒绝的请求不进入 WAL，binary API 返回 `OVERLOADED`，因此 client 可以安全重试。
+- binary API 返回 `OVERLOADED`，因此 client 可以安全重试。
 
-该判断是 admission 时刻的轻量快照，不承诺多个并发请求之间的严格配额预留；其目标是阻止
-持续积压，而不是提供精确的全局内存配额。
+为覆盖多个并发请求已经通过 server 快照检查、随后在 core 排队的窗口，写 leader 在现有
+`writeMutex` 内、每个内部合并 batch 写 WAL 前再次以 O(1) 方式读取 immutable / NEW count。
+如果此时已经达到水位，core 抛出 `PmsWriteOverloadedException`，整个 batch 不进入 WAL、
+不分配 sequence，并由 server 映射为同一个 `OVERLOADED`。
+
+两次检查都不做容量预留，也不承诺 count 绝不瞬时越界；一个已经接受的完整 batch 可以触发
+Freeze 并到达水位，后台 Flush 也可以并发发布新的 NEW run。该机制的目标是及时停止继续扩大
+积压，而不是提供精确的全局内存配额或给写入热路径增加 SST maintenance 锁。
 
 ### 4.3 与后台任务的联动
 
 | 水位 | 后台任务策略 |
 |------|-------------|
-| NORMAL | Flush/Sink 按配置间隔正常触发 |
-| OVERLOADED | Flush/Sink 立即触发，加速消化积压 |
+| NORMAL | Flush / Maintenance worker 按各自周期正常调和 |
+| OVERLOADED | 拒绝新写入；两个 worker 继续按周期和既有 signal 消化积压，不在写线程同步维护 |
 
 ### 4.4 后续扩展方向
 

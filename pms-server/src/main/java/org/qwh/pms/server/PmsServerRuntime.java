@@ -6,6 +6,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import org.qwh.pms.core.bucket.PmsFatalWriteException;
+import org.qwh.pms.core.bucket.PmsWriteOverloadedException;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
 import org.qwh.pms.protocol.api.RawLookupResult;
@@ -108,17 +109,29 @@ public final class PmsServerRuntime implements AutoCloseable {
 
     public void write(Map<String, Object> rowValues) {
         requireAcceptingWrites();
-        service().write(rowValues);
+        try {
+            service().write(rowValues);
+        } catch (PmsWriteOverloadedException e) {
+            throw overloaded(e);
+        }
     }
 
     public void delete(Map<String, Object> primaryKeyValues) {
         requireAcceptingWrites();
-        service().delete(primaryKeyValues);
+        try {
+            service().delete(primaryKeyValues);
+        } catch (PmsWriteOverloadedException e) {
+            throw overloaded(e);
+        }
     }
 
     public void writeRawBatch(List<RawKvEntry> entries) {
         requireAcceptingWrites();
-        service().writeRawBatch(entries);
+        try {
+            service().writeRawBatch(entries);
+        } catch (PmsWriteOverloadedException e) {
+            throw overloaded(e);
+        }
     }
 
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
@@ -239,6 +252,10 @@ public final class PmsServerRuntime implements AutoCloseable {
         if (service == null || status != PmsRuntimeStatus.RUNNING) {
             throw new PmsServiceUnavailableException("PMS server is not running, status=" + status);
         }
+    }
+
+    private static PmsOverloadedException overloaded(PmsWriteOverloadedException cause) {
+        return new PmsOverloadedException(cause.getMessage(), cause);
     }
 
     private PmsServerScheduler scheduler() {
