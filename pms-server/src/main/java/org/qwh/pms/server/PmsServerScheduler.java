@@ -1,14 +1,13 @@
 package org.qwh.pms.server;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.TreeMap;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
@@ -16,7 +15,6 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.LocalRunSnapshot;
@@ -61,16 +59,13 @@ public final class PmsServerScheduler implements AutoCloseable {
 
     private final Operations operations;
     private final PmsSchedulerConfig config;
-    private final SchedulerTimeSource timeSource;
+    private final Clock clock;
     private final ScheduledExecutorService flushExecutor;
     private final ScheduledExecutorService maintenanceExecutor;
     private final AtomicBoolean flushQueuedOrRunning = new AtomicBoolean();
     private final AtomicBoolean maintenanceQueuedOrRunning = new AtomicBoolean();
     private final AtomicBoolean flushRerunRequested = new AtomicBoolean();
     private final AtomicBoolean maintenanceRerunRequested = new AtomicBoolean();
-    private final ConcurrentHashMap<String, AtomicLong> actionSuccessCounts = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, AtomicLong> actionNoopCounts = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, AtomicLong> actionFailureCounts = new ConcurrentHashMap<>();
 
     private volatile boolean running;
     private volatile boolean closed;
@@ -79,31 +74,15 @@ public final class PmsServerScheduler implements AutoCloseable {
     // The only cross-operation plan state. Zero means no visibility fence is active.
     // 唯一跨 Operation 保留的计划状态; 零表示当前没有生效的可见性 fence.
     private volatile long pendingPaimonFenceSequenceId;
-    private volatile long flushRetryNotBeforeMillis;
-    private volatile long maintenanceRetryNotBeforeMillis;
-    private volatile String lastFlushStartedAt;
-    private volatile String lastFlushCompletedAt;
-    private volatile long lastFlushDurationMs;
-    private volatile long flushRunCount;
-    private volatile String lastMaintenanceStartedAt;
-    private volatile String lastMaintenanceCompletedAt;
-    private volatile long lastMaintenanceDurationMs;
-    private volatile long maintenanceRunCount;
-    private volatile String lastMaintenanceAction;
-    private volatile String lastMaintenanceReason;
-    private volatile String lastErrorAt;
-    private volatile String lastErrorWorker;
-    private volatile String lastErrorAction;
-    private volatile String lastErrorMessage;
 
     public PmsServerScheduler(PmsTableService service, PmsSchedulerConfig config) {
-        this(requireService(service), config, SchedulerTimeSource.SYSTEM);
+        this(requireService(service), config, Clock.systemUTC());
     }
 
-    PmsServerScheduler(Operations operations, PmsSchedulerConfig config, SchedulerTimeSource timeSource) {
+    PmsServerScheduler(Operations operations, PmsSchedulerConfig config, Clock clock) {
         this.operations = Objects.requireNonNull(operations, "operations must not be null");
         this.config = config == null ? PmsSchedulerConfig.defaults() : config;
-        this.timeSource = Objects.requireNonNull(timeSource, "timeSource must not be null");
+        this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.flushExecutor = newWorker("flush");
         this.maintenanceExecutor = newWorker("maintenance");
     }
@@ -133,10 +112,6 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
         ensureOpen();
         running = true;
-        if (!config.enabled()) {
-            LOG.info("PMS server automatic reconciliation disabled; manual fence requests remain available");
-            return;
-        }
         flushExecutor.scheduleWithFixedDelay(
             this::signalFlush,
             0,
@@ -180,66 +155,19 @@ public final class PmsServerScheduler implements AutoCloseable {
         });
     }
 
-    /**
-     * Runs both reconciliation paths synchronously for management and deterministic tests.
-     * 为管理操作和确定性测试同步执行两条调和路径.
-     *
-     * <p>The first maintenance pass may establish a visibility fence, Flush materializes that
-     * fence, and the second maintenance pass can then Sink it. The ordering is therefore part of
-     * the method's behavior rather than three interchangeable wakeups.
-     *
-     * <p>第一次 Maintenance 可能建立可见性 fence, 随后 Flush 将该 fence 对应的数据物化为 SST, 
-     * 第二次 Maintenance 才能继续完成 Sink.因此, 这一执行顺序属于方法语义的一部分, 不能将其
-     * 视为三次可以任意互换的唤醒.
-     */
-    public void reconcileNow() {
-        ensureOpen();
-        callMaintenance(() -> {
-            reconcileMaintenance(false);
-            return null;
-        });
-        callFlush(() -> {
-            reconcileFlush("RECONCILE_NOW", false);
-            return null;
-        });
-        callMaintenance(() -> {
-            reconcileMaintenance(false);
-            return null;
-        });
-    }
-
     public Map<String, Object> state() {
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("enabled", config.enabled());
         result.put("running", running);
         result.put("flushReconcileIntervalMs", config.flushReconcileIntervalMs());
         result.put("maintenanceReconcileIntervalMs", config.maintenanceReconcileIntervalMs());
-        result.put("failureRetryDelayMs", config.failureRetryDelayMs());
         result.put("visibilityMaxDelayMs", config.visibilityMaxDelayMs());
         result.put("newSstMaxCount", config.newSstMaxCount());
         result.put("sinkedSstMaxCount", config.sinkedSstMaxCount());
+        result.put("sinkBatchMaxBytes", config.sinkBatchMaxBytes());
+        result.put("compactMaxInputBytes", config.compactMaxInputBytes());
         result.put("pendingPaimonFenceSequenceId", pendingPaimonFenceSequenceId);
         result.put("flushRunning", flushRunning);
-        result.put("lastFlushStartedAt", lastFlushStartedAt);
-        result.put("lastFlushCompletedAt", lastFlushCompletedAt);
-        result.put("lastFlushDurationMs", lastFlushDurationMs);
-        result.put("flushRunCount", flushRunCount);
-        result.put("flushRetryNotBeforeMillis", flushRetryNotBeforeMillis);
         result.put("maintenanceRunning", maintenanceRunning);
-        result.put("lastMaintenanceStartedAt", lastMaintenanceStartedAt);
-        result.put("lastMaintenanceCompletedAt", lastMaintenanceCompletedAt);
-        result.put("lastMaintenanceDurationMs", lastMaintenanceDurationMs);
-        result.put("maintenanceRunCount", maintenanceRunCount);
-        result.put("maintenanceRetryNotBeforeMillis", maintenanceRetryNotBeforeMillis);
-        result.put("lastMaintenanceAction", lastMaintenanceAction);
-        result.put("lastMaintenanceReason", lastMaintenanceReason);
-        result.put("actionSuccessCounts", countSnapshot(actionSuccessCounts));
-        result.put("actionNoopCounts", countSnapshot(actionNoopCounts));
-        result.put("actionFailureCounts", countSnapshot(actionFailureCounts));
-        result.put("lastErrorAt", lastErrorAt);
-        result.put("lastErrorWorker", lastErrorWorker);
-        result.put("lastErrorAction", lastErrorAction);
-        result.put("lastErrorMessage", lastErrorMessage);
         return result;
     }
 
@@ -304,56 +232,36 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private void runFlushSafely() {
-        if (!running || closed || nowMillis() < flushRetryNotBeforeMillis) {
+        if (!running || closed) {
             return;
         }
-        long startedNanos = timeSource.monotonicNanos();
         flushRunning = true;
-        lastFlushStartedAt = now();
-        flushRunCount++;
         try {
-            reconcileFlush("IMMUTABLE_BACKLOG", true);
-            flushRetryNotBeforeMillis = 0;
+            reconcileFlush("IMMUTABLE_BACKLOG");
         } catch (RuntimeException e) {
-            recordWorkerFailure("flush", "FLUSH", e);
-            flushRetryNotBeforeMillis = retryNotBefore();
-            scheduleFlushRetry();
+            LOG.error("PMS Flush worker reconciliation failed; retrying on the next worker trigger", e);
         } finally {
-            lastFlushDurationMs = elapsedMillis(startedNanos);
-            lastFlushCompletedAt = now();
             flushRunning = false;
         }
     }
 
     private void runMaintenanceSafely() {
-        if (!running || closed || nowMillis() < maintenanceRetryNotBeforeMillis) {
+        if (!running || closed) {
             return;
         }
-        long startedNanos = timeSource.monotonicNanos();
         maintenanceRunning = true;
-        lastMaintenanceStartedAt = now();
-        maintenanceRunCount++;
         try {
-            reconcileMaintenance(true);
-            maintenanceRetryNotBeforeMillis = 0;
+            reconcileMaintenance();
         } catch (RuntimeException e) {
-            recordWorkerFailure("maintenance", lastMaintenanceAction, e);
-            maintenanceRetryNotBeforeMillis = retryNotBefore();
-            scheduleMaintenanceRetry();
+            LOG.error("PMS maintenance worker reconciliation failed; retrying on the next worker trigger", e);
         } finally {
-            lastMaintenanceDurationMs = elapsedMillis(startedNanos);
-            lastMaintenanceCompletedAt = now();
             maintenanceRunning = false;
         }
     }
 
-    private void reconcileFlush(String reason, boolean background) {
+    private void reconcileFlush(String reason) {
         for (int actions = 0; actions < MAX_ACTIONS_PER_RUN; actions++) {
-            // A background slice yields promptly once shutdown starts. Deterministic management
-            // reconciliation passes background=false but retain the same per-pass action budget.
-            // shutdown 开始后, 后台执行片段应尽快让出; 确定性管理调和传入 background=false,
-            // 但仍服从相同的单轮动作预算.
-            if (background && !running) {
+            if (!running) {
                 return;
             }
             BucketStateSnapshot state = operations.stateSnapshot();
@@ -368,7 +276,7 @@ public final class PmsServerScheduler implements AutoCloseable {
                 signalMaintenance();
             }
         }
-        if (background && running && operations.stateSnapshot().immutableMemTableCount() > 0) {
+        if (running && operations.stateSnapshot().immutableMemTableCount() > 0) {
             signalFlush();
         }
     }
@@ -384,13 +292,13 @@ public final class PmsServerScheduler implements AutoCloseable {
         );
     }
 
-    private void reconcileMaintenance(boolean background) {
+    private void reconcileMaintenance() {
         // This is a priority reconciliation loop, not a precomputed plan. Every progressed action
         // invalidates the old snapshot, so the loop rereads state and starts again at priority 1.
         // 这是按优先级执行的调和循环, 而不是预先计算好的计划. 每个取得进展的动作都会使旧快照
         // 失效, 因此循环必须重新读取状态, 并从最高优先级重新判断.
         for (int actions = 0; actions < MAX_ACTIONS_PER_RUN; actions++) {
-            if (background && !running) {
+            if (!running) {
                 return;
             }
             BucketStateSnapshot state = operations.stateSnapshot();
@@ -423,9 +331,9 @@ public final class PmsServerScheduler implements AutoCloseable {
                     signalFlush();
                     return;
                 }
-                // One Sink call is deliberately bounded by batch count/bytes. Keep the same fence
+                // One Sink call is deliberately bounded by input bytes. Keep the same fence
                 // across calls until lastPersistedSequenceId reaches it.
-                // 单次 Sink 调用有意受到 batch 数量和字节数限制; 在 lastPersistedSequenceId 达到
+                // 单次 Sink 调用有意受到输入字节数限制; 在 lastPersistedSequenceId 达到
                 // fence 之前, 多次调用必须始终推进同一个 fence.
                 SinkOperationResult result = executeSink(state, fence, "PAIMON_VISIBILITY_FENCE");
                 if (!result.progressed()) {
@@ -490,14 +398,12 @@ public final class PmsServerScheduler implements AutoCloseable {
             }
             return;
         }
-        if (background && running) {
+        if (running) {
             signalMaintenance();
         }
     }
 
     private FreezeResult executeFreeze(String reason, BucketStateSnapshot state) {
-        lastMaintenanceAction = "FREEZE";
-        lastMaintenanceReason = reason;
         return executeAction(
             "maintenance",
             "FREEZE",
@@ -509,8 +415,6 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private SinkOperationResult executePreparedRetry(BucketStateSnapshot state) {
-        lastMaintenanceAction = "COMMIT_PREPARED_SINK";
-        lastMaintenanceReason = "PREPARED_RETRY";
         return executeAction(
             "maintenance",
             "COMMIT_PREPARED_SINK",
@@ -528,18 +432,14 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
         SinkSelection selection = new SinkSelection(
             targetSequenceId,
-            config.sinkBatchMaxSsts(),
             config.sinkBatchMaxBytes()
         );
-        lastMaintenanceAction = "SINK";
-        lastMaintenanceReason = reason;
         return executeAction(
             "maintenance",
             "SINK",
             reason,
             "targetSequenceId=" + targetSequenceId
                 + " newSstCount=" + state.newSSTCount()
-                + " batchMaxSsts=" + config.sinkBatchMaxSsts()
                 + " batchMaxBytes=" + config.sinkBatchMaxBytes(),
             () -> operations.sinkToPaimon(selection),
             SinkOperationResult::progressed
@@ -550,11 +450,10 @@ public final class PmsServerScheduler implements AutoCloseable {
             BucketStateSnapshot state,
             CompactionSelection selection,
             String reason) {
-        lastMaintenanceAction = "COMPACT_" + selection.state().name();
-        lastMaintenanceReason = reason;
+        String action = "COMPACT_" + selection.state().name();
         return executeAction(
             "maintenance",
-            lastMaintenanceAction,
+            action,
             reason,
             "runIds=" + selection.inputRunIds()
                 + " newSstCount=" + state.newSSTCount()
@@ -565,8 +464,6 @@ public final class PmsServerScheduler implements AutoCloseable {
     }
 
     private EvictionResult executeEviction(BucketStateSnapshot state, String reason) {
-        lastMaintenanceAction = "EVICT_OLDEST_SINKED";
-        lastMaintenanceReason = reason;
         return executeAction(
             "maintenance",
             "EVICT_OLDEST_SINKED",
@@ -657,7 +554,6 @@ public final class PmsServerScheduler implements AutoCloseable {
         try {
             T result = operation.get();
             boolean madeProgress = progressed.test(result);
-            increment(madeProgress ? actionSuccessCounts : actionNoopCounts, action);
             LOG.info(
                 "{} phase={} worker={} action={} reason={} {}",
                 ACTION_LOG_MARKER,
@@ -669,11 +565,6 @@ public final class PmsServerScheduler implements AutoCloseable {
             );
             return result;
         } catch (RuntimeException e) {
-            increment(actionFailureCounts, action);
-            lastErrorAt = now();
-            lastErrorWorker = worker;
-            lastErrorAction = action;
-            lastErrorMessage = e.getMessage();
             LOG.error(
                 "{} phase=failed worker={} action={} reason={} {}",
                 ACTION_LOG_MARKER,
@@ -685,37 +576,6 @@ public final class PmsServerScheduler implements AutoCloseable {
             );
             throw e;
         }
-    }
-
-    private void recordWorkerFailure(String worker, String action, RuntimeException failure) {
-        lastErrorAt = now();
-        lastErrorWorker = worker;
-        lastErrorAction = action;
-        lastErrorMessage = failure.getMessage();
-    }
-
-    private long retryNotBefore() {
-        return Math.addExact(nowMillis(), config.failureRetryDelayMs());
-    }
-
-    private void scheduleFlushRetry() {
-        if (running && !closed) {
-            flushExecutor.schedule(this::signalFlush, config.failureRetryDelayMs(), TimeUnit.MILLISECONDS);
-        }
-    }
-
-    private void scheduleMaintenanceRetry() {
-        if (running && !closed) {
-            maintenanceExecutor.schedule(
-                this::signalMaintenance,
-                config.failureRetryDelayMs(),
-                TimeUnit.MILLISECONDS
-            );
-        }
-    }
-
-    private <T> T callFlush(Callable<T> action) {
-        return await(flushExecutor.submit(action));
     }
 
     private <T> T callMaintenance(Callable<T> action) {
@@ -738,16 +598,6 @@ public final class PmsServerScheduler implements AutoCloseable {
             }
             throw new IllegalStateException("PMS scheduler operation failed", cause);
         }
-    }
-
-    private static void increment(ConcurrentHashMap<String, AtomicLong> counts, String action) {
-        counts.computeIfAbsent(action, ignored -> new AtomicLong()).incrementAndGet();
-    }
-
-    private static Map<String, Long> countSnapshot(ConcurrentHashMap<String, AtomicLong> counts) {
-        Map<String, Long> snapshot = new TreeMap<>();
-        counts.forEach((action, count) -> snapshot.put(action, count.get()));
-        return snapshot;
     }
 
     private static void shutdown(ScheduledExecutorService executor, String role) {
@@ -776,16 +626,8 @@ public final class PmsServerScheduler implements AutoCloseable {
         }
     }
 
-    private String now() {
-        return timeSource.wallClockNow().toString();
-    }
-
     private long nowMillis() {
-        return timeSource.wallClockNow().toEpochMilli();
-    }
-
-    private long elapsedMillis(long startedNanos) {
-        return TimeUnit.NANOSECONDS.toMillis(timeSource.monotonicNanos() - startedNanos);
+        return clock.millis();
     }
 
     interface Operations {

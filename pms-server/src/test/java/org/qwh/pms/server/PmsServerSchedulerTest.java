@@ -5,8 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -14,7 +16,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
@@ -35,7 +36,7 @@ class PmsServerSchedulerTest {
 
     @Test
     void configKeepsFlushAndMaintenanceIntervalsIndependent() {
-        PmsSchedulerConfig config = config(true, 1_000, 30_000, 600_000, 10, 10, 4, 1_024, 1_024);
+        PmsSchedulerConfig config = config(1_000, 30_000, 600_000, 10, 10, 1_024, 1_024);
 
         assertEquals(1_000, config.flushReconcileIntervalMs());
         assertEquals(30_000, config.maintenanceReconcileIntervalMs());
@@ -43,15 +44,14 @@ class PmsServerSchedulerTest {
         assertEquals(1_024L * 1024 * 1024, config.compactMaxInputBytes());
         assertThrows(
             IllegalArgumentException.class,
-            () -> config(true, 0, 30_000, 600_000, 10, 10, 4, 1_024, 1_024)
+            () -> config(0, 30_000, 600_000, 10, 10, 1_024, 1_024)
         );
     }
 
     @Test
-    void productionDefaultsEnableTheTwoCadences() {
+    void productionDefaultsDefineTheTwoCadences() {
         PmsSchedulerConfig config = PmsSchedulerConfig.defaults();
 
-        assertTrue(config.enabled());
         assertEquals(1_000, config.flushReconcileIntervalMs());
         assertEquals(30_000, config.maintenanceReconcileIntervalMs());
         assertEquals(600_000, config.visibilityMaxDelayMs());
@@ -64,8 +64,8 @@ class PmsServerSchedulerTest {
         operations.immutableCount = 3;
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(true, 1, 60_000, 600_000, 10, 10, 4, 1_024, 1_024),
-            systemLikeTimeSource()
+            config(1, 60_000, 600_000, 10, 10, 1_024, 1_024),
+            Clock.systemUTC()
         );
         try {
             scheduler.start();
@@ -76,23 +76,24 @@ class PmsServerSchedulerTest {
 
         assertEquals(3, operations.flushCalls);
         assertEquals(0, operations.freezeCalls);
-        assertTrue((Long) scheduler.state().get("flushRunCount") > 0);
+        assertEquals(false, scheduler.state().get("running"));
     }
 
     @Test
-    void visibilityFenceFreezesFlushesAndSinksThroughOneController() {
+    void visibilityFenceFreezesFlushesAndSinksThroughOneController() throws Exception {
         MutableOperations operations = new MutableOperations();
         operations.currentEntries = 1;
         operations.lastAssignedSequenceId = 5;
         operations.currentOldestWriteAtMillis = 1_000;
-        SchedulerTimeSource timeSource = fixedTimeSource(Instant.ofEpochMilli(2_000));
+        Clock timeSource = fixedTimeSource(Instant.ofEpochMilli(2_000));
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 1_000, 30_000, 500, 10, 10, 1, 1_024, 1_024),
+            config(1, 1, 500, 10, 10, 1_024, 1_024),
             timeSource
         );
         try {
-            scheduler.reconcileNow();
+            scheduler.start();
+            waitUntil(() -> operations.lastPersistedSequenceId >= 5);
         } finally {
             scheduler.close();
         }
@@ -106,20 +107,21 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void visibilityFenceAdvancesThroughMultipleBoundedSinkBatches() {
+    void visibilityFenceAdvancesThroughMultipleBoundedSinkBatches() throws Exception {
         MutableOperations operations = new MutableOperations();
-        operations.addRun(SSTState.NEW, 1, 100);
-        operations.addRun(SSTState.NEW, 2, 100);
-        operations.addRun(SSTState.NEW, 3, 100);
+        operations.addRun(SSTState.NEW, 1, 700L * 1024);
+        operations.addRun(SSTState.NEW, 2, 700L * 1024);
+        operations.addRun(SSTState.NEW, 3, 700L * 1024);
         operations.lastFlushedSequenceId = 3;
         operations.recoveredUnpersistedData = true;
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 1_000, 30_000, 600_000, 10, 10, 1, 1_024, 1_024),
+            config(1, 1, 600_000, 10, 10, 1, 1_024),
             fixedTimeSource(Instant.ofEpochMilli(10_000))
         );
         try {
-            scheduler.reconcileNow();
+            scheduler.start();
+            waitUntil(() -> operations.lastPersistedSequenceId >= 3);
         } finally {
             scheduler.close();
         }
@@ -132,7 +134,7 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void preparedSinkRetryRunsBeforeOrdinaryMaintenance() {
+    void preparedSinkRetryRunsBeforeOrdinaryMaintenance() throws Exception {
         MutableOperations operations = new MutableOperations();
         LocalRunSnapshot preparedRun = operations.addRun(SSTState.NEW, 1, 100);
         operations.lastFlushedSequenceId = preparedRun.maxSequenceId();
@@ -145,11 +147,12 @@ class PmsServerSchedulerTest {
         );
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 1_000, 30_000, 600_000, 10, 10, 4, 1_024, 1_024),
+            config(1, 1, 600_000, 10, 10, 1_024, 1_024),
             fixedTimeSource(Instant.ofEpochMilli(10_000))
         );
         try {
-            scheduler.reconcileNow();
+            scheduler.start();
+            waitUntil(() -> operations.sinkFlight.status() == SinkFlightSnapshot.Status.IDLE);
         } finally {
             scheduler.close();
         }
@@ -169,8 +172,8 @@ class PmsServerSchedulerTest {
         operations.blockNextFlush();
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 60_000, 60_000, 600_000, 10, 10, 1, 1_024, 1_024),
-            systemLikeTimeSource()
+            config(60_000, 60_000, 600_000, 10, 10, 1_024, 1_024),
+            Clock.systemUTC()
         );
         try {
             scheduler.start();
@@ -193,26 +196,23 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void closeDoesNotWaitForLongDelayedRetry() throws Exception {
+    void closeDoesNotWaitForNextPeriodicRetry() throws Exception {
         MutableOperations operations = new MutableOperations();
         operations.addImmutable(1);
         operations.flushFailure = new RuntimeException("injected retryable Flush failure");
         PmsSchedulerConfig config = new PmsSchedulerConfig(
-            true,
-            1,
             60_000,
             60_000,
             600_000,
             10,
             10,
-            4,
             1_024,
             1_024
         );
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
             config,
-            systemLikeTimeSource()
+            Clock.systemUTC()
         );
         try {
             scheduler.start();
@@ -230,8 +230,8 @@ class PmsServerSchedulerTest {
         operations.lastAssignedSequenceId = 3;
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(true, 60_000, 60_000, 600_000, 10, 10, 1, 1_024, 1_024),
-            systemLikeTimeSource()
+            config(60_000, 60_000, 600_000, 10, 10, 1_024, 1_024),
+            Clock.systemUTC()
         );
         try {
             scheduler.start();
@@ -253,18 +253,19 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void newCountCompactsOneContinuousGroupBeforeConsideringSink() {
+    void newCountCompactsOneContinuousGroupBeforeConsideringSink() throws Exception {
         MutableOperations operations = new MutableOperations();
         operations.addRun(SSTState.NEW, 1, 100);
         operations.addRun(SSTState.NEW, 2, 100);
         operations.addRun(SSTState.NEW, 3, 100);
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 1_000, 30_000, 600_000, 2, 10, 4, 1_024, 1_024),
+            config(1, 1, 600_000, 2, 10, 1_024, 1_024),
             fixedTimeSource(Instant.ofEpochMilli(10_000))
         );
         try {
-            scheduler.reconcileNow();
+            scheduler.start();
+            waitUntil(() -> operations.count(SSTState.NEW) == 1);
         } finally {
             scheduler.close();
         }
@@ -275,17 +276,18 @@ class PmsServerSchedulerTest {
     }
 
     @Test
-    void sinkedCountEvictsOldestWhenNoPairFitsCompactLimit() {
+    void sinkedCountEvictsOldestWhenNoPairFitsCompactLimit() throws Exception {
         MutableOperations operations = new MutableOperations();
         operations.addRun(SSTState.SINKED, 1, 700L * 1024 * 1024);
         operations.addRun(SSTState.SINKED, 2, 700L * 1024 * 1024);
         PmsServerScheduler scheduler = new PmsServerScheduler(
             operations,
-            config(false, 1_000, 30_000, 600_000, 10, 1, 4, 1_024, 1_024),
+            config(1, 1, 600_000, 10, 1, 1_024, 1_024),
             fixedTimeSource(Instant.ofEpochMilli(10_000))
         );
         try {
-            scheduler.reconcileNow();
+            scheduler.start();
+            waitUntil(() -> operations.count(SSTState.SINKED) == 1);
         } finally {
             scheduler.close();
         }
@@ -301,56 +303,26 @@ class PmsServerSchedulerTest {
     }
 
     private static PmsSchedulerConfig config(
-            boolean enabled,
             int flushIntervalMs,
             int maintenanceIntervalMs,
             long visibilityMaxDelayMs,
             int newMaxCount,
             int sinkedMaxCount,
-            int sinkBatchMaxSsts,
             int sinkBatchMaxBytesMb,
             int compactMaxInputSizeMb) {
         return new PmsSchedulerConfig(
-            enabled,
             flushIntervalMs,
             maintenanceIntervalMs,
-            5_000,
             visibilityMaxDelayMs,
             newMaxCount,
             sinkedMaxCount,
-            sinkBatchMaxSsts,
             sinkBatchMaxBytesMb,
             compactMaxInputSizeMb
         );
     }
 
-    private static SchedulerTimeSource systemLikeTimeSource() {
-        return new SchedulerTimeSource() {
-            @Override
-            public Instant wallClockNow() {
-                return Instant.now();
-            }
-
-            @Override
-            public long monotonicNanos() {
-                return System.nanoTime();
-            }
-        };
-    }
-
-    private static SchedulerTimeSource fixedTimeSource(Instant instant) {
-        AtomicLong monotonicNanos = new AtomicLong();
-        return new SchedulerTimeSource() {
-            @Override
-            public Instant wallClockNow() {
-                return instant;
-            }
-
-            @Override
-            public long monotonicNanos() {
-                return monotonicNanos.getAndAdd(TimeUnit.MILLISECONDS.toNanos(1));
-            }
-        };
+    private static Clock fixedTimeSource(Instant instant) {
+        return Clock.fixed(instant, ZoneOffset.UTC);
     }
 
     private static void waitUntil(BooleanSupplier condition) throws Exception {
@@ -398,12 +370,10 @@ class PmsServerSchedulerTest {
                 currentEntries == 0 ? 0 : lastAssignedSequenceId,
                 currentEntries == 0 ? 0 : lastAssignedSequenceId,
                 currentOldestWriteAtMillis,
-                0,
                 immutableCount,
                 immutableCount * 100L,
                 immutableCount == 0 ? 0 : 1,
                 immutableCount == 0 ? 0 : lastAssignedSequenceId,
-                0,
                 0,
                 lastAssignedSequenceId,
                 lastFlushedSequenceId,
@@ -414,13 +384,11 @@ class PmsServerSchedulerTest {
                 minSequence(newRuns),
                 maxSequence(newRuns),
                 0,
-                0,
                 sinkedRuns.size(),
                 totalBytes(sinkedRuns),
                 sinkedRuns.size(),
                 minSequence(sinkedRuns),
                 maxSequence(sinkedRuns),
-                0,
                 0,
                 List.copyOf(runs),
                 sinkFlight,
@@ -486,7 +454,6 @@ class PmsServerSchedulerTest {
             long selectedBytes = 0;
             for (LocalRunSnapshot run : runs(SSTState.NEW)) {
                 if (run.maxSequenceId() > selection.targetSequenceId()
-                        || selected.size() >= selection.maxSstCount()
                         || (!selected.isEmpty() && run.fileSizeBytes() > selection.maxInputBytes() - selectedBytes)) {
                     break;
                 }
@@ -559,7 +526,6 @@ class PmsServerSchedulerTest {
                 selected.size(),
                 minSequence(selected),
                 maxSequence(selected),
-                0,
                 0
             );
             runs.add(output);
@@ -602,7 +568,6 @@ class PmsServerSchedulerTest {
                 1,
                 sequenceId,
                 sequenceId,
-                0,
                 0
             );
             runs.add(run);
@@ -654,8 +619,7 @@ class PmsServerSchedulerTest {
                 run.entryCount(),
                 run.minSequenceId(),
                 run.maxSequenceId(),
-                run.oldestWriteAtMillis(),
-                run.ageMillis()
+                run.oldestWriteAtMillis()
             );
         }
 

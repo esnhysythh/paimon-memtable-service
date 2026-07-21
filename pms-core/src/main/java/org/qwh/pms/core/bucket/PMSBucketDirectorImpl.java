@@ -387,7 +387,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 );
                 return new FlushResult(
                     OperationStatus.PROGRESSED,
-                    Optional.of(output.snapshot(nowMillis()))
+                    Optional.of(output.snapshot())
                 );
             } finally {
                 lifecycleLock.readLock().unlock();
@@ -503,7 +503,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 );
                 return new EvictionResult(
                     OperationStatus.PROGRESSED,
-                    Optional.of(evictedRun.snapshot(nowMillis()))
+                    Optional.of(evictedRun.snapshot())
                 );
             } finally {
                 lifecycleLock.readLock().unlock();
@@ -555,7 +555,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             RunStats newStats = runStats(newRunSnapshot);
             RunStats sinkedStats = runStats(sinkedRunSnapshot);
             List<LocalRunSnapshot> localRuns = visibleRuns.stream()
-                .map(run -> run.snapshot(nowMillis))
+                .map(LocalRun::snapshot)
                 .toList();
 
             return new BucketStateSnapshot(
@@ -565,13 +565,11 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 cur.minSequenceId(),
                 cur.maxSequenceId(),
                 cur.oldestWriteAtMillis(),
-                ageMillis(nowMillis, cur.oldestWriteAtMillis()),
                 immutables.size(),
                 immutableStats.totalBytes(),
                 immutableStats.minSequenceId(),
                 immutableStats.maxSequenceId(),
                 immutableStats.oldestWriteAtMillis(),
-                ageMillis(nowMillis, immutableStats.oldestWriteAtMillis()),
                 walManager.lastSequenceId(),
                 lastFlushedSequenceId,
                 lastPersistedSequenceId,
@@ -581,14 +579,12 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 newStats.minSequenceId(),
                 newStats.maxSequenceId(),
                 newStats.oldestWriteAtMillis(),
-                ageMillis(nowMillis, newStats.oldestWriteAtMillis()),
                 sinkedRunSnapshot.size(),
                 sinkedStats.totalBytes(),
                 sinkedStats.totalRows(),
                 sinkedStats.minSequenceId(),
                 sinkedStats.maxSequenceId(),
                 sinkedStats.oldestWriteAtMillis(),
-                ageMillis(nowMillis, sinkedStats.oldestWriteAtMillis()),
                 localRuns,
                 sinkFlightView,
                 recoveredUnpersistedMaxSequenceId > lastPersistedSequenceId,
@@ -792,10 +788,6 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return System.currentTimeMillis();
     }
 
-    private static long ageMillis(long nowMillis, long oldestWriteAtMillis) {
-        return oldestWriteAtMillis <= 0 ? 0 : Math.max(0, nowMillis - oldestWriteAtMillis);
-    }
-
     private SinkOperationResult completeCommittedSink(
             SinkCommitResult result,
             List<LocalRun> selectedRuns) {
@@ -815,7 +807,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
         sinkFlight = SinkFlightSnapshot.idle();
         List<LocalRunSnapshot> sinked = publishedSinkedRuns.stream()
-            .map(run -> run.snapshot(nowMillis()))
+            .map(LocalRun::snapshot)
             .toList();
         RunState published = runState;
         LOG.debug(
@@ -846,7 +838,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return new CompactionResult.Group(
             state,
             inputRunIds,
-            output.snapshot(nowMillis())
+            output.snapshot()
         );
     }
 
@@ -947,8 +939,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                         + ", targetSequenceId=" + selection.targetSequenceId()
                 );
             }
-            if (meta.maxSequenceId() > selection.targetSequenceId()
-                    || selected.size() >= selection.maxSstCount()) {
+            if (meta.maxSequenceId() > selection.targetSequenceId()) {
                 break;
             }
             if (!selected.isEmpty()

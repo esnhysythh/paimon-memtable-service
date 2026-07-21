@@ -22,7 +22,7 @@ final class LocalRun {
         return meta.oldestWriteAtMillis();
     }
 
-    LocalRunSnapshot snapshot(long nowMillis) {
+    LocalRunSnapshot snapshot() {
         return new LocalRunSnapshot(
             meta.runId(),
             meta.minFlushId(),
@@ -32,15 +32,7 @@ final class LocalRun {
             meta.entryCount(),
             meta.minSequenceId(),
             meta.maxSequenceId(),
-            meta.oldestWriteAtMillis(),
-            ageMillis(nowMillis, meta.oldestWriteAtMillis())
+            meta.oldestWriteAtMillis()
         );
-    }
-
-    private static long ageMillis(long nowMillis, long oldestWriteAtMillis) {
-        if (oldestWriteAtMillis <= 0) {
-            return 0;
-        }
-        return Math.max(0, nowMillis - oldestWriteAtMillis);
     }
 }

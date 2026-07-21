@@ -53,7 +53,7 @@ public final class ConfigManager {
             coreConfig
         );
         LOG.info(
-            "PMS server config resolved: bind={}:{}, table={}.{}, walDir={}, storageDir={}, warehouse={}, schedulerEnabled={}, lookupCacheEnabled={}, lookupCacheDir={}",
+            "PMS server config resolved: bind={}:{}, table={}.{}, walDir={}, storageDir={}, warehouse={}, lookupCacheEnabled={}, lookupCacheDir={}",
             config.host(),
             config.port(),
             config.database(),
@@ -61,7 +61,6 @@ public final class ConfigManager {
             config.coreConfig().wal().dir(),
             config.coreConfig().storage().dir(),
             config.coreConfig().paimon().warehouse(),
-            config.scheduler().enabled(),
             config.lookup().cacheEnabled(),
             config.lookup().cacheDir()
         );
@@ -70,7 +69,6 @@ public final class ConfigManager {
 
     private static PmsSchedulerConfig schedulerConfig(Properties props) {
         return new PmsSchedulerConfig(
-            getBoolean(props, "pms.server.scheduler.enabled", PmsSchedulerConfig.DEFAULT_ENABLED),
             getInt(
                 props,
                 "pms.server.scheduler.flush_reconcile_interval_ms",
@@ -81,11 +79,6 @@ public final class ConfigManager {
                 "pms.server.scheduler.maintenance_reconcile_interval_ms",
                 PmsSchedulerConfig.DEFAULT_MAINTENANCE_RECONCILE_INTERVAL_MS
             ),
-            getInt(
-                props,
-                "pms.server.scheduler.failure_retry_delay_ms",
-                PmsSchedulerConfig.DEFAULT_FAILURE_RETRY_DELAY_MS
-            ),
             getLong(
                 props,
                 "pms.paimon.visibility.max_delay_ms",
@@ -93,7 +86,6 @@ public final class ConfigManager {
             ),
             getInt(props, "pms.storage.new_sst.max_count", PmsSchedulerConfig.DEFAULT_NEW_SST_MAX_COUNT),
             getInt(props, "pms.storage.sinked_sst.max_count", PmsSchedulerConfig.DEFAULT_SINKED_SST_MAX_COUNT),
-            getInt(props, "pms.operation.sink.batch_max_ssts", PmsSchedulerConfig.DEFAULT_SINK_BATCH_MAX_SSTS),
             getInt(
                 props,
                 "pms.operation.sink.batch_max_bytes_mb",
@@ -109,6 +101,8 @@ public final class ConfigManager {
 
     private static void rejectRemovedSchedulerKeys(Properties props) {
         String[] removedKeys = {
+            "pms.server.scheduler.enabled",
+            "pms.server.scheduler.failure_retry_delay_ms",
             "pms.server.scheduler.flush_interval_ms",
             "pms.server.scheduler.sink_interval_ms",
             "pms.sink.interval_ms",
@@ -116,6 +110,7 @@ public final class ConfigManager {
             "pms.storage.sinked_max_size_mb",
             "pms.storage.sinked_max_count",
             "pms.storage.local_sst_max_rows",
+            "pms.operation.sink.batch_max_ssts",
             "pms.storage.compact_threshold_mb",
             "pms.storage.compact_min_files"
         };

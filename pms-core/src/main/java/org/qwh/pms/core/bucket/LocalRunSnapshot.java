@@ -12,8 +12,7 @@ public record LocalRunSnapshot(
     long entryCount,
     long minSequenceId,
     long maxSequenceId,
-    long oldestWriteAtMillis,
-    long ageMillis
+    long oldestWriteAtMillis
 ) {
     public LocalRunSnapshot {
         Objects.requireNonNull(state, "state must not be null");

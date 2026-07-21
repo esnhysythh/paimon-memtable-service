@@ -70,16 +70,8 @@ public final class PMSTestServer implements AutoCloseable {
         start();
     }
 
-    public void abortAndRestart() throws Exception {
-        abortRuntime();
-        start();
-    }
-
-    public void abortRuntime() throws Exception {
-        if (runtime != null) {
-            runtime.abort();
-            runtime = null;
-        }
+    public void stop() throws Exception {
+        stopRuntime();
     }
 
     public PmsServerRuntime runtime() {
@@ -163,10 +155,6 @@ public final class PMSTestServer implements AutoCloseable {
 
     public long sink() {
         return runtime().sink();
-    }
-
-    public void reconcileNow() {
-        runtime().reconcileNow();
     }
 
     public Map<Integer, String> readIntStringRows() throws Exception {

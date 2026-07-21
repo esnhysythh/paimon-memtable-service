@@ -135,11 +135,11 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void unflushedWalDataIsRecoveredAfterAbortRestart() throws Exception {
+    void unflushedWalDataIsRecoveredAfterRestart() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "wal-a"));
 
-            server.abortAndRestart();
+            server.restart();
 
             assertEquals(Map.of("id", 1, "marker", "wal-a"), server.get(Map.of("id", 1)).orElseThrow());
             Map<String, Object> recovery = recovery(server.getJson("/state"));
@@ -151,12 +151,12 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void flushedUnsinkedSstIsRecoveredAfterAbortRestart() throws Exception {
+    void flushedUnsinkedSstIsRecoveredAfterRestart() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "sst-a"));
             flushAndWait(server);
 
-            server.abortAndRestart();
+            server.restart();
 
             assertEquals(Map.of("id", 1, "marker", "sst-a"), server.get(Map.of("id", 1)).orElseThrow());
             Map<String, Object> recovery = recovery(server.getJson("/state"));
@@ -183,12 +183,8 @@ class PmsServerEndToEndTest {
                 failingRuntime.write(Map.of("id", 1, "marker", "prepared-a"));
                 failingRuntime.sink();
                 waitUntil(() -> sinkFlight(failingRuntime) == SinkFlightSnapshot.Status.PREPARED_RETRY);
-                @SuppressWarnings("unchecked")
-                Map<String, Object> schedulerState = (Map<String, Object>) failingRuntime.state().get("scheduler");
-                assertTrue(String.valueOf(schedulerState.get("lastErrorMessage"))
-                    .contains("forced commit failure after prepare"));
             } finally {
-                failingRuntime.abort();
+                failingRuntime.close();
             }
 
             PmsServerRuntime recoveredRuntime = new PmsServerRuntime(server.config()).start();
@@ -215,7 +211,7 @@ class PmsServerEndToEndTest {
     void preparedSinkCommitRetriesInSameRuntimeWithoutPreparingAgain() throws Exception {
         AtomicReference<FailOnceAfterPrepareSinkManager> sinkManagerRef = new AtomicReference<>();
         Properties props = baseProperties();
-        props.setProperty("pms.server.scheduler.failure_retry_delay_ms", "25");
+        props.setProperty("pms.server.scheduler.maintenance_reconcile_interval_ms", "25");
         PmsServerConfig config = new ConfigManager().from(props);
         try (PMSTestServer server = PMSTestServer.create(config, schema())) {
             PmsServerRuntime runtime = new PmsServerRuntime(
@@ -261,13 +257,13 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void sinkSuccessWalStateIsRecoveredAfterAbortRestart() throws Exception {
+    void sinkSuccessWalStateIsRecoveredAfterRestart() throws Exception {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "success-a"));
             flushAndWait(server);
             sinkAndWait(server);
 
-            server.abortAndRestart();
+            server.restart();
 
             Map<String, Object> recovery = recovery(server.getJson("/state"));
             assertEquals(0L, number(recovery, "pendingPreparedSinkCount"));
@@ -286,7 +282,7 @@ class PmsServerEndToEndTest {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "missing-a"));
             flushAndWait(server);
-            server.abortRuntime();
+            server.stop();
         }
 
         Files.delete(flushedSstPath());
@@ -302,7 +298,7 @@ class PmsServerEndToEndTest {
         try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
             server.write(Map.of("id", 1, "marker", "corrupt-a"));
             flushAndWait(server);
-            server.abortRuntime();
+            server.stop();
         }
 
         Files.write(flushedSstPath(), new byte[] {1, 2, 3, 4});
@@ -480,7 +476,13 @@ class PmsServerEndToEndTest {
             server.write(Map.of("id", 3, "marker", "retained-3"));
             flushAndWait(server);
             sinkAndWait(server);
-            server.reconcileNow();
+            waitUntil(() -> {
+                try {
+                    return number(server.getJson("/state"), "sinkedSSTCount") == 1;
+                } catch (Exception e) {
+                    return false;
+                }
+            });
 
             Map<String, Object> state = server.getJson("/state");
             assertEquals(0L, number(state, "newSSTTotalRows"));
@@ -512,7 +514,13 @@ class PmsServerEndToEndTest {
             flushAndWait(server);
 
             sinkAndWait(server);
-            server.reconcileNow();
+            waitUntil(() -> {
+                try {
+                    return number(server.getJson("/state"), "sinkedSSTCount") == 1;
+                } catch (Exception e) {
+                    return false;
+                }
+            });
 
             Map<String, Object> state = server.getJson("/state");
             assertEquals(0L, number(state, "newSSTCount"));
@@ -815,7 +823,6 @@ class PmsServerEndToEndTest {
     @Test
     void schedulerAutomaticallyFlushesAndSinks() throws Exception {
         Properties props = baseProperties();
-        props.setProperty("pms.server.scheduler.enabled", "true");
         props.setProperty("pms.server.scheduler.flush_reconcile_interval_ms", "25");
         props.setProperty("pms.server.scheduler.maintenance_reconcile_interval_ms", "25");
         props.setProperty("pms.paimon.visibility.max_delay_ms", "50");
@@ -827,10 +834,8 @@ class PmsServerEndToEndTest {
             waitUntil(() -> {
                 try {
                     Map<String, Object> state = server.getJson("/state");
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> scheduler = (Map<String, Object>) state.get("scheduler");
                     return Map.of(1, "auto-a").equals(server.readIntStringRows())
-                        && actionCount(scheduler, "actionSuccessCounts", "SINK") > 0;
+                        && number(state, "lastPersistedSequenceId") >= 1;
                 } catch (Exception e) {
                     return false;
                 }
@@ -839,22 +844,12 @@ class PmsServerEndToEndTest {
             Map<String, Object> state = server.getJson("/state");
             @SuppressWarnings("unchecked")
             Map<String, Object> scheduler = (Map<String, Object>) state.get("scheduler");
-            assertEquals(true, scheduler.get("enabled"));
             assertEquals(true, scheduler.get("running"));
             assertEquals(25L, number(scheduler, "flushReconcileIntervalMs"));
             assertEquals(25L, number(scheduler, "maintenanceReconcileIntervalMs"));
             assertTrue(scheduler.get("flushRunning") instanceof Boolean);
             assertTrue(scheduler.get("maintenanceRunning") instanceof Boolean);
-            assertTrue(actionCount(scheduler, "actionSuccessCounts", "FLUSH") > 0);
-            assertTrue(actionCount(scheduler, "actionSuccessCounts", "SINK") > 0);
-            assertEquals(0L, actionCount(scheduler, "actionFailureCounts", "FLUSH"));
-            assertEquals(0L, actionCount(scheduler, "actionFailureCounts", "SINK"));
-            assertTrue(scheduler.containsKey("lastFlushStartedAt"));
-            assertTrue(scheduler.containsKey("lastFlushCompletedAt"));
-            assertTrue(scheduler.containsKey("lastMaintenanceStartedAt"));
-            assertTrue(scheduler.containsKey("lastMaintenanceCompletedAt"));
-            assertTrue(number(scheduler, "lastFlushDurationMs") >= 0);
-            assertTrue(number(scheduler, "lastMaintenanceDurationMs") >= 0);
+            assertEquals(0L, number(scheduler, "pendingPaimonFenceSequenceId"));
         }
     }
 
@@ -943,10 +938,8 @@ class PmsServerEndToEndTest {
         assertTrue(config.coreConfig().paimon().cacheEnabled());
         assertEquals("128mb", config.coreConfig().paimon().manifestCacheSmallFileMemory());
         assertEquals("1mb", config.coreConfig().paimon().manifestCacheSmallFileThreshold());
-        assertFalse(config.scheduler().enabled());
-        assertEquals(1000, config.scheduler().flushReconcileIntervalMs());
-        assertEquals(30000, config.scheduler().maintenanceReconcileIntervalMs());
-        assertEquals(5000, config.scheduler().failureRetryDelayMs());
+        assertEquals(600000, config.scheduler().flushReconcileIntervalMs());
+        assertEquals(600000, config.scheduler().maintenanceReconcileIntervalMs());
         assertEquals(600000, config.scheduler().visibilityMaxDelayMs());
         assertEquals(20, config.coreConfig().flowcontrol().overloadedPendingSstCount());
         assertTrue(config.protocol().strictHttp2());
@@ -977,16 +970,22 @@ class PmsServerEndToEndTest {
     }
 
     @Test
-    void configManagerRejectsRemovedFixedDelaySchedulerKeys() {
-        Properties props = baseProperties();
-        props.setProperty("pms.server.scheduler.sink_interval_ms", "1000");
+    void configManagerRejectsRemovedSchedulerKeys() {
+        for (String removedKey : List.of(
+                "pms.server.scheduler.sink_interval_ms",
+                "pms.server.scheduler.enabled",
+                "pms.server.scheduler.failure_retry_delay_ms",
+                "pms.operation.sink.batch_max_ssts")) {
+            Properties props = baseProperties();
+            props.setProperty(removedKey, "1000");
 
-        IllegalArgumentException error = assertThrows(
-            IllegalArgumentException.class,
-            () -> new ConfigManager().from(props)
-        );
+            IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class,
+                () -> new ConfigManager().from(props)
+            );
 
-        assertTrue(error.getMessage().contains("Removed scheduler config key"));
+            assertTrue(error.getMessage().contains("Removed scheduler config key"));
+        }
     }
 
     @Test
@@ -1216,7 +1215,8 @@ class PmsServerEndToEndTest {
         props.setProperty("pms.wal.dir", rootDir.resolve("wal").toString());
         props.setProperty("pms.storage.dir", rootDir.resolve("storage").toString());
         props.setProperty("pms.lookup.cache.dir", rootDir.resolve("target").resolve("lookup-cache").toString());
-        props.setProperty("pms.server.scheduler.enabled", "false");
+        props.setProperty("pms.server.scheduler.flush_reconcile_interval_ms", "600000");
+        props.setProperty("pms.server.scheduler.maintenance_reconcile_interval_ms", "600000");
         return props;
     }
 
@@ -1280,17 +1280,10 @@ class PmsServerEndToEndTest {
         return ((Number) map.get(key)).longValue();
     }
 
-    private static long actionCount(Map<String, Object> scheduler, String metric, String action) {
-        @SuppressWarnings("unchecked")
-        Map<String, Object> counts = (Map<String, Object>) scheduler.get(metric);
-        Object value = counts.get(action);
-        return value == null ? 0 : ((Number) value).longValue();
-    }
-
     private static void sinkAllAvailable(PmsTableService service) {
         long targetSequenceId = service.stateSnapshot().newSSTMaxSequenceId();
         if (targetSequenceId > 0) {
-            service.sinkToPaimon(new SinkSelection(targetSequenceId, Integer.MAX_VALUE, Long.MAX_VALUE));
+            service.sinkToPaimon(new SinkSelection(targetSequenceId, Long.MAX_VALUE));
         }
     }
 
