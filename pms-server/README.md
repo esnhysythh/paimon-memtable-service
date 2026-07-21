@@ -58,18 +58,17 @@ directories and the target Paimon table.
 | `pms.protocol.max_concurrent_streams` | `128` | Jetty h2c maximum concurrent streams. |
 | `pms.protocol.max_request_body_bytes` | `33554432` | Maximum binary protocol request body bytes. |
 | `pms.protocol.max_response_body_bytes` | `33554432` | Maximum binary protocol response body bytes. |
-| `pms.server.scheduler.enabled` | `false` | Enables the lightweight background scheduler. |
-| `pms.server.scheduler.flush_interval_ms` | `0` | Scheduled freeze+flush interval. `0` disables scheduled flush. |
-| `pms.server.scheduler.sink_interval_ms` | `pms.sink.interval_ms` | Scheduled sink interval. `0` disables scheduled sink. |
+| `pms.server.scheduler.flush_reconcile_interval_ms` | `1000` | Immutable MemTable reconciliation interval. |
+| `pms.server.scheduler.maintenance_reconcile_interval_ms` | `30000` | Paimon visibility and local SST maintenance interval. |
+| `pms.paimon.visibility.max_delay_ms` | `600000` | Target maximum normal delay before writes become visible in Paimon. |
 | `pms.wal.dir` | required | WAL directory. Must differ from `pms.storage.dir`. |
 | `pms.wal.file_size_mb` | `256` | WAL segment size. |
 | `pms.wal.use_mmap` | `false` | Whether WAL uses mmap writer. |
 | `pms.storage.dir` | required | Local SST/state directory. |
-| `pms.storage.sinked_max_size_mb` | `10240` | Local SST retention size threshold; only sinked SSTs can be evicted. |
-| `pms.storage.sinked_max_count` | `100` | Local SST retention file-count threshold; only sinked SSTs can be evicted. |
-| `pms.storage.local_sst_max_rows` | `0` | Local SST physical entry-count threshold. `0` disables row-based retention. |
-| `pms.storage.compact_threshold_mb` | `32` | Local compaction threshold. |
-| `pms.storage.compact_min_files` | `4` | Minimum files for local compaction. |
+| `pms.storage.new_sst.max_count` | `10` | Daily maintenance target for NEW local SST count. |
+| `pms.storage.sinked_sst.max_count` | `10` | Daily maintenance target for retained SINKED local SST count. |
+| `pms.operation.sink.batch_max_bytes_mb` | `1024` | Maximum input bytes for one Sink batch; one oversized oldest run may progress alone. |
+| `pms.operation.compact.max_input_size_mb` | `1024` | Maximum input bytes for one local compaction. |
 | `pms.paimon.warehouse` | required | Paimon warehouse path. |
 | `pms.paimon.database` | required | Paimon database. |
 | `pms.paimon.table` | required | Paimon table. |
@@ -79,7 +78,5 @@ directories and the target Paimon table.
 | `pms.paimon.manifest_cache_max_memory` | unset | Optional Paimon manifest max cache memory; when larger than small-file memory, Paimon may cache all manifest files up to this budget. |
 | `pms.memtable.max_entries` | `1000000` | Current memtable entry threshold. |
 | `pms.memtable.max_size_mb` | `256` | Current memtable size threshold. |
-| `pms.sink.interval_ms` | `30000` | Core sink interval default and scheduler sink fallback. |
-| `pms.sink.max_pending_ssts` | `8` | Pending SST threshold. |
 | `pms.flowcontrol.overloaded_immutable_count` | `4` | Flow-control threshold. |
-| `pms.flowcontrol.overloaded_pending_sst_count` | `16` | Flow-control threshold. |
+| `pms.flowcontrol.overloaded_pending_sst_count` | `20` | Flow-control threshold. |

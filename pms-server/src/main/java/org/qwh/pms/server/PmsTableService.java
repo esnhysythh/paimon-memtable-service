@@ -710,13 +710,19 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
         result.put("curMemTableMinSequenceId", state.curMemTableMinSequenceId());
         result.put("curMemTableMaxSequenceId", state.curMemTableMaxSequenceId());
         result.put("curMemTableOldestWriteAtMillis", state.curMemTableOldestWriteAtMillis());
-        result.put("curMemTableAgeMillis", state.curMemTableAgeMillis());
+        result.put("curMemTableAgeMillis", ageMillis(
+            state.observedAtMillis(),
+            state.curMemTableOldestWriteAtMillis()
+        ));
         result.put("immutableMemTableCount", state.immutableMemTableCount());
         result.put("immutableMemTableTotalBytes", state.immutableMemTableTotalBytes());
         result.put("immutableMemTableMinSequenceId", state.immutableMemTableMinSequenceId());
         result.put("immutableMemTableMaxSequenceId", state.immutableMemTableMaxSequenceId());
         result.put("immutableMemTableOldestWriteAtMillis", state.immutableMemTableOldestWriteAtMillis());
-        result.put("immutableMemTableAgeMillis", state.immutableMemTableAgeMillis());
+        result.put("immutableMemTableAgeMillis", ageMillis(
+            state.observedAtMillis(),
+            state.immutableMemTableOldestWriteAtMillis()
+        ));
         result.put("lastAssignedSequenceId", state.lastAssignedSequenceId());
         result.put("lastFlushedSequenceId", state.lastFlushedSequenceId());
         result.put("lastPersistedSequenceId", state.lastPersistedSequenceId());
@@ -726,19 +732,29 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
         result.put("newSSTMinSequenceId", state.newSSTMinSequenceId());
         result.put("newSSTMaxSequenceId", state.newSSTMaxSequenceId());
         result.put("newSSTOldestWriteAtMillis", state.newSSTOldestWriteAtMillis());
-        result.put("newSSTAgeMillis", state.newSSTAgeMillis());
+        result.put("newSSTAgeMillis", ageMillis(
+            state.observedAtMillis(),
+            state.newSSTOldestWriteAtMillis()
+        ));
         result.put("sinkedSSTCount", state.sinkedSSTCount());
         result.put("sinkedSSTTotalBytes", state.sinkedSSTTotalBytes());
         result.put("sinkedSSTTotalRows", state.sinkedSSTTotalRows());
         result.put("sinkedSSTMinSequenceId", state.sinkedSSTMinSequenceId());
         result.put("sinkedSSTMaxSequenceId", state.sinkedSSTMaxSequenceId());
         result.put("sinkedSSTOldestWriteAtMillis", state.sinkedSSTOldestWriteAtMillis());
-        result.put("sinkedSSTAgeMillis", state.sinkedSSTAgeMillis());
+        result.put("sinkedSSTAgeMillis", ageMillis(
+            state.observedAtMillis(),
+            state.sinkedSSTOldestWriteAtMillis()
+        ));
         result.put("localRuns", state.localRuns());
         result.put("sinkFlight", state.sinkFlight());
         result.put("recoveredUnpersistedData", state.recoveredUnpersistedData());
         result.put("lastSinkedSnapshotId", state.lastSinkedSnapshotId());
         return result;
+    }
+
+    private static long ageMillis(long observedAtMillis, long oldestWriteAtMillis) {
+        return oldestWriteAtMillis <= 0 ? 0 : Math.max(0, observedAtMillis - oldestWriteAtMillis);
     }
 
     private static Map<String, Object> recoverySummaryToMap(RecoverySummary recovery) {

@@ -159,11 +159,6 @@ public final class PmsServerRuntime implements AutoCloseable {
         return scheduler().requestSinkToCurrent();
     }
 
-    public void reconcileNow() {
-        requireRunning();
-        scheduler().reconcileNow();
-    }
-
     public Map<String, Object> state() {
         Map<String, Object> result = service == null ? new LinkedHashMap<>() : new LinkedHashMap<>(service.state());
         Map<String, Object> runtime = new LinkedHashMap<>();
@@ -225,27 +220,6 @@ public final class PmsServerRuntime implements AutoCloseable {
         status = PmsRuntimeStatus.STOPPED;
         stoppedAt = now();
         LOG.info("PMS server runtime shutdown completed");
-    }
-
-    /**
-     * Simulates abrupt process loss for recovery tests and development fault injection.
-     */
-    public synchronized void abort() throws Exception {
-        if (status == PmsRuntimeStatus.STOPPED || status == PmsRuntimeStatus.NEW) {
-            return;
-        }
-        LOG.warn("PMS server runtime abort requested, status={}", status);
-        closeQuietly(httpServer);
-        httpServer = null;
-        closeQuietly(scheduler);
-        scheduler = null;
-        if (service != null) {
-            service.close();
-            service = null;
-        }
-        status = PmsRuntimeStatus.STOPPED;
-        stoppedAt = now();
-        LOG.warn("PMS server runtime aborted without graceful request coordination");
     }
 
     private boolean acceptingWrites() {
