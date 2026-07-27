@@ -317,6 +317,68 @@ class PmsServerSchedulerTest {
     }
 
     @Test
+    void closeAfterFlushSnapshotDoesNotStartFlush() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        operations.addImmutable(1);
+        operations.blockNextFlushSnapshot();
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(1, 60_000, 600_000, 10, 10, 1_024, 1_024),
+            Clock.systemUTC()
+        );
+        Thread closeThread = new Thread(scheduler::close);
+        try {
+            scheduler.start();
+            assertTrue(operations.flushSnapshotStarted.await(5, TimeUnit.SECONDS));
+
+            closeThread.start();
+            waitUntil(() -> !(Boolean) scheduler.state().get("running"));
+            operations.releaseFlushSnapshot();
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+            assertFalse(closeThread.isAlive());
+        } finally {
+            operations.releaseFlushSnapshot();
+            scheduler.close();
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+        }
+
+        assertEquals(0, operations.flushCalls);
+        assertEquals(1, operations.immutableCount);
+    }
+
+    @Test
+    void closeAfterMaintenanceSnapshotDoesNotStartSink() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        operations.addRun(SSTState.NEW, 1, 700L * 1024 * 1024);
+        operations.addRun(SSTState.NEW, 2, 700L * 1024 * 1024);
+        operations.lastFlushedSequenceId = 2;
+        operations.blockNextMaintenanceSnapshot();
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(60_000, 1, 600_000, 1, 10, 1_024, 1_024),
+            Clock.systemUTC()
+        );
+        Thread closeThread = new Thread(scheduler::close);
+        try {
+            scheduler.start();
+            assertTrue(operations.maintenanceSnapshotStarted.await(5, TimeUnit.SECONDS));
+
+            closeThread.start();
+            waitUntil(() -> !(Boolean) scheduler.state().get("running"));
+            operations.releaseMaintenanceSnapshot();
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+            assertFalse(closeThread.isAlive());
+        } finally {
+            operations.releaseMaintenanceSnapshot();
+            scheduler.close();
+            closeThread.join(TimeUnit.SECONDS.toMillis(5));
+        }
+
+        assertEquals(0, operations.sinkCalls);
+        assertEquals(2, operations.count(SSTState.NEW));
+    }
+
+    @Test
     void manualSinkReusesVisibilityFenceAndCompletesAsynchronously() throws Exception {
         MutableOperations operations = new MutableOperations();
         operations.currentEntries = 1;
@@ -515,13 +577,26 @@ class PmsServerSchedulerTest {
         private volatile CountDownLatch flushRelease;
         private volatile CountDownLatch sinkStarted;
         private volatile CountDownLatch sinkRelease;
+        private volatile CountDownLatch flushSnapshotStarted;
+        private volatile CountDownLatch flushSnapshotRelease;
+        private volatile CountDownLatch maintenanceSnapshotStarted;
+        private volatile CountDownLatch maintenanceSnapshotRelease;
         private boolean recoveredUnpersistedData;
         private SinkFlightSnapshot sinkFlight = SinkFlightSnapshot.idle();
         private final ArrayDeque<Long> immutableMaxSequenceIds = new ArrayDeque<>();
         private final List<LocalRunSnapshot> runs = new ArrayList<>();
 
         @Override
-        public synchronized BucketStateSnapshot stateSnapshot() {
+        public BucketStateSnapshot stateSnapshot() {
+            BucketStateSnapshot snapshot;
+            synchronized (this) {
+                snapshot = stateSnapshotLocked();
+            }
+            awaitBlockedSnapshotForCurrentWorker();
+            return snapshot;
+        }
+
+        private BucketStateSnapshot stateSnapshotLocked() {
             List<LocalRunSnapshot> newRuns = runs(SSTState.NEW);
             List<LocalRunSnapshot> sinkedRuns = runs(SSTState.SINKED);
             return new BucketStateSnapshot(
@@ -581,32 +656,37 @@ class PmsServerSchedulerTest {
         }
 
         @Override
-        public synchronized FlushResult flushImmutableMemTable() {
-            if (immutableCount == 0) {
-                return FlushResult.noop();
-            }
-            flushCalls++;
-            if (flushFailure != null) {
-                throw flushFailure;
-            }
-            if (flushStarted != null) {
-                flushStarted.countDown();
-                try {
-                    flushRelease.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException("blocked Flush interrupted", e);
+        public FlushResult flushImmutableMemTable() {
+            CountDownLatch started;
+            CountDownLatch release;
+            synchronized (this) {
+                if (immutableCount == 0) {
+                    return FlushResult.noop();
                 }
-                flushStarted = null;
-                flushRelease = null;
+                flushCalls++;
+                if (flushFailure != null) {
+                    throw flushFailure;
+                }
+                started = flushStarted;
+                release = flushRelease;
             }
-            immutableCount--;
-            long flushedSequenceId = immutableMaxSequenceIds.isEmpty()
-                ? lastAssignedSequenceId
-                : immutableMaxSequenceIds.removeFirst();
-            lastFlushedSequenceId = Math.max(lastFlushedSequenceId, flushedSequenceId);
-            LocalRunSnapshot run = addRun(SSTState.NEW, nextFlushId++, 100, flushedSequenceId);
-            return new FlushResult(OperationStatus.PROGRESSED, Optional.of(run));
+            if (started != null) {
+                started.countDown();
+                await(release, "blocked Flush interrupted");
+            }
+            synchronized (this) {
+                if (started != null && flushStarted == started) {
+                    flushStarted = null;
+                    flushRelease = null;
+                }
+                immutableCount--;
+                long flushedSequenceId = immutableMaxSequenceIds.isEmpty()
+                    ? lastAssignedSequenceId
+                    : immutableMaxSequenceIds.removeFirst();
+                lastFlushedSequenceId = Math.max(lastFlushedSequenceId, flushedSequenceId);
+                LocalRunSnapshot run = addRun(SSTState.NEW, nextFlushId++, 100, flushedSequenceId);
+                return new FlushResult(OperationStatus.PROGRESSED, Optional.of(run));
+            }
         }
 
         @Override
@@ -780,6 +860,65 @@ class PmsServerSchedulerTest {
             CountDownLatch release = sinkRelease;
             if (release != null) {
                 release.countDown();
+            }
+        }
+
+        private synchronized void blockNextFlushSnapshot() {
+            flushSnapshotStarted = new CountDownLatch(1);
+            flushSnapshotRelease = new CountDownLatch(1);
+        }
+
+        private void releaseFlushSnapshot() {
+            CountDownLatch release = flushSnapshotRelease;
+            if (release != null) {
+                release.countDown();
+            }
+        }
+
+        private synchronized void blockNextMaintenanceSnapshot() {
+            maintenanceSnapshotStarted = new CountDownLatch(1);
+            maintenanceSnapshotRelease = new CountDownLatch(1);
+        }
+
+        private void releaseMaintenanceSnapshot() {
+            CountDownLatch release = maintenanceSnapshotRelease;
+            if (release != null) {
+                release.countDown();
+            }
+        }
+
+        private void awaitBlockedSnapshotForCurrentWorker() {
+            String threadName = Thread.currentThread().getName();
+            boolean flushWorker = threadName.contains("-flush-");
+            boolean maintenanceWorker = threadName.contains("-maintenance-");
+            CountDownLatch started = flushWorker
+                ? flushSnapshotStarted
+                : maintenanceWorker ? maintenanceSnapshotStarted : null;
+            CountDownLatch release = flushWorker
+                ? flushSnapshotRelease
+                : maintenanceWorker ? maintenanceSnapshotRelease : null;
+            if (started == null) {
+                return;
+            }
+            started.countDown();
+            await(release, "blocked state snapshot interrupted");
+            synchronized (this) {
+                if (flushWorker && flushSnapshotStarted == started) {
+                    flushSnapshotStarted = null;
+                    flushSnapshotRelease = null;
+                } else if (maintenanceWorker && maintenanceSnapshotStarted == started) {
+                    maintenanceSnapshotStarted = null;
+                    maintenanceSnapshotRelease = null;
+                }
+            }
+        }
+
+        private static void await(CountDownLatch release, String message) {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(message, e);
             }
         }
 

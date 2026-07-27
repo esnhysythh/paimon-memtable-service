@@ -135,7 +135,10 @@ Freeze 在 `writeMutex` 内执行短状态切换：
 
 一次 `flushImmutableMemTable()` 只处理最老的一个 ImmutableMemTable。慢 SST IO 不持有 `writeMutex`；写入可以继续进入新的 CurMemTable。
 
+storage 发布采用 prepare/publish 两段式：SST data、SST meta 与经过完整校验的 reader 均在 SST 可见视图 monitor 外准备，随后在短临界区内一起发布。查询看到的 SST meta 必须始终存在对应的 cached reader；缺失时按内部状态损坏记录 `PMS_STORAGE_INVARIANT` 错误并失败，不在查询线程中重新扫描文件。compact 输出和批量 NEW→SINKED 状态变化遵循同一规则，元数据 fsync 不占用查询可见视图 monitor。
+
 `lastFlushedSequenceId` 是本地 SST/WAL replay 边界，不是 Paimon 可见性边界。若 SST 文件已写出但 flush boundary 尚未发布就崩溃，该文件作为 orphan 忽略，数据由 WAL 重放；若 boundary 已发布，则启动时必须验证承载它的 SST 完整存在。
+flush boundary 使用独立的串行化边界，不与 SST 可见视图/read epoch 共用 monitor。
 
 ### 4.3 Sink 与 prepared retry
 

@@ -263,6 +263,13 @@ public final class PmsServerScheduler implements AutoCloseable {
                 return;
             }
             BucketStateSnapshot state = operations.stateSnapshot();
+            // stateSnapshot may wait behind an in-flight storage publication. Recheck after it
+            // returns so shutdown does not normally admit a new action from a stale worker pass.
+            // This is intentionally a best-effort lifecycle boundary rather than a new action
+            // admission lock; an action racing with the check is treated as already in flight.
+            if (!running) {
+                return;
+            }
             if (state.immutableMemTableCount() == 0) {
                 return;
             }
@@ -300,6 +307,11 @@ public final class PmsServerScheduler implements AutoCloseable {
                 return;
             }
             BucketStateSnapshot state = operations.stateSnapshot();
+            // See reconcileFlush(): keep the stop check close to action selection without adding
+            // a scheduler-wide lock to every maintenance operation.
+            if (!running) {
+                return;
+            }
 
             // A durable prepared Sink must be resolved before starting any other SST maintenance.
             // Flush remains independent and may continue on its own worker.

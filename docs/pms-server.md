@@ -168,6 +168,8 @@ RUNNING
 
 Scheduler `close()` 不设置内部业务超时，而是等待已经开始的单步操作完成，避免在 SST/Paimon publish 中途主动中断。部署系统应在进程级配置 shutdown grace period；超过该时间可以终止进程，恢复协议负责处理边界前后的完整状态。
 
+两个 reconciliation loop 在获取 `BucketStateSnapshot` 后、选择下一动作前再次检查运行状态，以避免被慢快照阻塞的旧 worker pass 在 shutdown 后通常再启动新动作。该检查是 KISS 的 best-effort 生命周期边界，不额外引入全局 action admission lock；与检查真正并发穿过的极小窗口按已经 in-flight 处理，并由 `close()` 等待完成。
+
 ### 2.6 状态与可观测性
 
 `GET /state` 汇总：

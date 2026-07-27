@@ -13,9 +13,16 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -67,6 +74,48 @@ class FileLocalStorageManagerTest {
         assertFalse(value.get().isTombstone());
         assertArrayEquals("v2".getBytes(), value.get().bytes());
         assertEquals(2L, value.get().sequenceId());
+    }
+
+    @Test
+    void flushPreparationDoesNotBlockTheVisibleSstView() throws Exception {
+        FileLocalStorageManager storage = storage();
+        SSTMeta existing = storage.flushToSST(immutable("existing", "v0".getBytes(), 1L));
+        CountDownLatch iteratorEntered = new CountDownLatch(1);
+        CountDownLatch allowIterator = new CountDownLatch(1);
+        ImmutableMemTable blocked = blockIterator(
+            immutable("new", "v1".getBytes(), 2L),
+            iteratorEntered,
+            allowIterator
+        );
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<SSTMeta> flush = executor.submit(() -> storage.flushToSST(blocked));
+        try {
+            assertTrue(iteratorEntered.await(5, TimeUnit.SECONDS));
+
+            assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+                assertEquals(List.of(existing.runId()),
+                    storage.metas().stream().map(SSTMeta::runId).toList());
+                try (SSTReadSnapshot snapshot = storage.readVisibleSnapshot()) {
+                    assertEquals(List.of(existing.runId()),
+                        snapshot.metas().stream().map(SSTMeta::runId).toList());
+                    assertArrayEquals(
+                        "v0".getBytes(),
+                        snapshot.get(existing, new Key("existing".getBytes())).orElseThrow().bytes()
+                    );
+                }
+            });
+            assertFalse(flush.isDone());
+            allowIterator.countDown();
+
+            SSTMeta published = flush.get(5, TimeUnit.SECONDS);
+            assertEquals(
+                List.of(existing.runId(), published.runId()),
+                storage.metas().stream().map(SSTMeta::runId).toList()
+            );
+        } finally {
+            allowIterator.countDown();
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -283,6 +332,39 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
+    void missingReaderFailsWithExpectedSstDetailsInsteadOfReopening() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        storage.deleteSST(meta);
+
+        try (SSTReadSnapshot snapshot = storage.readSnapshot(List.of(meta))) {
+            IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> snapshot.get(meta, new Key("k1".getBytes()))
+            );
+
+            assertTrue(error.getMessage().contains("Expected SST reader is missing"));
+            assertTrue(error.getMessage().contains("runId=" + meta.runId()));
+            assertTrue(error.getMessage().contains(meta.path().toString()));
+        }
+    }
+
+    @Test
+    void markSinkedPublishesTheBatchWithoutReplacingCachedReaders() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+
+        List<SSTMeta> sinked = storage.markSinked(List.of(first, second));
+
+        assertEquals(List.of(first.runId(), second.runId()),
+            sinked.stream().map(SSTMeta::runId).toList());
+        assertTrue(sinked.stream().allMatch(meta -> meta.state() == SSTState.SINKED));
+        assertArrayEquals("v1".getBytes(), get(storage, sinked.get(0), "k1").orElseThrow().bytes());
+        assertArrayEquals("v2".getBytes(), get(storage, sinked.get(1), "k2").orElseThrow().bytes());
+    }
+
+    @Test
     void initIgnoresSstBeyondFlushBoundaryAsOrphan() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta orphan = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
@@ -355,6 +437,39 @@ class FileLocalStorageManagerTest {
 
         FileLocalStorageManager reloaded = storage();
         assertEquals(10L, reloaded.lastFlushedSequenceId());
+    }
+
+    @Test
+    void flushBoundaryPersistenceDoesNotUseTheVisibleSstViewMonitor() throws Exception {
+        FileLocalStorageManager storage = storage();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        CountDownLatch monitorHeld = new CountDownLatch(1);
+        CountDownLatch releaseMonitor = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<?> holder = executor.submit(() -> {
+            synchronized (storage) {
+                monitorHeld.countDown();
+                try {
+                    releaseMonitor.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("storage monitor holder interrupted", e);
+                }
+            }
+        });
+        try {
+            assertTrue(monitorHeld.await(5, TimeUnit.SECONDS));
+
+            Future<?> persisted = executor.submit(
+                () -> storage.persistFlushedSequenceId(meta.maxSequenceId())
+            );
+            persisted.get(2, TimeUnit.SECONDS);
+            assertEquals(meta.maxSequenceId(), storage.lastFlushedSequenceId());
+        } finally {
+            releaseMonitor.countDown();
+            holder.get(5, TimeUnit.SECONDS);
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -456,5 +571,61 @@ class FileLocalStorageManagerTest {
 
         assertTrue(error.getMessage().contains("continuous"));
         assertTrue(Files.exists(second.path()));
+    }
+
+    private static ImmutableMemTable blockIterator(
+            ImmutableMemTable delegate,
+            CountDownLatch entered,
+            CountDownLatch release) {
+        return new ImmutableMemTable() {
+            @Override
+            public Value get(Key key) {
+                return delegate.get(key);
+            }
+
+            @Override
+            public Iterator<org.qwh.pms.core.memtable.model.Entry> iterator() {
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("blocked immutable iterator interrupted", e);
+                }
+                return delegate.iterator();
+            }
+
+            @Override
+            public Iterator<org.qwh.pms.core.memtable.model.Entry> iterator(
+                    Key startInclusive,
+                    Optional<Key> endExclusive) {
+                return delegate.iterator(startInclusive, endExclusive);
+            }
+
+            @Override
+            public long estimatedSize() {
+                return delegate.estimatedSize();
+            }
+
+            @Override
+            public int estimatedEntryCount() {
+                return delegate.estimatedEntryCount();
+            }
+
+            @Override
+            public long minSequenceId() {
+                return delegate.minSequenceId();
+            }
+
+            @Override
+            public long maxSequenceId() {
+                return delegate.maxSequenceId();
+            }
+
+            @Override
+            public long oldestWriteAtMillis() {
+                return delegate.oldestWriteAtMillis();
+            }
+        };
     }
 }

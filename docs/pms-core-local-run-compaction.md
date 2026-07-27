@@ -148,7 +148,7 @@ Compact 输出约束：
 - tombstone 与普通 PUT 一样参与归并，并可成为输出 entry。
 - V1 不做 tombstone GC；即使更老数据已经在 Paimon 中，也不在本地 compact 中丢弃 tombstone。
 
-发布 compact 结果时，应以元数据切换为准：新 run 完整落盘并写入元数据后，才替换旧 run 的可见列表。
+发布 compact 结果时，应以元数据切换为准：新 run data、meta 与经过完整校验的 cached reader 均在可见视图 monitor 外准备，随后在短临界区内一次替换旧 run。查询只能观察到带完整 reader 的旧集合或新集合，不在 cache miss 时同步重新打开并扫描 SST。
 
 当前实现通过 read epoch 避免并发查询读到已删除文件：查询、scan、sink 和 compact 读取 SST 前会创建 `SSTReadSnapshot` 并注册当前 epoch；compact 发布新 run 或 evict 移除旧 run 后, 旧 run 进入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于旧 run 的 `retireEpoch` 时, storage 才关闭旧 reader 并删除旧 data/meta 文件。启动恢复时，如果一个无 meta 的 SST 文件的 flush 范围已经被可见 run 连续覆盖，则忽略该 orphan；如果 compact 输出 meta 已写入但旧输入 meta 尚未删除就崩溃，恢复时选择覆盖范围更大的 compact run。
 

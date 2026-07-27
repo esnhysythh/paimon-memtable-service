@@ -26,7 +26,7 @@
 |------|---------|
 | CurMemTable | 并发 put/get、容量阈值触发 freeze |
 | ImmutableMemTable | Freeze 后只读、sequence/oldest-write 边界、Flush 发布后退出查询路径 |
-| LocalStorageManager | SST 写入 → 读取一致性、BloomFilter、`Optional<Value>` 三态、read epoch 延迟删除、多路归并保留最新 Key |
+| LocalStorageManager | SST 写入 → 读取一致性、BloomFilter、`Optional<Value>` 三态、read epoch 延迟删除、多路归并保留最新 Key；锁外 Flush 准备期间旧可见快照不阻塞，发布后的 meta 始终存在 cached reader |
 | WALManager | 单盘写入 → 读取、CRC 校验正确性、Magic 检测 partial write |
 | RowCodec / PrimaryKeyCodec | `InternalRow` 编码 → 解码往返正确性、主键编码顺序一致性、schema 不匹配拒绝 |
 | BloomFilter | 假阳性率在预期范围内（如 < 1%）、不同 FPP 配置的效果 |
@@ -57,7 +57,7 @@
 | SST 淘汰 | 只淘汰最老 SINKED run，read epoch 结束后才物理删除 |
 | WAL 截断 | SinkMeta success 的 `persistedSequenceId` 覆盖旧 WAL 文件时正确删除 |
 | Scheduler 优先级 | prepared retry、可见性 fence、NEW/SINKED 数量维护按固定优先级单步调和，progress 后重新采样 |
-| Scheduler 生命周期 | 周期信号合并、64-action slice 重排队、close 停止 delayed/periodic task 并等待在途 action |
+| Scheduler 生命周期 | 周期信号合并、64-action slice 重排队、close 停止 delayed/periodic task 并等待在途 action；Flush/Maintenance 在慢快照返回后复查 running，不从旧 pass 启动新动作 |
 | 手动 fence | `/flush`、`/sink` 返回 202；轮询 state boundary 可观察完成，不执行同步 drain |
 
 使用 mock/fake 实现替代 Paimon API：
