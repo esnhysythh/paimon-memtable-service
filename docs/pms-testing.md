@@ -52,11 +52,13 @@
 | Freeze/Flush 并发查询 | 对象切换和“目标先发布、源后移除”不产生瞬时 MISS，lookup 不获取写锁 |
 | Sink 流程状态机 | 最老连续 NEW 前缀 → SINKED，固定 sequence fence 可跨多个有界 batch 推进 |
 | Prepared Sink 在线恢复 | commit 临时失败后不重启即可重试同一 durable prepare，且不准备新 batch |
+| Committed Sink 在线收尾 | durable success 后 SST metadata fail-once 进入 FINALIZING；重试只完成同一 batch 的本地状态，不再次 Paimon commit |
+| Sink metadata 部分写 | 多个 SST metadata 逐个标记时部分成功，重试后全部幂等收敛为 SINKED |
 | 流控水位线 | server 快速检查与 core WAL 前复查都能返回 OVERLOADED，拒绝批次不进入 WAL |
 | 本地 SST 合并 | 只合并同状态连续 run；NEW/SINKED 均可合并，查询与恢复边界不变 |
 | SST 淘汰 | 只淘汰最老 SINKED run，read epoch 结束后才物理删除 |
-| WAL 截断 | SinkMeta success 的 `persistedSequenceId` 覆盖旧 WAL 文件时正确删除 |
-| Scheduler 优先级 | prepared retry、可见性 fence、NEW/SINKED 数量维护按固定优先级单步调和，progress 后重新采样 |
+| WAL 截断 | SinkMeta success 的 `persistedSequenceId` 覆盖旧 WAL 文件时正确删除；删除失败的候选可由后续 truncate 重试 |
+| Scheduler 优先级 | prepared retry/finalizing、可见性 fence、NEW/SINKED 数量维护按固定优先级单步调和，progress 后重新采样 |
 | Scheduler 生命周期 | 周期信号合并、64-action slice 重排队、close 停止 delayed/periodic task 并等待在途 action；Flush/Maintenance 在慢快照返回后复查 running，不从旧 pass 启动新动作 |
 | 手动 fence | `/flush`、`/sink` 返回 202；轮询 state boundary 可观察完成，不执行同步 drain |
 

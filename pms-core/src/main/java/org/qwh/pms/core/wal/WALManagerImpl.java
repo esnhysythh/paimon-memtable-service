@@ -211,10 +211,12 @@ public class WALManagerImpl implements WALManager {
         }
 
         for (Long fileNum : toDelete) {
-            WalFileInfo info = walFiles.remove(fileNum);
+            // Keep failed deletions in the in-memory candidate set so a later truncate can retry.
+            WalFileInfo info = walFiles.get(fileNum);
             if (info != null) {
                 try {
                     new LogWriterDeleter(info.file).delete();
+                    walFiles.remove(fileNum);
                     LOG.info("Truncated WAL file {} (maxSequenceId <= {})", info.file.getName(), safeSequenceId);
                 } catch (IOException e) {
                     LOG.warn("Failed to delete WAL file {}: {}", info.file, e.getMessage());

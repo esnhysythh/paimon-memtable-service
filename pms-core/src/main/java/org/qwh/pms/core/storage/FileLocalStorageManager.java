@@ -192,14 +192,25 @@ public class FileLocalStorageManager implements LocalStorageManager {
         Objects.requireNonNull(toMark, "toMark must not be null");
         List<SSTMeta> updated;
         synchronized (this) {
-            updated = toMark.stream()
-                .map(meta -> metas.get(meta.runId()))
-                .filter(Objects::nonNull)
-                .map(meta -> meta.withPathAndState(meta.path(), SSTState.SINKED))
-                .toList();
+            // Resolve every requested run exactly. Silently dropping one would allow a durable
+            // Paimon success to be published with an incomplete local SINKED set.
+            List<SSTMeta> targets = new ArrayList<>(toMark.size());
+            for (SSTMeta requested : toMark) {
+                SSTMeta current = metas.get(requested.runId());
+                if (current == null) {
+                    throw new IllegalStateException(
+                        "SST selected for Sink finalization is no longer visible: runId=" + requested.runId()
+                    );
+                }
+                targets.add(current.withPathAndState(current.path(), SSTState.SINKED));
+            }
+            updated = List.copyOf(targets);
         }
 
         try {
+            // Disk files are persisted one by one outside the visibility monitor. A failed attempt
+            // may leave a durable prefix, but memory is unchanged and retrying the same target
+            // state simply overwrites that prefix with identical SINKED metadata.
             for (SSTMeta meta : updated) {
                 sstMetaStore.save(meta);
             }
@@ -208,11 +219,12 @@ public class FileLocalStorageManager implements LocalStorageManager {
         }
 
         synchronized (this) {
+            // Publish only after the whole metadata batch is durable.
             validateStatePublicationInputs(updated);
             for (SSTMeta meta : updated) {
                 putVisibleMeta(meta);
             }
-            return metas(SSTState.SINKED);
+            return updated;
         }
     }
 

@@ -39,6 +39,9 @@ public record SinkFlightSnapshot(
     public enum Status {
         IDLE,
         IN_FLIGHT,
-        PREPARED_RETRY
+        /** A durable prepare exists, but durable success does not; retry the same Paimon commit. */
+        PREPARED_RETRY,
+        /** Durable success exists; only idempotent local finalization may be retried. */
+        FINALIZING
     }
 }
