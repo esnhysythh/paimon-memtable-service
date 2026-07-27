@@ -140,6 +140,8 @@ storage 发布采用 prepare/publish 两段式：SST data、SST meta 与经过�
 `lastFlushedSequenceId` 是本地 SST/WAL replay 边界，不是 Paimon 可见性边界。若 SST 文件已写出但 flush boundary 尚未发布就崩溃，该文件作为 orphan 忽略，数据由 WAL 重放；若 boundary 已发布，则启动时必须验证承载它的 SST 完整存在。
 flush boundary 使用独立的串行化边界，不与 SST 可见视图/read epoch 共用 monitor。
 
+进程内如果 `flushToSST()` 已经发布 SST、但 flush boundary 写入失败，Director 保留一个非持久化 `FlushFlight(sourceImmutable, outputMeta)`。下一次 Flush 继续完成同一个 output 的 boundary 和 handoff，不再次调用 `flushToSST()`；flight 只在 Immutable 移除并将原 output 发布到 maintenance RunState 后清除。因此一次 Immutable 在线重试期间只产生一个 SST。进程崩溃后不恢复该 flight，仍使用上述 orphan + WAL replay 协议。
+
 ### 4.3 Sink 与 prepared retry
 
 `SinkSelection(targetSequenceId, maxInputBytes)` 选择不超过目标 sequence 的最老连续 NEW 前缀：

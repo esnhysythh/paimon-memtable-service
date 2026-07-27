@@ -161,7 +161,7 @@ interface SSTReadSnapshot extends AutoCloseable {
 
 **SSTMeta** 至少包含 `runId`、`minFlushId/maxFlushId`、文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、`oldestWriteAtMillis`、`createdAtMillis` 和状态。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
 
-SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` 表达稳定的 `minFlushId/maxFlushId` 范围。`NEW` / `SINKED` 状态写入 `sst-*.meta.json`, 可靠状态来源是 SST metadata 和 SinkMeta success, 不是数据文件名。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。
+SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` 表达稳定的 `minFlushId/maxFlushId` 范围。`NEW` / `SINKED` 状态写入 `sst-*.meta.json`, 可靠状态来源是 SST metadata 和 SinkMeta success, 不是数据文件名。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。运行期若 SST 已发布但 flush boundary 写入失败，Director 通过非持久化 FlushFlight 复用该 SST 完成下一次重试，避免为同一个 Immutable 生成第二个 run。
 
 **BloomFilter**：
 - 每个 SST 文件包含基于主键的 BloomFilter。

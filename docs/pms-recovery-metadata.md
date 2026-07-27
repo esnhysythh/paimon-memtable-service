@@ -372,6 +372,7 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 - 启动恢复通过扫描 SinkMeta 恢复 pending prepare，并用 success meta 推导 sinked SST。
 - 运行期 durable success 之后的本地收尾失败会进入 `FINALIZING`，由 Maintenance 最高优先级重做；该路径只读取原 success metadata，不创建新 Paimon commit。
 - Flush boundary 已使用独立 `flush-boundary.meta`。
+- 运行期 flush boundary 写入失败时，非持久化 FlushFlight 会复用已经发布的 SST 完成重试；进程崩溃后仍按 orphan SST + WAL replay 恢复。
 - WAL truncate 已按 `persistedSequenceId` / `maxSequenceId` 维度实现，并在 sink success 或 recovered prepare commit 后触发；删除失败的 WAL 仍保留在候选集合中，后续 truncate 可以重试。
 - `SinkMetaPayloadCodec` 作为 SinkMeta 中 prepared/success payload 的内部二进制编解码器使用。
 
@@ -385,6 +386,7 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 
 - WAL 只 replay DATA，且 delete tombstone 正确恢复。
 - flush boundary 未推进时 orphan SST 不注册。
+- flush boundary fail-once 后在线重试复用同一个 SST，最终只存在一个 local run。
 - flush boundary 已推进但 SST/SSTMeta 损坏时启动失败。
 - prepare meta 存在、success meta 不存在时恢复 commit。
 - success meta 存在但 SSTMeta 仍为 NEW 时恢复为 SINKED。

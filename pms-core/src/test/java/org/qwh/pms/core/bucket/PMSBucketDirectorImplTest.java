@@ -621,6 +621,61 @@ class PMSBucketDirectorImplTest {
     }
 
     @Test
+    void flushBoundaryFailureRetriesTheSamePublishedSst() throws IOException {
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
+        Path storageDir = tempDir.resolve("storage");
+        Path boundaryTmpBlocker = storageDir.resolve("flush-boundary.meta.tmp");
+        dir.init();
+        try {
+            dir.put("k1".getBytes(), "v1".getBytes());
+            dir.freezeCurMemTable();
+            Files.createDirectory(boundaryTmpBlocker);
+
+            RuntimeException failure = assertThrows(
+                RuntimeException.class,
+                dir::flushImmutableMemTable
+            );
+
+            assertTrue(failure.getMessage().contains("persist flush boundary failed"));
+            BucketStateSnapshot failed = dir.stateSnapshot();
+            assertEquals(1, failed.immutableMemTableCount());
+            assertEquals(1, failed.newSSTCount());
+            assertEquals(0L, failed.lastFlushedSequenceId());
+            assertEquals(List.of(1L), failed.localRuns().stream()
+                .map(LocalRunSnapshot::runId)
+                .toList());
+
+            Files.delete(boundaryTmpBlocker);
+            FlushResult retried = dir.flushImmutableMemTable();
+
+            assertTrue(retried.progressed());
+            assertEquals(1L, retried.outputRun().orElseThrow().runId());
+            BucketStateSnapshot completed = dir.stateSnapshot();
+            assertEquals(0, completed.immutableMemTableCount());
+            assertEquals(1, completed.newSSTCount());
+            assertEquals(1L, completed.lastFlushedSequenceId());
+            assertEquals(List.of(1L), completed.localRuns().stream()
+                .map(LocalRunSnapshot::runId)
+                .toList());
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElseThrow());
+            assertFalse(dir.flushImmutableMemTable().progressed());
+
+            try (var files = Files.list(storageDir)) {
+                assertEquals(1, files.filter(path -> path.getFileName().toString().endsWith(".sst")).count());
+            }
+            try (var files = Files.list(storageDir)) {
+                assertEquals(
+                    1,
+                    files.filter(path -> path.getFileName().toString().endsWith(".meta.json")).count()
+                );
+            }
+        } finally {
+            Files.deleteIfExists(boundaryTmpBlocker);
+            dir.close();
+        }
+    }
+
+    @Test
     void sstTombstoneStopsLookup() throws IOException {
         PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256));
         dir.init();

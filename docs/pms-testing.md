@@ -50,6 +50,7 @@
 | 写入 → Freeze → Flush | curMemTable 数据正确转移为 SST，查询结果不变 |
 | 多次 Freeze + 并发查询 | 查询穿透多层 ImmutableMemTable，数据不丢失不重复 |
 | Freeze/Flush 并发查询 | 对象切换和“目标先发布、源后移除”不产生瞬时 MISS，lookup 不获取写锁 |
+| Flush boundary 在线重试 | SST 已发布但 boundary fail-once 时复用同一个 FlushFlight，成功后只存在一个 local run |
 | Sink 流程状态机 | 最老连续 NEW 前缀 → SINKED，固定 sequence fence 可跨多个有界 batch 推进 |
 | Prepared Sink 在线恢复 | commit 临时失败后不重启即可重试同一 durable prepare，且不准备新 batch |
 | Committed Sink 在线收尾 | durable success 后 SST metadata fail-once 进入 FINALIZING；重试只完成同一 batch 的本地状态，不再次 Paimon commit |
