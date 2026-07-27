@@ -193,6 +193,9 @@ public class WALManagerImpl implements WALManager {
 
     @Override
     public synchronized void truncate(long safeSequenceId) {
+        // TODO(pms-wal): detach eligible WAL metadata under this monitor and delete the files
+        // outside it, while preserving retry/recovery semantics for failed deletes. The current
+        // implementation keeps file deletion simple but can briefly delay concurrent WAL append.
         List<Long> toDelete = new ArrayList<>();
         for (var entry : walFiles.entrySet()) {
             long fileNum = entry.getKey();
