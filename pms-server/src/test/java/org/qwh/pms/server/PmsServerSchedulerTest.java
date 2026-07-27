@@ -160,11 +160,43 @@ class PmsServerSchedulerTest {
             scheduler.close();
         }
 
-        assertEquals(1, operations.preparedCommitCalls);
+        assertEquals(1, operations.sinkFlightResumeCalls);
         assertEquals(0, operations.sinkCalls);
         assertEquals(SinkFlightSnapshot.Status.IDLE, operations.sinkFlight.status());
         assertEquals(0, operations.count(SSTState.NEW));
         assertEquals(1, operations.count(SSTState.SINKED));
+    }
+
+    @Test
+    void committedSinkFinalizationRunsBeforeOrdinaryMaintenance() throws Exception {
+        MutableOperations operations = new MutableOperations();
+        LocalRunSnapshot committedRun = operations.addRun(SSTState.NEW, 1, 100);
+        operations.addRun(SSTState.NEW, 2, 100);
+        operations.lastFlushedSequenceId = 2;
+        operations.sinkFlight = new SinkFlightSnapshot(
+            SinkFlightSnapshot.Status.FINALIZING,
+            "committed-1",
+            committedRun.maxFlushId(),
+            committedRun.minSequenceId(),
+            committedRun.maxSequenceId()
+        );
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(1, 1, 600_000, 1, 10, 1_024, 1_024),
+            fixedTimeSource(Instant.ofEpochMilli(10_000))
+        );
+        try {
+            scheduler.start();
+            waitUntil(() -> operations.sinkFlight.status() == SinkFlightSnapshot.Status.IDLE);
+        } finally {
+            scheduler.close();
+        }
+
+        assertEquals(1, operations.sinkFlightResumeCalls);
+        assertEquals(0, operations.sinkCalls);
+        assertEquals(0, operations.compactCalls);
+        assertEquals(List.of(2L), operations.runIds(SSTState.NEW));
+        assertEquals(List.of(1L), operations.runIds(SSTState.SINKED));
     }
 
     @Test
@@ -569,7 +601,7 @@ class PmsServerSchedulerTest {
         private int freezeCalls;
         private int flushCalls;
         private int sinkCalls;
-        private int preparedCommitCalls;
+        private int sinkFlightResumeCalls;
         private int compactCalls;
         private int evictCalls;
         private RuntimeException flushFailure;
@@ -737,8 +769,9 @@ class PmsServerSchedulerTest {
         }
 
         @Override
-        public synchronized SinkOperationResult commitPreparedSink() {
-            if (sinkFlight.status() != SinkFlightSnapshot.Status.PREPARED_RETRY) {
+        public synchronized SinkOperationResult resumeSinkFlight() {
+            if (sinkFlight.status() != SinkFlightSnapshot.Status.PREPARED_RETRY
+                    && sinkFlight.status() != SinkFlightSnapshot.Status.FINALIZING) {
                 return SinkOperationResult.noop();
             }
             List<LocalRunSnapshot> prepared = runs(SSTState.NEW).stream()
@@ -747,7 +780,7 @@ class PmsServerSchedulerTest {
             if (prepared.isEmpty()) {
                 throw new IllegalStateException("prepared Sink has no matching NEW runs");
             }
-            preparedCommitCalls++;
+            sinkFlightResumeCalls++;
             runs.removeAll(prepared);
             List<LocalRunSnapshot> sinked = prepared.stream()
                 .map(run -> withState(run, SSTState.SINKED))
@@ -757,7 +790,7 @@ class PmsServerSchedulerTest {
             lastPersistedSequenceId = sinkFlight.maxSequenceId();
             SinkCommitResult commit = new SinkCommitResult(
                 sinkFlight.batchId(),
-                preparedCommitCalls,
+                sinkFlightResumeCalls,
                 lastPersistedSequenceId,
                 prepared.stream().map(LocalRunSnapshot::runId).toList()
             );

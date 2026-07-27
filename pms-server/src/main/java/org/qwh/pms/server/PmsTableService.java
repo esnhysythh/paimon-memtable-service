@@ -346,9 +346,9 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
     }
 
     @Override
-    public SinkOperationResult commitPreparedSink() {
+    public SinkOperationResult resumeSinkFlight() {
         synchronized (paimonCommitPublishLock) {
-            SinkOperationResult result = director.commitPreparedSink();
+            SinkOperationResult result = director.resumeSinkFlight();
             result.commitResult().ifPresent(this::publishCommittedLookupDelta);
             return result;
         }

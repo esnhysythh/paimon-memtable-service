@@ -358,8 +358,8 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 | flush boundary 已推进、SST/SSTMeta 缺失 | boundary 指向缺失数据 | 启动失败，避免丢数据 |
 | Paimon prepare 成功、prepare meta 未写 | Paimon 可能有临时 data files | 不恢复 commit，后续重新 sink；可能遗留外部垃圾 |
 | prepare meta 已写、success meta 未写 | 可恢复 prepared commit | 重试 commit，成功后写 success |
-| success meta 已写、SSTMeta 未标记 SINKED | commit 已确认 | 根据 success.sstIds 和 persistedSequenceId 修正 SSTMeta |
-| success meta 已写、WAL 未截断 | 数据可能重复存在于 WAL/SST/Paimon | 通过 flush boundary 和 sink meta 跳过/截断，不丢数据 |
+| success meta 已写、部分或全部 SSTMeta 未标记 SINKED | commit 已确认 | 进入 `FINALIZING`，按 exact batch success 幂等修正 SSTMeta、RunState 和 boundary，不再次 commit |
+| success meta 已写、WAL 未截断 | 数据可能重复存在于 WAL/SST/Paimon | 逻辑 Sink 保持完成；通过 flush boundary 和 sink meta 避免 replay 重复，并在后续 truncate 再次尝试删除 |
 
 ## 9. 当前实现状态
 
@@ -370,8 +370,9 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 - Sink prepare/success 写入独立 `SinkMetaStore`，文件为可读 metadata，并带校验字段。
 - `SinkCoordinator` 的持久化依赖已经从 `WALManager` 切换到 `SinkMetaStore`。
 - 启动恢复通过扫描 SinkMeta 恢复 pending prepare，并用 success meta 推导 sinked SST。
+- 运行期 durable success 之后的本地收尾失败会进入 `FINALIZING`，由 Maintenance 最高优先级重做；该路径只读取原 success metadata，不创建新 Paimon commit。
 - Flush boundary 已使用独立 `flush-boundary.meta`。
-- WAL truncate 已按 `persistedSequenceId` / `maxSequenceId` 维度实现，并在 sink success 或 recovered prepare commit 后触发。
+- WAL truncate 已按 `persistedSequenceId` / `maxSequenceId` 维度实现，并在 sink success 或 recovered prepare commit 后触发；删除失败的 WAL 仍保留在候选集合中，后续 truncate 可以重试。
 - `SinkMetaPayloadCodec` 作为 SinkMeta 中 prepared/success payload 的内部二进制编解码器使用。
 
 仍需后续补齐的部分：
@@ -387,5 +388,7 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 - flush boundary 已推进但 SST/SSTMeta 损坏时启动失败。
 - prepare meta 存在、success meta 不存在时恢复 commit。
 - success meta 存在但 SSTMeta 仍为 NEW 时恢复为 SINKED。
+- durable success 后本地 metadata fail-once 时进入 `FINALIZING`，在线重试后只存在原 Paimon commit。
+- 多个 SSTMeta 标记中途失败时，已经写成 SINKED 的文件和仍为 NEW 的文件可由同一 finalization 幂等收敛。
 - WAL truncate 只删除 `maxSequenceId <= persistedSequenceId` 的非当前 WAL 文件。
 - 人工改坏 metadata checksum 时拒绝加载或降级为 orphan，行为需要按是否越过 boundary 区分。

@@ -103,7 +103,7 @@ V1 不设置 `flush.max_delay`：低流量数据留在 CurMemTable，直到容�
 
 每次循环严格按以下顺序选择一个动作：
 
-1. 存在 durable prepared Sink：调用 `commitPreparedSink()`，成功前不启动其他 SST maintenance。
+1. 存在可恢复 Sink flight（`PREPARED_RETRY` 或 `FINALIZING`）：调用 `resumeSinkFlight()`；前者复用 durable prepare，后者只重做 durable success 对应的本地收尾，成功前不启动其他 SST maintenance。
 2. pending Paimon fence 已由 `lastPersistedSequenceId` 覆盖：清除 controller 状态并重新采样。
 3. 存在 pending fence 且 `lastFlushedSequenceId < fence`：signal Flush worker，本轮退出。
 4. 存在尚未满足、但已经完整 Flush 的 pending fence：Sink 一个受字节上限约束的 NEW 前缀。

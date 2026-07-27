@@ -281,7 +281,7 @@ interface SinkManager {
 }
 ```
 
-当前实现使用 `SinkCoordinator` 编排 `SinkManager` 与 `SinkMetaStore`。一次操作只 Sink `SinkSelection` 选出的最老连续 NEW 前缀；单批受输入字节数约束，但不受 SST 个数限制。commit 临时失败留下的 durable prepare 可由 `commitPreparedSink()` 在线重试，成功后与普通 Sink 共用 NEW → SINKED 和 WAL truncate 路径，并返回相同的 commit result 供 server 发布 lookup delta。
+当前实现使用 `SinkCoordinator` 编排 `SinkManager` 与 `SinkMetaStore`。一次操作只 Sink `SinkSelection` 选出的最老连续 NEW 前缀；单批受输入字节数约束，但不受 SST 个数限制。`resumeSinkFlight()` 统一处理两种在线恢复：`PREPARED_RETRY` 复用 durable prepare 重试原 commit；`FINALIZING` 从 exact batch success metadata 读取原 commit result，只幂等重做本地 NEW → SINKED 和 boundary 收尾，不再次创建 Paimon commit。两条路径都返回原 commit result 供 server 发布 lookup delta。WAL truncate 作为 success 后的可重试空间回收，不阻塞逻辑 Sink 完成。
 
 **Compaction 集成**：
 - PMS 不自己实现 Paimon 文件合并算法；由 `pms-sink-paimon` 调用 Paimon 原生 `TableWrite.compact(partition, bucket, fullCompaction)`，再通过 `prepareCommit(waitCompaction=true, commitIdentifier)` 和 `TableCommit` 提交 compact 结果。

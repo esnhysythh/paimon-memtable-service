@@ -100,9 +100,9 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
      */
     private final Object runStateMutex = new Object();
     /**
-     * V1 permits one SST maintenance operation at a time. A Sink may leave a durable prepared
-     * flight after failure; its logical flush fence then excludes the selected NEW prefix from
-     * later compaction until recovery completes.
+     * V1 permits one SST maintenance operation at a time. A Sink may leave a recoverable flight
+     * after durable prepare or durable success; its logical flush fence then excludes the selected
+     * NEW prefix from later compaction until recovery completes.
      */
     private final Object sstMaintenanceMutex = new Object();
     private boolean writeLeaderActive;
@@ -432,11 +432,14 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 SinkCommitResult result;
                 try {
                     result = sinkCoordinator.sink(batch);
+                    // Durable success now exists. Publish this state before the first local mutation
+                    // so every later failure is recovered as finalization, never as a new commit.
+                    sinkFlight = sinkFlightForCommitted(result, toSink);
+                    return finalizeCommittedSink(result, toSink);
                 } catch (RuntimeException e) {
                     refreshSinkFlightAfterFailureUnderLease();
                     throw e;
                 }
-                return completeCommittedSink(result, toSink);
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -444,42 +447,28 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     @Override
-    public SinkOperationResult commitPreparedSink() {
+    public SinkOperationResult resumeSinkFlight() {
         synchronized (sstMaintenanceMutex) {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                SinkRecoveryState recovery = sinkMetaStore.load();
-                validateSinglePendingPrepare(recovery);
-                if (recovery.pendingPrepares().isEmpty()) {
-                    if (sinkFlight.active()) {
-                        throw new IllegalStateException(
-                            "active Sink flight has no pending prepare metadata: batch=" + sinkFlight.batchId()
-                        );
-                    }
+                if (!sinkFlight.active()) {
                     return SinkOperationResult.noop();
                 }
-                if (sinkFlight.status() != SinkFlightSnapshot.Status.PREPARED_RETRY) {
-                    throw new IllegalStateException(
-                        "pending prepare metadata requires PREPARED_RETRY flight, actual=" + sinkFlight.status()
-                    );
-                }
-                PreparedSinkCommit prepared = recovery.pendingPrepares().get(0);
-                List<LocalRun> selected = resolvePreparedRuns(prepared, runState.newRuns());
-                SinkFlightSnapshot expectedFlight = sinkFlightForPrepared(prepared, selected);
-                if (!sinkFlight.equals(expectedFlight)) {
-                    throw new IllegalStateException(
-                        "prepared Sink flight differs from durable prepare metadata: batch=" + prepared.batchId()
-                    );
-                }
-                SinkCommitResult result;
                 try {
-                    result = sinkCoordinator.commitPrepared(prepared);
+                    return switch (sinkFlight.status()) {
+                        case PREPARED_RETRY -> resumePreparedSink();
+                        case FINALIZING -> resumeCommittedSinkFinalization();
+                        case IN_FLIGHT -> throw new IllegalStateException(
+                            "cannot resume a Sink while its original call is still in flight: batch="
+                                + sinkFlight.batchId()
+                        );
+                        case IDLE -> SinkOperationResult.noop();
+                    };
                 } catch (RuntimeException e) {
                     refreshSinkFlightAfterFailureUnderLease();
                     throw e;
                 }
-                return completeCommittedSink(result, selected);
             } finally {
                 lifecycleLock.readLock().unlock();
             }
@@ -796,9 +785,42 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     /** Caller must hold a lifecycle read lease. */
     private void refreshSinkFlightAfterFailureUnderLease() {
+        SinkFlightSnapshot failedFlight = sinkFlight;
+        if (!failedFlight.active()) {
+            return;
+        }
+        // A success file wins over the still-present prepare file. Retrying prepare after success
+        // could create fresh Paimon files whose payload does not describe the committed snapshot.
+        Optional<SinkCommitResult> durableSuccess = sinkMetaStore.loadSuccess(failedFlight.batchId());
+        if (durableSuccess.isPresent()) {
+            List<LocalRun> selected = resolveCommittedRuns(durableSuccess.get(), runState);
+            sinkFlight = sinkFlightForCommitted(durableSuccess.get(), selected);
+            return;
+        }
+
         SinkRecoveryState recovery = sinkMetaStore.load();
         validateSinglePendingPrepare(recovery);
-        sinkFlight = sinkFlightFromRecovery(recovery);
+        if (!recovery.pendingPrepares().isEmpty()) {
+            PreparedSinkCommit prepared = recovery.pendingPrepares().get(0);
+            if (!prepared.batchId().equals(failedFlight.batchId())) {
+                throw new IllegalStateException(
+                    "active Sink flight differs from durable prepare metadata: active="
+                        + failedFlight.batchId()
+                        + ", durable="
+                        + prepared.batchId()
+                );
+            }
+            List<LocalRun> selected = resolvePreparedRuns(prepared, runState.newRuns());
+            sinkFlight = sinkFlightForPrepared(prepared, selected);
+            return;
+        }
+        if (failedFlight.status() != SinkFlightSnapshot.Status.IN_FLIGHT) {
+            throw new IllegalStateException(
+                "recoverable Sink flight has no durable metadata: batch=" + failedFlight.batchId()
+                    + ", status=" + failedFlight.status()
+            );
+        }
+        sinkFlight = SinkFlightSnapshot.idle();
     }
 
     private static List<LocalRun> localRuns(List<SSTMeta> metas) {
@@ -815,7 +837,44 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return System.currentTimeMillis();
     }
 
-    private SinkOperationResult completeCommittedSink(
+    private SinkOperationResult resumePreparedSink() {
+        SinkRecoveryState recovery = sinkMetaStore.load();
+        validateSinglePendingPrepare(recovery);
+        if (recovery.pendingPrepares().isEmpty()) {
+            throw new IllegalStateException(
+                "PREPARED_RETRY Sink flight has no pending prepare metadata: batch=" + sinkFlight.batchId()
+            );
+        }
+        PreparedSinkCommit prepared = recovery.pendingPrepares().get(0);
+        List<LocalRun> selected = resolvePreparedRuns(prepared, runState.newRuns());
+        SinkFlightSnapshot expectedFlight = sinkFlightForPrepared(prepared, selected);
+        if (!sinkFlight.equals(expectedFlight)) {
+            throw new IllegalStateException(
+                "prepared Sink flight differs from durable prepare metadata: batch=" + prepared.batchId()
+            );
+        }
+        SinkCommitResult result = sinkCoordinator.commitPrepared(prepared);
+        sinkFlight = sinkFlightForCommitted(result, selected);
+        return finalizeCommittedSink(result, selected);
+    }
+
+    private SinkOperationResult resumeCommittedSinkFinalization() {
+        // Deliberately bypass SinkCoordinator: FINALIZING must never invoke Paimon prepare/commit.
+        SinkCommitResult result = sinkMetaStore.loadSuccess(sinkFlight.batchId())
+            .orElseThrow(() -> new IllegalStateException(
+                "FINALIZING Sink flight has no durable success metadata: batch=" + sinkFlight.batchId()
+            ));
+        List<LocalRun> selected = resolveCommittedRuns(result, runState);
+        SinkFlightSnapshot expectedFlight = sinkFlightForCommitted(result, selected);
+        if (!sinkFlight.equals(expectedFlight)) {
+            throw new IllegalStateException(
+                "finalizing Sink flight differs from durable success metadata: batch=" + result.batchId()
+            );
+        }
+        return finalizeCommittedSink(result, selected);
+    }
+
+    private SinkOperationResult finalizeCommittedSink(
             SinkCommitResult result,
             List<LocalRun> selectedRuns) {
         List<Long> selectedRunIds = selectedRuns.stream().map(LocalRun::runId).toList();
@@ -825,17 +884,33 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             );
         }
         Set<Long> sinkedIds = Set.copyOf(selectedRunIds);
-        List<SSTMeta> selectedSinkedMetas = storageManager.markSinked(metas(selectedRuns)).stream()
-            .filter(meta -> sinkedIds.contains(meta.runId()))
-            .toList();
-        walManager.truncate(result.persistedSequenceId());
-        List<LocalRun> publishedSinkedRuns = publishSinkedRuns(sinkedIds, selectedSinkedMetas);
+        // Both steps are ensure-style operations. Repeating them after a partial previous attempt
+        // converges to the same metadata and immutable RunState without duplicating runs.
+        List<SSTMeta> selectedSinkedMetas = storageManager.markSinked(metas(selectedRuns));
+        List<LocalRun> publishedSinkedRuns = ensureSinkedRuns(sinkedIds, selectedSinkedMetas);
         lastPersistedSequenceId = Math.max(lastPersistedSequenceId, result.persistedSequenceId());
         lastSinkedSnapshotId = Math.max(lastSinkedSnapshotId, result.snapshotId());
-        sinkFlight = SinkFlightSnapshot.idle();
         List<LocalRunSnapshot> sinked = publishedSinkedRuns.stream()
             .map(LocalRun::snapshot)
             .toList();
+        SinkOperationResult operationResult = new SinkOperationResult(
+            OperationStatus.PROGRESSED,
+            Optional.of(result),
+            sinked
+        );
+        // At this point every logical local state derived from durable success is published.
+        // WAL deletion is only space reclamation, so it must not keep the Sink flight active.
+        sinkFlight = SinkFlightSnapshot.idle();
+        try {
+            walManager.truncate(result.persistedSequenceId());
+        } catch (RuntimeException e) {
+            LOG.warn(
+                "Failed to truncate WAL after durable Sink success: batch={}, persistedSequenceId={}",
+                result.batchId(),
+                result.persistedSequenceId(),
+                e
+            );
+        }
         RunState published = runState;
         LOG.debug(
             "Sink completed: batch={}, newSST count={}, sinkedSST count={}",
@@ -843,11 +918,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             published.newRuns().size(),
             published.sinkedRuns().size()
         );
-        return new SinkOperationResult(
-            OperationStatus.PROGRESSED,
-            Optional.of(result),
-            sinked
-        );
+        return operationResult;
     }
 
     private CompactionResult.Group compactSelectedGroup(SSTState state, List<LocalRun> selected) {
@@ -911,21 +982,31 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         }
     }
 
-    private List<LocalRun> publishSinkedRuns(Set<Long> sinkedIds, List<SSTMeta> sinkedMetas) {
+    private List<LocalRun> ensureSinkedRuns(Set<Long> sinkedIds, List<SSTMeta> sinkedMetas) {
         if (sinkedMetas.size() != sinkedIds.size()
                 || sinkedMetas.stream().anyMatch(meta -> meta.state() != SSTState.SINKED)) {
             throw new IllegalStateException("Sink success did not publish every selected run as SINKED");
         }
         synchronized (runStateMutex) {
             RunState current = runState;
+            // A retry may observe each target in either side of the transition. Rebuild the target
+            // set exactly once instead of requiring every run to still be NEW.
+            Set<Long> visibleIds = new HashSet<>();
+            current.newRuns().forEach(run -> visibleIds.add(run.runId()));
+            current.sinkedRuns().forEach(run -> visibleIds.add(run.runId()));
+            if (!visibleIds.containsAll(sinkedIds)) {
+                throw new IllegalStateException("Sink inputs are no longer maintenance-visible");
+            }
             List<LocalRun> remainingNew = current.newRuns().stream()
                 .filter(run -> !sinkedIds.contains(run.runId()))
                 .toList();
-            if (current.newRuns().size() - remainingNew.size() != sinkedIds.size()) {
-                throw new IllegalStateException("Sink inputs are no longer maintenance-visible as NEW");
-            }
             List<LocalRun> published = localRuns(sinkedMetas);
-            List<LocalRun> updatedSinked = new ArrayList<>(current.sinkedRuns());
+            List<LocalRun> updatedSinked = new ArrayList<>();
+            for (LocalRun run : current.sinkedRuns()) {
+                if (!sinkedIds.contains(run.runId())) {
+                    updatedSinked.add(run);
+                }
+            }
             updatedSinked.addAll(published);
             runState = new RunState(remainingNew, updatedSinked);
             return published;
@@ -1045,6 +1126,40 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return selected;
     }
 
+    private static List<LocalRun> resolveCommittedRuns(
+            SinkCommitResult result,
+            RunState state) {
+        Map<Long, LocalRun> candidates = new TreeMap<>();
+        for (LocalRun run : state.newRuns()) {
+            candidates.put(run.runId(), run);
+        }
+        for (LocalRun run : state.sinkedRuns()) {
+            if (candidates.put(run.runId(), run) != null) {
+                throw new IllegalStateException("run appears in both maintenance states: " + run.runId());
+            }
+        }
+        List<LocalRun> selected = new ArrayList<>(result.sstIds().size());
+        for (long runId : result.sstIds()) {
+            LocalRun run = candidates.get(runId);
+            if (run == null) {
+                throw new IllegalStateException(
+                    "durable Sink success references missing or replaced local run: batch="
+                        + result.batchId()
+                        + ", runId="
+                        + runId
+                );
+            }
+            selected.add(run);
+        }
+        validateContinuousRuns("Committed Sink finalization", selected);
+        if (maxSequenceId(metas(selected)) != result.persistedSequenceId()) {
+            throw new IllegalStateException(
+                "durable Sink success sequence boundary differs from local runs: batch=" + result.batchId()
+            );
+        }
+        return List.copyOf(selected);
+    }
+
     private static SinkFlightSnapshot sinkFlightForPrepared(
             PreparedSinkCommit prepared,
             List<LocalRun> selected) {
@@ -1054,6 +1169,26 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             maxFlushId(metas(selected)),
             prepared.minSequenceId(),
             prepared.maxSequenceId()
+        );
+    }
+
+    private static SinkFlightSnapshot sinkFlightForCommitted(
+            SinkCommitResult result,
+            List<LocalRun> selected) {
+        List<SSTMeta> selectedMetas = metas(selected);
+        List<Long> selectedRunIds = selected.stream().map(LocalRun::runId).toList();
+        if (!result.sstIds().equals(selectedRunIds)
+                || maxSequenceId(selectedMetas) != result.persistedSequenceId()) {
+            throw new IllegalStateException(
+                "committed Sink result differs from local runs: batch=" + result.batchId()
+            );
+        }
+        return new SinkFlightSnapshot(
+            SinkFlightSnapshot.Status.FINALIZING,
+            result.batchId(),
+            maxFlushId(selectedMetas),
+            minSequenceId(selectedMetas),
+            result.persistedSequenceId()
         );
     }
 

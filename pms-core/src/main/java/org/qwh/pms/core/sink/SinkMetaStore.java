@@ -14,6 +14,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.zip.CRC32;
 
@@ -92,6 +93,27 @@ public final class SinkMetaStore {
             lastSnapshotId,
             lastPersistedSequenceId
         );
+    }
+
+    /**
+     * Loads the exact durable result needed to finish one committed batch locally.
+     *
+     * <p>The aggregate recovery view intentionally keeps only boundaries and run IDs, so it cannot
+     * reproduce the original commit payload required by the server lookup delta.
+     */
+    public Optional<SinkCommitResult> loadSuccess(String batchId) {
+        if (batchId == null || batchId.isBlank()) {
+            throw new IllegalArgumentException("batchId must not be blank");
+        }
+        Path path = successPath(batchId);
+        if (!Files.exists(path)) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(readSuccess(path));
+        } catch (IOException e) {
+            throw new RuntimeException("load sink success metadata failed: " + path, e);
+        }
     }
 
     private PreparedSinkCommit readPrepare(Path path) throws IOException {

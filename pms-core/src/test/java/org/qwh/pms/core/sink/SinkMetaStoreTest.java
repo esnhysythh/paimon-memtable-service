@@ -73,6 +73,30 @@ class SinkMetaStoreTest {
     }
 
     @Test
+    void loadsExactDurableSuccessByBatchId() throws IOException {
+        SinkMetaStore store = store();
+        PreparedSinkCommit prepared = prepared("sink-10-2");
+        SinkCommitResult success = new SinkCommitResult(
+            prepared.batchId(),
+            42L,
+            prepared.maxSequenceId(),
+            prepared.sstIds(),
+            new byte[] {7, 8, 9}
+        );
+        store.savePrepare(prepared);
+        store.saveSuccess(success);
+
+        SinkCommitResult loaded = store.loadSuccess(prepared.batchId()).orElseThrow();
+
+        assertEquals(success.batchId(), loaded.batchId());
+        assertEquals(success.snapshotId(), loaded.snapshotId());
+        assertEquals(success.persistedSequenceId(), loaded.persistedSequenceId());
+        assertEquals(success.sstIds(), loaded.sstIds());
+        assertArrayEquals(success.commitPayload(), loaded.commitPayload());
+        assertTrue(store.loadSuccess("missing-batch").isEmpty());
+    }
+
+    @Test
     void metadataIsHumanReadableJson() throws IOException {
         SinkMetaStore store = store();
         PreparedSinkCommit prepared = prepared("sink-10-2");

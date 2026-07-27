@@ -14,6 +14,7 @@ import org.qwh.pms.core.wal.util.Slice;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -201,6 +202,36 @@ class WALManagerImplTest {
         boolean hasK2 = cb.dataRecords.stream().anyMatch(r -> Arrays.equals(r.key(), "k2".getBytes()));
         assertFalse(hasK1, "k1 should have been truncated");
         assertTrue(hasK2, "k2 should remain after truncate");
+    }
+
+    @Test
+    void failedWalDeletionRemainsEligibleForLaterTruncate() throws IOException {
+        WALManagerImpl wal = new WALManagerImpl(config(1));
+        wal.init();
+        Path firstWal = tempDir.resolve("wal-000001.log");
+        Path blocker = firstWal.resolve("blocker");
+        try {
+            wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
+            wal.appendDataRecord("pad".getBytes(), new byte[1100 * 1024]);
+            Files.delete(firstWal);
+            Files.createDirectory(firstWal);
+            Files.createFile(blocker);
+
+            wal.truncate(2L);
+
+            assertTrue(Files.isDirectory(firstWal), "failed deletion should leave the WAL candidate");
+            Files.delete(blocker);
+            Files.delete(firstWal);
+            Files.createFile(firstWal);
+
+            wal.truncate(2L);
+
+            assertFalse(Files.exists(firstWal), "a later truncate should retry the retained candidate");
+        } finally {
+            Files.deleteIfExists(blocker);
+            Files.deleteIfExists(firstWal);
+            wal.close();
+        }
     }
 
     @Test

@@ -110,7 +110,7 @@ MemTable 通过不可变 `MemTableState` 整体发布。点查与 scan 通过 `L
 FreezeResult freezeCurMemTable();
 FlushResult flushImmutableMemTable();
 SinkOperationResult sinkToPaimon(SinkSelection selection);
-SinkOperationResult commitPreparedSink();
+SinkOperationResult resumeSinkFlight();
 CompactionResult compactLocalSSTs(CompactionSelection selection);
 EvictionResult evictOldestSinkedSST();
 BucketStateSnapshot stateSnapshot();
@@ -157,11 +157,18 @@ select NEW prefix
   -> durable SinkMeta prepare
   -> Paimon commit
   -> durable SinkMeta success
-  -> atomically publish NEW -> SINKED
-  -> truncate eligible WAL files
+  -> persist every selected SSTMeta as SINKED
+  -> idempotently publish NEW -> SINKED and persisted boundaries
+  -> clear Sink flight
+  -> best-effort truncate eligible WAL files
 ```
 
-commit 临时失败后，durable prepare 保留，`sinkFlight` 进入 `PREPARED_RETRY`。此时不得准备新 batch，也不得执行会改变相关 run 的 compact/evict；`commitPreparedSink()` 只重试该 prepared commit。成功后走与普通 Sink 相同的 success 发布路径，不要求重启进程。
+`sinkFlight` 的可恢复状态只有两种：
+
+- `PREPARED_RETRY`：durable prepare 已存在，但 durable success 尚不存在。`resumeSinkFlight()` 只重试原 prepared commit。
+- `FINALIZING`：Paimon commit 和 durable success 已存在。`resumeSinkFlight()` 按 batchId 读取原 success，只重做本地 SST metadata、RunState 和 boundary 收尾，绝不再次调用 Paimon prepare/commit。
+
+两种状态都保持最高维护优先级，不得准备新 batch，也不得执行会改变相关 run 的 compact/evict。SST metadata 可能在多个文件之间部分写入，因此本地收尾必须幂等：重试接受目标 run 已经是 NEW 或 SINKED，并最终发布同一组 SINKED run。WAL truncate 是 success 后的空间回收；删除失败保留候选文件供后续 truncate 重试，但不让已经完成的逻辑 Sink 永久占用 flight。
 
 ### 4.4 Local compact
 

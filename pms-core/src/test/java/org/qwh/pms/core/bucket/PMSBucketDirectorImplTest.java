@@ -1117,7 +1117,7 @@ class PMSBucketDirectorImplTest {
             assertEquals("sink-1-1", failedSink.sinkFlight().batchId());
             assertEquals(1L, failedSink.sinkFlight().sinkFenceFlushId());
 
-            RuntimeException retryError = assertThrows(RuntimeException.class, dir1::commitPreparedSink);
+            RuntimeException retryError = assertThrows(RuntimeException.class, dir1::resumeSinkFlight);
             assertTrue(retryError.getMessage().contains("commit failed after prepare"));
             assertEquals(1, failingSink.prepareCalls);
             assertEquals(2, failingSink.commitCalls);
@@ -1184,7 +1184,7 @@ class PMSBucketDirectorImplTest {
 
             flushEntry(dir, "k2", "v2");
 
-            SinkOperationResult retried = dir.commitPreparedSink();
+            SinkOperationResult retried = dir.resumeSinkFlight();
 
             assertTrue(retried.progressed());
             assertEquals(77L, retried.commitResult().orElseThrow().snapshotId());
@@ -1204,8 +1204,113 @@ class PMSBucketDirectorImplTest {
             assertEquals(77L, recovered.lastSinkedSnapshotId());
             assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElseThrow());
             assertArrayEquals("v2".getBytes(), dir.get("k2".getBytes()).orElseThrow());
-            assertFalse(dir.commitPreparedSink().progressed());
+            assertFalse(dir.resumeSinkFlight().progressed());
         } finally {
+            dir.close();
+        }
+    }
+
+    @Test
+    void durableSinkSuccessFinalizationRetriesWithoutAnotherPaimonCommit() throws IOException {
+        RecordingSinkManager sinkManager = new RecordingSinkManager(77);
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
+        Path metadataTmpBlocker = tempDir.resolve("storage")
+            .resolve("sst-000001-000001.meta.json.tmp");
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+            Files.createDirectory(metadataTmpBlocker);
+
+            RuntimeException failure = assertThrows(
+                RuntimeException.class,
+                () -> dir.sinkToPaimon(allAvailableSinkSelection())
+            );
+
+            assertTrue(failure.getMessage().contains("persist SINKED SST metadata failed"));
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(1, sinkManager.commitCalls);
+            BucketStateSnapshot finalizing = dir.stateSnapshot();
+            assertEquals(SinkFlightSnapshot.Status.FINALIZING, finalizing.sinkFlight().status());
+            assertEquals("sink-1-1", finalizing.sinkFlight().batchId());
+            assertEquals(1, finalizing.newSSTCount());
+            assertEquals(0, finalizing.sinkedSSTCount());
+            assertEquals(0L, finalizing.lastPersistedSequenceId());
+            assertTrue(Files.exists(tempDir.resolve("storage")
+                .resolve("sink")
+                .resolve("sink-1-1.success.json")));
+
+            Files.delete(metadataTmpBlocker);
+            SinkOperationResult resumed = dir.resumeSinkFlight();
+
+            assertTrue(resumed.progressed());
+            assertEquals(77L, resumed.commitResult().orElseThrow().snapshotId());
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(1, sinkManager.commitCalls);
+            BucketStateSnapshot completed = dir.stateSnapshot();
+            assertEquals(SinkFlightSnapshot.Status.IDLE, completed.sinkFlight().status());
+            assertEquals(0, completed.newSSTCount());
+            assertEquals(1, completed.sinkedSSTCount());
+            assertEquals(1L, completed.lastPersistedSequenceId());
+            assertEquals(77L, completed.lastSinkedSnapshotId());
+            assertArrayEquals("v1".getBytes(), dir.get("k1".getBytes()).orElseThrow());
+        } finally {
+            Files.deleteIfExists(metadataTmpBlocker);
+            dir.close();
+        }
+    }
+
+    @Test
+    void partiallyPersistedSinkedMetadataFinalizesIdempotently() throws IOException {
+        RecordingSinkManager sinkManager = new RecordingSinkManager(88);
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
+        Path secondMetadataTmpBlocker = tempDir.resolve("storage")
+            .resolve("sst-000002-000002.meta.json.tmp");
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+            flushEntry(dir, "k2", "v2");
+            Files.createDirectory(secondMetadataTmpBlocker);
+
+            assertThrows(
+                RuntimeException.class,
+                () -> dir.sinkToPaimon(allAvailableSinkSelection())
+            );
+
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(1, sinkManager.commitCalls);
+            assertEquals(
+                SinkFlightSnapshot.Status.FINALIZING,
+                dir.stateSnapshot().sinkFlight().status()
+            );
+            String firstMetadata = Files.readString(
+                tempDir.resolve("storage").resolve("sst-000001-000001.meta.json"),
+                StandardCharsets.UTF_8
+            );
+            String secondMetadata = Files.readString(
+                tempDir.resolve("storage").resolve("sst-000002-000002.meta.json"),
+                StandardCharsets.UTF_8
+            );
+            assertTrue(firstMetadata.contains("\"state\": \"SINKED\""));
+            assertTrue(secondMetadata.contains("\"state\": \"NEW\""));
+
+            Files.delete(secondMetadataTmpBlocker);
+            SinkOperationResult resumed = dir.resumeSinkFlight();
+
+            assertTrue(resumed.progressed());
+            assertEquals(List.of(1L, 2L), resumed.sinkedRuns().stream()
+                .map(LocalRunSnapshot::runId)
+                .toList());
+            assertEquals(1, sinkManager.prepareCalls);
+            assertEquals(1, sinkManager.commitCalls);
+            BucketStateSnapshot completed = dir.stateSnapshot();
+            assertEquals(SinkFlightSnapshot.Status.IDLE, completed.sinkFlight().status());
+            assertEquals(0, completed.newSSTCount());
+            assertEquals(2, completed.sinkedSSTCount());
+            assertEquals(2, completed.localRuns().stream()
+                .filter(run -> run.state() == SSTState.SINKED)
+                .count());
+        } finally {
+            Files.deleteIfExists(secondMetadataTmpBlocker);
             dir.close();
         }
     }

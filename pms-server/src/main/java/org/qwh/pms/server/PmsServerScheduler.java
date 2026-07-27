@@ -313,16 +313,21 @@ public final class PmsServerScheduler implements AutoCloseable {
                 return;
             }
 
-            // A durable prepared Sink must be resolved before starting any other SST maintenance.
-            // Flush remains independent and may continue on its own worker.
-            // durable prepared Sink 必须先得到解决, 才能启动其他 SST 维护; Flush 保持独立, 仍可
-            // 在自己的 worker 上继续执行.
-            if (state.sinkFlight().status() == SinkFlightSnapshot.Status.PREPARED_RETRY) {
-                SinkOperationResult result = executePreparedRetry(state);
+            // A recoverable Sink flight must be resolved before starting any other SST maintenance.
+            // PREPARED_RETRY reuses the durable Paimon prepare; FINALIZING only reapplies local
+            // state derived from durable success. Flush remains independent on its own worker.
+            // 可恢复的 Sink flight 必须先得到解决, 才能启动其他 SST 维护. PREPARED_RETRY 复用
+            // durable Paimon prepare; FINALIZING 只重做 durable success 对应的本地状态收尾.
+            if (state.sinkFlight().status() == SinkFlightSnapshot.Status.PREPARED_RETRY
+                    || state.sinkFlight().status() == SinkFlightSnapshot.Status.FINALIZING) {
+                SinkOperationResult result = executeSinkFlightResume(state);
                 if (!result.progressed()) {
                     return;
                 }
                 continue;
+            }
+            if (state.sinkFlight().status() == SinkFlightSnapshot.Status.IN_FLIGHT) {
+                return;
             }
 
             long fence = pendingPaimonFenceSequenceId.get();
@@ -424,14 +429,15 @@ public final class PmsServerScheduler implements AutoCloseable {
         );
     }
 
-    private SinkOperationResult executePreparedRetry(BucketStateSnapshot state) {
+    private SinkOperationResult executeSinkFlightResume(BucketStateSnapshot state) {
+        String status = state.sinkFlight().status().name();
         return executeAction(
             "maintenance",
-            "COMMIT_PREPARED_SINK",
-            "PREPARED_RETRY",
+            "RESUME_SINK_FLIGHT",
+            status,
             "batchId=" + state.sinkFlight().batchId()
                 + " fenceFlushId=" + state.sinkFlight().sinkFenceFlushId(),
-            operations::commitPreparedSink,
+            operations::resumeSinkFlight,
             SinkOperationResult::progressed
         );
     }
@@ -626,7 +632,7 @@ public final class PmsServerScheduler implements AutoCloseable {
 
         SinkOperationResult sinkToPaimon(SinkSelection selection);
 
-        SinkOperationResult commitPreparedSink();
+        SinkOperationResult resumeSinkFlight();
 
         CompactionResult compactLocalSSTs(CompactionSelection selection);
 
