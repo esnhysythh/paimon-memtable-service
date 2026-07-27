@@ -67,6 +67,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private volatile MemTableState memTables;
     private volatile RunState runState = RunState.empty();
     private volatile SinkFlightSnapshot sinkFlight = SinkFlightSnapshot.idle();
+    /** Protected by flushMutex; retained only while this process retries one Flush handoff. */
+    private FlushFlight flushFlight;
     private volatile long recoveredUnpersistedMaxSequenceId;
     private volatile long lastFlushedSequenceId;
     private volatile long lastPersistedSequenceId;
@@ -358,17 +360,27 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             lifecycleLock.readLock().lock();
             try {
                 ensureNotClosed();
-                ImmutableMemTable toFlush;
-                synchronized (writeMutex) {
-                    if (memTables.immutables().isEmpty()) {
-                        return FlushResult.noop();
+                FlushFlight flight = flushFlight;
+                if (flight == null) {
+                    ImmutableMemTable toFlush;
+                    synchronized (writeMutex) {
+                        if (memTables.immutables().isEmpty()) {
+                            return FlushResult.noop();
+                        }
+                        toFlush = memTables.immutables().get(0);
                     }
-                    toFlush = memTables.immutables().get(0);
+
+                    // Keep the lifecycle lease across I/O. close() must not close storage while an
+                    // operation selected under the lease is still using it.
+                    // Once Storage publishes an SST, every in-process retry must finish this exact
+                    // output. Re-flushing the same immutable would create a second visible run.
+                    SSTMeta output = storageManager.flushToSST(toFlush);
+                    flight = new FlushFlight(toFlush, output);
+                    flushFlight = flight;
                 }
 
-                // Keep the lifecycle lease across I/O. close() must not close storage while an
-                // operation selected under the lease is still using it.
-                SSTMeta meta = storageManager.flushToSST(toFlush);
+                ImmutableMemTable toFlush = flight.source();
+                SSTMeta meta = flight.output();
                 storageManager.persistFlushedSequenceId(meta.maxSequenceId());
 
                 synchronized (writeMutex) {
@@ -383,6 +395,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                 // A run becomes maintenance-eligible only after both its durable flush boundary
                 // and the MemTable -> SST query handoff have completed.
                 LocalRun output = publishFlushedRun(meta);
+                // Clear before logging/result construction: all stateful Flush steps are complete.
+                flushFlight = null;
                 LOG.debug(
                     "Flush: immutable count={}, newSST count={}",
                     memTables.immutables().size(),
@@ -1440,6 +1454,14 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
             Objects.requireNonNull(current, "current must not be null");
             Objects.requireNonNull(immutables, "immutables must not be null");
             immutables = List.copyOf(immutables);
+        }
+    }
+
+    /** In-process ownership of one Storage-published SST whose Flush handoff is not complete yet. */
+    private record FlushFlight(ImmutableMemTable source, SSTMeta output) {
+        private FlushFlight {
+            Objects.requireNonNull(source, "source must not be null");
+            Objects.requireNonNull(output, "output must not be null");
         }
     }
 
