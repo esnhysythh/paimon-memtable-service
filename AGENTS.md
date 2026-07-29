@@ -25,5 +25,5 @@
 详细设计以 `design.md` 为准. 实现时特别注意: 
 
 - `pms-core` 保持 byte-oriented, 不直接依赖 `pms-codec` 或暴露 Paimon `InternalRow`.
-- V1 不处理 Paimon 表 Schema 变更.
+- V1 假定绑定表的 Schema 在 PMS 本地状态生命周期内保持不变；该约束由部署与用户行为保证，程序不主动监控或阻止 Schema 变更.
 - PMS 按单一 Paimon 表的唯一写入者模型实现.

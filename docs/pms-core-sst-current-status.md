@@ -118,8 +118,8 @@ interface RowCodecFactory {
 - `decode(null)` 不应表示 delete。
 - `INSERT/UPDATE_AFTER` 归一化为 `put(key, valueBytes)`；`DELETE/UPDATE_BEFORE` 归一化为 `delete(key)`。
 - `pms-codec` 不反向依赖 `pms-core`，因此 primary key codec 返回 `byte[]`，由调用方构造 core 层的 `Key` 或调用 bucket 接口。
-- V1 绑定单表，运行期间 RowType/Schema 不变；检测到 schema 变更应视为 fatal。
-- RowCodec 应保持与 Paimon `InternalRow` / `RowType` 的稳定映射，并由格式版本与 schema fingerprint 拒绝不兼容 payload。
+- V1 绑定单表，并由产品与部署约束保证该 PMS 本地状态生命周期内的 RowType/Schema 不变；core 与 codec 不负责主动监控或阻止 Schema 变更。
+- RowCodec 应保持与启动时固定的 Paimon `InternalRow` / `RowType` 稳定映射；格式版本和 handshake schema fingerprint 用于校验各自的编码/协议边界，不构成运行期 Schema 变更检测机制。
 - Mock codec 可以用于打通测试，但类名应明确标记 mock/test，避免误认为生产编码。
 
 ## 5. 后续验证

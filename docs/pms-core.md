@@ -75,7 +75,7 @@ interface CurMemTable {
 }
 ```
 
-- Schema 校验由上层处理，不在此接口传递。V1 中 PMS 绑定单表，Schema 不变（变更即 Fatal Error）。
+- Schema 不进入 core 接口。V1 在产品与部署层保证绑定表 Schema 不变，core 不负责监控或阻止 Schema 变更。
 - Key 使用无符号字节比较（与 Paimon 主键序一致），参见 [paimon-primary-key-encoding.md](../references/paimon-primary-key-encoding.md)。
 - 删除不通过 `CurMemTable.delete(Key)` 表达，而是写入 `Value.tombstone(sequenceId)`。这样 tombstone 与普通 upsert 一样携带明确的 sequence 边界。
 

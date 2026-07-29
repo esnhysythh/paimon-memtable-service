@@ -4,7 +4,13 @@
 
 `pms-server` 是单机 PMS 的可执行外壳。它负责配置解析、表与本地状态恢复、HTTP 服务、写入 admission、Paimon 历史点查、后台调度和进程生命周期；本地 LSM 操作本身由 `pms-core` 实现。
 
-V1 采用一张 Paimon 表对应一个 runtime、PMS 是该表唯一写入者的模型。配置只在启动时加载，不支持热更新。
+V1 采用一张 Paimon 表对应一个 runtime、PMS 是该表唯一写入者的模型。绑定表 Schema 在整套
+PMS 本地状态生命周期内保持不变；与唯一写入者约束相同，这由产品与部署行为保证，server
+不主动监控或阻止 Schema 变更。配置只在启动时加载，不支持热更新。
+
+需要变更 Schema 时，应先停止上游写入，调用 `/sink` 并等待
+`lastPersistedSequenceId >= fenceSequenceId`，再停止 PMS。变更完成后使用全新的 WAL、
+storage 与 lookup cache 目录部署新实例，不复用旧 Schema 对应的本地状态。
 
 ## 2. 核心组件
 
@@ -30,7 +36,7 @@ binary endpoint 默认要求 HTTP/2。h2c client 应先访问 `/pms/api/v1/hands
 |--------|------|----------|
 | `OK` | 写入成功 | 继续写入 |
 | `OVERLOADED` | Immutable/NEW backlog 达到水位，写入未进入 WAL | 退避重试 |
-| `SCHEMA_MISMATCH` | V1 不支持 Schema 变化 | 停止写入并修复部署 |
+| `SCHEMA_MISMATCH` | 防御性保留的 Schema 不一致状态 | 停止使用当前部署并检查产品约束 |
 | `SHUTTING_DOWN` | runtime 不再接收请求 | 切换实例或稍后重试 |
 
 WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteException`。此时请求结果是 unknown outcome，runtime 进入 `FAILED` 并异步关闭 HTTP、scheduler 和 table service，等待重启恢复。
@@ -40,7 +46,7 @@ WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteExcept
 `PmsTableService.open()` 在对外监听前完成本地状态恢复：
 
 ```text
-load/validate Paimon table and fixed schema
+load/validate Paimon table and supported table profile
   -> initialize local storage and flush boundary
   -> initialize SinkMeta and derive NEW/SINKED state
   -> initialize WAL and replay data beyond lastFlushedSequenceId
@@ -51,7 +57,7 @@ load/validate Paimon table and fixed schema
   -> start HTTP, then scheduler
 ```
 
-启动时的 metadata 损坏、Schema mismatch、SST/flush boundary 不一致或非法 prepared 状态属于确定性错误，必须拒绝启动。恢复出的、尚未由 `lastPersistedSequenceId` 覆盖的数据会使 scheduler 尽快建立新的 Paimon 可见性 fence，而不是等待可能失真的 wall-clock age。
+启动时的 metadata 损坏、表 profile 不受支持、SST/flush boundary 不一致或非法 prepared 状态属于确定性错误，必须拒绝启动。server 不会把当前表 Schema 与旧进程或旧本地状态做主动比对；Schema 不变由上述产品约束保证。恢复出的、尚未由 `lastPersistedSequenceId` 覆盖的数据会使 scheduler 尽快建立新的 Paimon 可见性 fence，而不是等待可能失真的 wall-clock age。
 
 ### 2.3 配置管理
 
@@ -128,7 +134,7 @@ Sink 与 compact 不冲突：数据 Sink 后仍可在 SINKED 状态 compact。�
 
 Flush/Maintenance worker 捕获运行期 `RuntimeException`，记录失败并在下一个周期或已有 signal 重试；不维护单独 retry timer。积压达到 flow-control 水位后，写入会被 `OVERLOADED` 阻止。
 
-V1 不构建复杂的后台 fatal exception taxonomy。确定性配置、Schema 与恢复损坏在启动阶段 fail fast；运行期只对已有明确语义的 fatal write 关闭 runtime。待故障注入与生产样本证明需要后，再增加少量显式 fatal 类型，而不是按异常消息猜测。
+V1 不构建复杂的后台 fatal exception taxonomy。确定性配置、表 profile 与恢复损坏在启动阶段 fail fast；运行期只对已有明确语义的 fatal write 关闭 runtime。Schema 不变属于产品前置条件，不由后台任务主动监控。待故障注入与生产样本证明需要后，再增加少量显式 fatal 类型，而不是按异常消息猜测。
 
 所有实际 Flush 或 Maintenance 动作都使用统一日志标记：
 
