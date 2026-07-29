@@ -9,7 +9,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -32,7 +31,9 @@ public class FileLocalStorageManager implements LocalStorageManager {
     private final Path dir;
     private final FlushBoundaryStore flushBoundaryStore;
     private final SSTMetaStore sstMetaStore;
+    private final FileDeleter fileDeleter;
     private final Object flushBoundaryMutex = new Object();
+    private final Object flushWriteMutex = new Object();
     private final ConcurrentSkipListMap<Long, SSTMeta> metas = new ConcurrentSkipListMap<>();
     private final ConcurrentHashMap<Long, SSTReaderRef> readers = new ConcurrentHashMap<>();
     private final Map<Long, Integer> activeReadEpochs = new HashMap<>();
@@ -43,95 +44,62 @@ public class FileLocalStorageManager implements LocalStorageManager {
     private volatile long lastFlushedSequenceId;
 
     public FileLocalStorageManager(StorageConfig config) {
+        this(config, path -> Files.deleteIfExists(path));
+    }
+
+    FileLocalStorageManager(StorageConfig config, FileDeleter fileDeleter) {
         if (config.dir() == null) {
             throw new IllegalArgumentException("storage dir must not be null");
         }
         this.dir = Path.of(config.dir());
         this.flushBoundaryStore = new FlushBoundaryStore(dir);
         this.sstMetaStore = new SSTMetaStore(dir);
+        this.fileDeleter = Objects.requireNonNull(fileDeleter, "fileDeleter must not be null");
     }
 
     public synchronized void init() throws IOException {
+        init(0);
+    }
+
+    /**
+     * Initializes the local SST view using the already durable Paimon sequence boundary.
+     */
+    public synchronized void init(long lastPersistedSequenceId) throws IOException {
         Files.createDirectories(dir);
         sstMetaStore.init();
         lastFlushedSequenceId = flushBoundaryStore.load();
-        long maxRunId = 0;
-        long maxFlushId = 0;
-        List<SSTMeta> recoveredMetas = new ArrayList<>();
-        for (Path path : sstMetaStore.listMetaFiles()) {
-            try {
-                SSTMeta meta = sstMetaStore.load(path);
-                maxRunId = Math.max(maxRunId, meta.runId());
-                maxFlushId = Math.max(maxFlushId, meta.maxFlushId());
-                if (!Files.exists(meta.path())) {
-                    throw new IOException(
-                        "SST files are missing after flush boundary was persisted: " + meta.path()
-                    );
-                }
-                SSTMeta actual = SSTReader.readMeta(meta.path(), meta.state());
-                validateMetaMatchesFile(meta, actual);
-                if (meta.maxSequenceId() > lastFlushedSequenceId) {
-                    LOG.warn(
-                        "Ignore orphan SST beyond flush boundary: path={}, maxSequenceId={}, lastFlushedSequenceId={}",
-                        meta.path(),
-                        meta.maxSequenceId(),
-                        lastFlushedSequenceId
-                    );
-                    continue;
-                }
-                recoveredMetas.add(meta);
-            } catch (IOException | RuntimeException e) {
-                if (lastFlushedSequenceId > 0) {
-                    if (e instanceof IOException && e.getMessage() != null
-                        && e.getMessage().contains("SST files are missing after flush boundary was persisted")) {
-                        throw (IOException) e;
-                    }
-                    throw new IOException(
-                        "SST metadata is corrupt after flush boundary was persisted: " + path,
-                        e
-                    );
-                }
-                LOG.warn("Skip corrupted SST metadata during init: {}", path, e);
+        SSTRecoveryPlanner.RecoveryPlan plan =
+            new SSTRecoveryPlanner(dir, sstMetaStore)
+                .recover(lastFlushedSequenceId, lastPersistedSequenceId);
+        for (SSTMeta meta : plan.visibleMetas()) {
+            SSTMeta stored = sstMetaStore.load(sstMetaStore.metaPath(meta));
+            if (stored.state() != meta.state()) {
+                // SinkMeta's persisted sequence boundary is authoritative over the observable
+                // state stored in an older SST metadata file.
+                sstMetaStore.save(meta);
             }
-        }
-        for (SSTMeta meta : reconcileVisibleMetas(recoveredMetas)) {
             SSTReaderRef reader = new SSTReaderRef(SSTReader.open(meta));
             putVisibleMeta(meta);
             readers.put(meta.runId(), reader);
         }
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "sst-*.sst")) {
-            for (Path path : stream) {
-                long[] flushRange = parseFlushRange(path);
-                maxFlushId = Math.max(maxFlushId, flushRange[1]);
-                if (hasMetaForRange(flushRange[0], flushRange[1])) {
-                    continue;
-                }
-                if (isRangeCoveredByVisibleMetas(flushRange[0], flushRange[1])) {
-                    LOG.warn("Ignore compacted SST data file covered by visible metadata: {}", path);
-                    continue;
-                }
-                SSTMeta actual = SSTReader.readMeta(path, stateFromPath(path));
-                if (actual.maxSequenceId() > lastFlushedSequenceId) {
-                    LOG.warn(
-                        "Ignore orphan SST beyond flush boundary: path={}, maxSequenceId={}, lastFlushedSequenceId={}",
-                        path,
-                        actual.maxSequenceId(),
-                        lastFlushedSequenceId
-                    );
-                    continue;
-                }
-                if (lastFlushedSequenceId > 0) {
-                    throw new IOException(
-                        "SST metadata file is missing after flush boundary was persisted: " + path
-                    );
-                }
-                LOG.warn("Ignore SST without metadata before flush boundary: {}", path);
+        nextRunId.set(plan.nextRunId());
+        nextFlushId.set(plan.nextFlushId());
+        for (SSTMeta obsolete : plan.cleanupMetas()) {
+            if (!deleteSSTFilesQuietly(obsolete)) {
+                LOG.warn("Recovered SST garbage will be retried on the next start: {}", obsolete.path());
             }
         }
-        validateFlushBoundaryCoveredBySST();
-        validateNoOverlappingRuns();
-        nextRunId.set(maxRunId + 1);
-        nextFlushId.set(maxFlushId + 1);
+        for (Path dataPath : plan.cleanupDataFiles()) {
+            try {
+                fileDeleter.deleteIfExists(dataPath);
+            } catch (IOException e) {
+                LOG.warn(
+                    "Recovered SST data without metadata will be retried on the next start: {}",
+                    dataPath,
+                    e
+                );
+            }
+        }
     }
 
     public synchronized void close() {
@@ -177,11 +145,25 @@ public class FileLocalStorageManager implements LocalStorageManager {
     /**
      * Reconciles recovered Sink state before the director starts serving requests.
      */
-    public synchronized void applySinkedSSTIds(Set<Long> sinkedIds, long persistedSequenceId) {
+    public synchronized void applyPersistedSequenceId(long persistedSequenceId) {
         for (SSTMeta meta : List.copyOf(metas.values())) {
-            SSTState target = sinkedIds.contains(meta.runId()) || meta.maxSequenceId() <= persistedSequenceId
-                ? SSTState.SINKED
-                : SSTState.NEW;
+            SSTState target;
+            if (meta.maxSequenceId() <= persistedSequenceId) {
+                target = SSTState.SINKED;
+            } else if (meta.minSequenceId() > persistedSequenceId) {
+                target = SSTState.NEW;
+            } else {
+                throw new IllegalStateException(
+                    "SST crosses the durable Sink boundary: runId="
+                        + meta.runId()
+                        + ", sequenceRange=["
+                        + meta.minSequenceId()
+                        + ","
+                        + meta.maxSequenceId()
+                        + "], persistedSequenceId="
+                        + persistedSequenceId
+                );
+            }
             if (meta.state() != target) {
                 updateState(meta, target);
             }
@@ -230,33 +212,37 @@ public class FileLocalStorageManager implements LocalStorageManager {
 
     @Override
     public SSTMeta flushToSST(ImmutableMemTable memTable) {
-        long runId = nextRunId.getAndIncrement();
-        long flushId = nextFlushId.getAndIncrement();
-        SSTReaderRef preparedReader = null;
-        boolean published = false;
-        try {
-            SSTMeta meta = new SSTWriter(
-                dir,
-                SSTFormat.DEFAULT_BLOCK_SIZE,
-                SSTFormat.DEFAULT_RESTART_INTERVAL
-            ).write(runId, flushId, memTable);
-            sstMetaStore.save(meta);
-            preparedReader = new SSTReaderRef(SSTReader.open(meta));
-            synchronized (this) {
-                publishNewVisibleMeta(meta, preparedReader);
-                published = true;
+        synchronized (flushWriteMutex) {
+            long runId = nextRunId.getAndIncrement();
+            long flushId = nextFlushId.get();
+            SSTReaderRef preparedReader = null;
+            boolean published = false;
+            try {
+                SSTMeta meta = new SSTWriter(
+                    dir,
+                    SSTFormat.DEFAULT_BLOCK_SIZE,
+                    SSTFormat.DEFAULT_RESTART_INTERVAL
+                ).write(runId, flushId, memTable);
+                sstMetaStore.save(meta);
+                preparedReader = new SSTReaderRef(SSTReader.open(meta));
+                synchronized (this) {
+                    publishNewVisibleMeta(meta, preparedReader);
+                    // Do not consume the logical ID until the complete SST is visible.
+                    nextFlushId.incrementAndGet();
+                    published = true;
+                }
+                return meta;
+            } catch (IOException e) {
+                if (!published) {
+                    cleanupUnpublishedSST(runId, flushId, flushId, preparedReader);
+                }
+                throw new RuntimeException("flush to SST failed", e);
+            } catch (RuntimeException e) {
+                if (!published) {
+                    cleanupUnpublishedSST(runId, flushId, flushId, preparedReader);
+                }
+                throw e;
             }
-            return meta;
-        } catch (IOException e) {
-            if (!published) {
-                cleanupUnpublishedSST(runId, flushId, flushId, preparedReader);
-            }
-            throw new RuntimeException("flush to SST failed", e);
-        } catch (RuntimeException e) {
-            if (!published) {
-                cleanupUnpublishedSST(runId, flushId, flushId, preparedReader);
-            }
-            throw e;
         }
     }
 
@@ -372,19 +358,13 @@ public class FileLocalStorageManager implements LocalStorageManager {
 
     private void deleteSSTFiles(SSTMeta meta) {
         try {
-            deleteSSTDataFile(meta);
-            deleteSSTMetadata(meta);
+            // Keep data-first syscall ordering so an ordinary failure leaves recoverable metadata.
+            // V1 deliberately avoids directory fsync on this best-effort cache cleanup path.
+            fileDeleter.deleteIfExists(meta.path());
+            fileDeleter.deleteIfExists(sstMetaStore.metaPath(meta));
         } catch (IOException e) {
             throw new RuntimeException("delete SST failed: " + meta.path(), e);
         }
-    }
-
-    private void deleteSSTDataFile(SSTMeta meta) throws IOException {
-        Files.deleteIfExists(meta.path());
-    }
-
-    private void deleteSSTMetadata(SSTMeta meta) throws IOException {
-        Files.deleteIfExists(sstMetaStore.metaPath(meta));
     }
 
     private void updateState(SSTMeta meta, SSTState target) {
@@ -545,20 +525,26 @@ public class FileLocalStorageManager implements LocalStorageManager {
                 i++;
                 continue;
             }
-            retiredSSTs.remove(i);
             SSTReaderRef holder = readers.remove(retired.meta().runId());
             if (holder != null) {
                 holder.close();
             }
-            deleteSSTFilesQuietly(retired.meta());
+            if (deleteSSTFilesQuietly(retired.meta())) {
+                // A partial data-first deletion remains here and is retried idempotently.
+                retiredSSTs.remove(i);
+            } else {
+                i++;
+            }
         }
     }
 
-    private void deleteSSTFilesQuietly(SSTMeta meta) {
+    private boolean deleteSSTFilesQuietly(SSTMeta meta) {
         try {
             deleteSSTFiles(meta);
+            return true;
         } catch (RuntimeException e) {
             LOG.warn("Failed to delete retired SST files: {}", meta.path(), e);
+            return false;
         }
     }
 
@@ -665,29 +651,9 @@ public class FileLocalStorageManager implements LocalStorageManager {
 
     private record RetiredSST(SSTMeta meta, long retireEpoch) {}
 
-    private boolean hasMetaForRange(long minFlushId, long maxFlushId) {
-        return metas.values().stream()
-            .anyMatch(meta -> meta.minFlushId() == minFlushId && meta.maxFlushId() == maxFlushId)
-            || Files.exists(sstMetaStore.metaPath(minFlushId, maxFlushId));
-    }
-
-    private boolean isRangeCoveredByVisibleMetas(long minFlushId, long maxFlushId) {
-        long next = minFlushId;
-        for (SSTMeta meta : metas.values().stream()
-            .sorted(Comparator.comparingLong(SSTMeta::minFlushId).thenComparingLong(SSTMeta::maxFlushId))
-            .toList()) {
-            if (meta.maxFlushId() < next) {
-                continue;
-            }
-            if (meta.minFlushId() > next) {
-                return false;
-            }
-            next = meta.maxFlushId() + 1;
-            if (next > maxFlushId) {
-                return true;
-            }
-        }
-        return false;
+    @FunctionalInterface
+    interface FileDeleter {
+        void deleteIfExists(Path path) throws IOException;
     }
 
     private void putVisibleMeta(SSTMeta meta) {
@@ -701,79 +667,8 @@ public class FileLocalStorageManager implements LocalStorageManager {
         metas.put(meta.runId(), meta);
     }
 
-    private void validateNoOverlappingRuns() {
-        List<SSTMeta> sorted = metas.values().stream()
-            .sorted(Comparator.comparingLong(SSTMeta::minFlushId).thenComparingLong(SSTMeta::maxFlushId))
-            .toList();
-        for (int i = 1; i < sorted.size(); i++) {
-            SSTMeta previous = sorted.get(i - 1);
-            SSTMeta current = sorted.get(i);
-            if (previous.maxFlushId() >= current.minFlushId()) {
-                throw new IllegalArgumentException(
-                    "overlapping SST flush ranges: " + previous.path() + " and " + current.path()
-                );
-            }
-        }
-    }
-
     private static boolean overlaps(SSTMeta left, SSTMeta right) {
         return left.minFlushId() <= right.maxFlushId() && right.minFlushId() <= left.maxFlushId();
-    }
-
-    private static boolean contains(SSTMeta outer, SSTMeta inner) {
-        return outer.minFlushId() <= inner.minFlushId() && outer.maxFlushId() >= inner.maxFlushId();
-    }
-
-    private static List<SSTMeta> reconcileVisibleMetas(List<SSTMeta> loaded) {
-        List<SSTMeta> sorted = loaded.stream()
-            .sorted(Comparator.comparingLong(SSTMeta::minFlushId).thenComparing(Comparator.comparingLong(SSTMeta::maxFlushId).reversed()))
-            .toList();
-        List<SSTMeta> result = new ArrayList<>();
-        candidates:
-        for (SSTMeta candidate : sorted) {
-            for (int i = 0; i < result.size(); ) {
-                SSTMeta existing = result.get(i);
-                if (!overlaps(existing, candidate)) {
-                    i++;
-                    continue;
-                }
-                if (existing.state() == candidate.state() && contains(existing, candidate)) {
-                    continue candidates;
-                }
-                if (existing.state() == candidate.state() && contains(candidate, existing)) {
-                    result.remove(i);
-                    continue;
-                }
-                throw new IllegalArgumentException(
-                    "overlapping SST flush ranges: " + existing.path() + " and " + candidate.path()
-                );
-            }
-            result.add(candidate);
-        }
-        return result.stream()
-            .sorted(Comparator.comparingLong(SSTMeta::maxFlushId).thenComparingLong(SSTMeta::minFlushId))
-            .toList();
-    }
-
-    private static long[] parseFlushRange(Path path) {
-        String name = path.getFileName().toString();
-        if (!name.startsWith("sst-") || !name.endsWith(".sst")) {
-            return new long[] {0, 0};
-        }
-        String body = name.substring(4, name.length() - 4);
-        int dot = body.indexOf('.');
-        String range = dot >= 0 ? body.substring(0, dot) : body;
-        String[] parts = range.split("-");
-        if (parts.length >= 2) {
-            return new long[] {Long.parseLong(parts[0]), Long.parseLong(parts[1])};
-        }
-        long id = Long.parseLong(range);
-        return new long[] {id, id};
-    }
-
-    private static SSTState stateFromPath(Path path) {
-        String name = path.getFileName().toString();
-        return name.contains(".sinked.") ? SSTState.SINKED : SSTState.NEW;
     }
 
     private static void validateCompactInputs(List<SSTMeta> inputs) {
@@ -796,39 +691,6 @@ public class FileLocalStorageManager implements LocalStorageManager {
             } catch (RuntimeException e) {
                 owner.addSuppressed(e);
             }
-        }
-    }
-
-    private static void validateMetaMatchesFile(SSTMeta meta, SSTMeta actual) {
-        if (meta.fileSize() != actual.fileSize()
-            || meta.entryCount() != actual.entryCount()
-            || meta.minSequenceId() != actual.minSequenceId()
-            || meta.maxSequenceId() != actual.maxSequenceId()
-            || meta.oldestWriteAtMillis() != actual.oldestWriteAtMillis()
-            || meta.createdAtMillis() != actual.createdAtMillis()
-            || !java.util.Objects.equals(meta.minKey(), actual.minKey())
-            || !java.util.Objects.equals(meta.maxKey(), actual.maxKey())) {
-            throw new IllegalArgumentException("SST metadata does not match SST file: " + meta.path());
-        }
-    }
-
-    private void validateFlushBoundaryCoveredBySST() throws IOException {
-        if (lastFlushedSequenceId <= 0) {
-            return;
-        }
-        long maxRecoveredSequenceId = metas.values().stream()
-            .mapToLong(SSTMeta::maxSequenceId)
-            .max()
-            .orElse(0);
-        if (maxRecoveredSequenceId < lastFlushedSequenceId) {
-            throw new IOException(
-                "SST files are missing after flush boundary was persisted: lastFlushedSequenceId="
-                    + lastFlushedSequenceId
-                    + ", maxRecoveredSequenceId="
-                    + maxRecoveredSequenceId
-                    + ", storageDir="
-                    + dir
-            );
         }
     }
 

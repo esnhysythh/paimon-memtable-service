@@ -190,7 +190,7 @@ record SSTMeta(
 ) {}
 ```
 
-`SSTState` 包含 `NEW` 和 `SINKED`。ImmutableMemTable 在 Flush 发布后退出查询状态，不存在需要写入 SST 的 Mem cache 状态。SST 数据文件 publish 后不再 rename, 文件名只包含稳定的 `flushId` range, 例如 `sst-000001-000001.sst`。可靠状态来源是 metadata 和 SinkMeta, 而不是文件名或 Footer。
+`SSTState` 包含 `NEW` 和 `SINKED`。ImmutableMemTable 在 Flush 发布后退出查询状态，不存在需要写入 SST 的 Mem cache 状态。SST 数据文件 publish 后不再 rename, 文件名只包含稳定的 `flushId` range, 例如 `sst-000001-000001.sst`。metadata 保存 run 结构和可观测 state；启动时的可靠生命周期状态由 SinkMeta `persistedSequenceId` 重新推导，不依赖文件名、Footer 或历史 runId。
 
 ## 10. Footer 格式
 
@@ -238,6 +238,8 @@ try (SSTReadSnapshot snapshot = storageManager.readSnapshot(ssts)) {
 
 `LocalStorageManager` 不直接暴露单 SST `get/openIterator` 作为外部读取入口；调用方必须先创建 `SSTReadSnapshot`, 再通过 snapshot 读取。snapshot 注册 read epoch, compact/evict 只能把旧 SST 放入 retired queue, 等所有可能看到旧 SST 的 snapshot 关闭后才物理删除文件。
 
+retired 物理删除固定为 data-first：data 删除成功后才删除 meta。任一步失败都不能移除 retired entry，后续 reclaim 重试相同幂等顺序。删除是本地 cache 清理，V1 不在两个 unlink 后 force storage 目录；普通删除失败只会留下“data 已删、meta 尚存”，启动恢复可用 compact 覆盖关系或最老 SINKED 前缀规则识别。极端掉电导致目录项持久化乱序时，无法安全证明的 data-only 前缀仍按 fatal 处理。
+
 语义：
 
 | 返回值 | 含义 | 查询路径动作 |
@@ -259,6 +261,8 @@ try (SSTReadSnapshot snapshot = storageManager.readSnapshot(ssts)) {
 - 每个 Entry 写入 Data Block，同时将 Key 加入 BloomFilter。
 - 写入完成后生成 Properties 和 Footer，并校验生成的 `SSTMeta` 与输入边界一致。
 - SST 对 BucketDirector 可见前，必须保证文件已完整写入。
+- flushId 只在 SST data、meta、reader 和可见视图全部发布后推进；发布前任一步失败都复用原 flushId。
+- 启动遇到 `minSequenceId > lastFlushedSequenceId` 的单 flush orphan 时，不将其计入 allocator；WAL replay 后的下一次 Flush 用相同路径原位覆盖。
 
 ## 13. Compact 规则
 

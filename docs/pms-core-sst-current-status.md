@@ -24,8 +24,10 @@
 - Flush 成功后会写独立 `sst-*.meta.json`，记录 SST 文件名、sequence 边界、key 边界、entryCount、状态和校验字段。
 - `lastFlushedSequenceId` 持久化在 storage 目录下的 `flush-boundary.meta`。
 - 重启恢复时，WAL 中 `sequenceId <= lastFlushedSequenceId` 的 DATA 记录不再回放到 curMemTable，而由 SST 承载。
-- 启动扫描 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效 SST；`maxSequenceId` 超过边界的 SST 视为 orphan，由 WAL replay 恢复对应数据，避免重复数据源。
-- 如果 flush boundary 已经持久化，但启动时发现相关 SST 损坏，当前策略是启动失败，避免 WAL 被跳过后数据丢失。
+- 启动扫描由 `SSTRecoveryPlanner` 构建 flushId 连续的本地 run 后缀；`minSequenceId > lastFlushedSequenceId` 的单 flush SST 视为可复用 orphan，不注册、不清理、不推进 allocator，由 WAL replay 后的下一次 Flush 原位覆盖。
+- 恢复自动清理被 compact output 覆盖的旧输入，以及位于保留后缀之前、已由 Paimon 覆盖的 meta-only 最老 evict 残留；保留后缀内部损坏或缺口仍启动失败。
+- `NEW/SINKED` 使用 SinkMeta success 的 `lastPersistedSequenceId` 推导，不信任 metadata 中可能过时的旧 state。
+- retired 文件按 data-first 顺序删除，不额外 force 目录；只有 data/meta 均成功后才移除 cleanup entry。
 - SST 文件、`sst-*.meta.json` 和 `flush-boundary.meta` 写入都采用 temp file + force/fsync + atomic rename + directory force 的持久化顺序。
 
 ### 2.3 Sink 边界与实现
