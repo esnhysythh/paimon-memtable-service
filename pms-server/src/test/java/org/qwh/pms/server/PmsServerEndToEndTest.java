@@ -291,7 +291,9 @@ class PmsServerEndToEndTest {
 
         PmsServerRuntime runtime = new PmsServerRuntime(new ConfigManager().from(baseProperties()));
         Exception error = assertThrows(Exception.class, runtime::start);
-        assertTrue(causalMessages(error).contains("SST files are missing after flush boundary was persisted"));
+        assertTrue(causalMessages(error).contains(
+            "Unpersisted flush boundary is not covered by recovered SSTs"
+        ));
         assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
     }
 
@@ -308,10 +310,7 @@ class PmsServerEndToEndTest {
         PmsServerRuntime runtime = new PmsServerRuntime(new ConfigManager().from(baseProperties()));
         Exception error = assertThrows(Exception.class, runtime::start);
         String messages = causalMessages(error);
-        assertTrue(
-            messages.contains("SST metadata is corrupt after flush boundary was persisted")
-                || messages.contains("SST file is corrupt after flush boundary was persisted")
-        );
+        assertTrue(messages.contains("Cannot read SST data"));
         assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
     }
 
