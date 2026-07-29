@@ -28,7 +28,7 @@
 | ImmutableMemTable | Freeze 后只读、sequence/oldest-write 边界、Flush 发布后退出查询路径 |
 | LocalStorageManager | SST 写入 → 读取一致性、BloomFilter、`Optional<Value>` 三态、read epoch 延迟删除、多路归并保留最新 Key；锁外 Flush 准备期间旧可见快照不阻塞，发布后的 meta 始终存在 cached reader；flushId 失败复用、retired data-first 删除重试与启动恢复规划 |
 | WALManager | 单盘写入 → 读取、CRC 校验正确性、Magic 检测 partial write |
-| RowCodec / PrimaryKeyCodec | `InternalRow` 编码 → 解码往返正确性、主键编码顺序一致性、schema 不匹配拒绝 |
+| RowCodec / PrimaryKeyCodec | `InternalRow` 编码 → 解码往返正确性、主键编码顺序一致性、非法格式与不支持类型拒绝 |
 | BloomFilter | 假阳性率在预期范围内（如 < 1%）、不同 FPP 配置的效果 |
 
 ### 2.2 测试工具

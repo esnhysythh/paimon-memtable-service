@@ -16,7 +16,7 @@
 - `pms-server` 直接创建并调用本模块；不新增 adapter、事件总线或 core listener 层。
 - 本模块只依赖 Paimon `1.4.1` 的 `api`、`common`、`core`、`format` artifact；版本统一使用父工程的 `${paimon.version}`。
 - 当前实现面向 Paimon primary-key + deduplicate 表的最新态查询，不提供 time travel、MVCC 或完整表 prefix scan。
-- Paimon schema 变更不属于 V1；启动或运行时检测到 schema/profile 不匹配按 PMS 的 fatal schema 策略处理，不能把它解释为未命中。
+- Paimon Schema 变更不属于 V1，并由产品与部署约束保证不会发生。lookup 中现有的 schema/profile 校验只属于防御性正确性检查：校验失败不能解释为未命中，但不代表 PMS 会主动监控或完整阻止 Schema 变更。
 
 ## 2. 模块依赖
 
@@ -174,7 +174,7 @@ Paimon commit success
 | 进程在 commit 后、发布前崩溃 | 重启后 view 为空；不重放历史 payload，按完整 snapshot 重建 |
 | direct Parquet lookup 或 metadata 读取失败 | 返回 `UNKNOWN`，server 返回可重试错误 |
 | Value SST build/evict/close 失败 | 若 direct Parquet lookup 仍可正确执行，降级到 direct path；否则 `UNKNOWN` |
-| schema/profile 校验失败 | 作为 V1 schema/profile 故障处理，不能转为 `MISS` |
+| schema/profile 校验失败 | 返回 lookup unavailable 并要求人工检查部署约束，不能转为 `MISS` |
 
 `LiveFileIndex` 使用 copy-on-write 发布 view，查询可观察到更新前或更新后的完整 view，不观察原地修改。router/cache 的失效与 view 更新遵循 demo 的并发约束。
 

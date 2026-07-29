@@ -19,7 +19,7 @@
 3. 调用 PMSClient.write() 发送
    └─ 成功 → 继续
    └─ OVERLOADED → 反压处理（见 § 2.2）
-   └─ SCHEMA_MISMATCH → V1 停止写入并触发 Flink failover
+   └─ SCHEMA_MISMATCH → 防御性错误；停止写入并检查部署约束
    └─ SHUTTING_DOWN → 当前 endpoint 等待恢复或由 connector 上层策略处理
 ```
 
@@ -123,4 +123,4 @@ Flink Connector 向 Flink 的 MetricGroup 注册以下指标：
 | `pms.write.reject` | Counter | 被拒绝次数（OVERLOADED） |
 | `pms.write.retry` | Counter | 重试次数 |
 | `pms.write.latency_ms` | Histogram | 写入延迟分布 |
-| `pms.schema.reload` | Counter | Schema 热重载次数 |
+| `pms.schema_mismatch` | Counter | 收到防御性 Schema mismatch 状态的次数；出现后停止使用当前部署 |

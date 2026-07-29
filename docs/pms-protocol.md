@@ -115,8 +115,9 @@ V1 的 `tableSchema` 是 server 在启动时绑定的单表 schema snapshot。�
 `rowTypeJson`、primary keys、partition keys 以及 row/key codec version。client 收到后应
 重新计算并校验该 hash，避免 server/client 对 handshake 内容的理解出现漂移。
 
-V1 不支持运行时 schema 变更，不提供 schema tracker/reload 协议。若表 schema 发生变化，
-server 应按 fatal 配置错误处理；后续版本再扩展增量 schema reload。
+V1 不支持运行时 Schema 变更，也不提供 schema tracker/reload 协议。绑定表 Schema 在整套
+PMS 本地状态生命周期内保持不变，由产品与部署约束保证；协议 handshake 只协商启动时的固定
+snapshot，不承担运行期 Schema 监控。后续版本再考虑程序化检测或 schema evolution。
 
 ## 5. Status 与查询语义
 
@@ -127,7 +128,7 @@ server 应按 fatal 配置错误处理；后续版本再扩展增量 schema relo
 | 0 | `OK` | 成功 |
 | 1 | `BAD_REQUEST` | 请求格式或 endpoint 语义错误 |
 | 2 | `OVERLOADED` | server 过载，写入或查询被拒绝 |
-| 3 | `SCHEMA_MISMATCH` | schema 不匹配，v1 预留 |
+| 3 | `SCHEMA_MISMATCH` | schema 不匹配的防御性保留状态；出现时调用方应停止使用当前部署 |
 | 4 | `SHUTTING_DOWN` | server 正在停机 |
 | 5 | `INTERNAL_ERROR` | server 内部错误 |
 | 6 | `LOOKUP_UNAVAILABLE` | 完整表点查无法证明结果正确，可重试 |

@@ -57,9 +57,9 @@ raw client 的协议 envelope、status、batch 整批语义与 `LOOKUP_UNAVAILAB
 [pms-protocol.md](pms-protocol.md)。
 
 V1 不处理 Paimon 表 Schema 变更。`PmsClient.connect(config)` 只在连接建立时从 handshake
-获取一次 schema snapshot，并认为该 snapshot 在 client 生命周期内稳定。若后续发现 schema
-变更，server 应进入 fatal 路径或通过后续版本的 schema reload 机制处理；当前版本不在 client
-内部静默切换 codec。
+获取一次 schema snapshot，并认为该 snapshot 在 client 生命周期内稳定。表 Schema 在整套
+PMS 本地状态生命周期内保持不变，由产品与部署约束保证；server 和 client 都不主动监控或
+阻止 Schema 变更，当前版本也不会在 client 内部静默切换 codec。
 
 ### 2.2 Java SDK 使用示例
 
@@ -112,7 +112,7 @@ try (PmsClient client = PmsClient.connect(config)) {
 |------|------|------------|
 | `OK` | 写入成功 | 继续 |
 | `OVERLOADED` | 系统过载，被拒绝 | 重试（指数退避） |
-| `SCHEMA_MISMATCH` | Schema 不一致 | V1 停止写入，不自动 reload |
+| `SCHEMA_MISMATCH` | 防御性保留的 Schema 不一致状态 | 停止写入并检查部署约束，不自动 reload |
 | `SHUTTING_DOWN` | 服务停机 | 当前 endpoint 等待恢复或由上层切换 |
 | `INTERNAL_ERROR` | 普通服务端内部错误 | 不自动重试，由调用方处理 |
 
@@ -141,7 +141,7 @@ DELETE/UPDATE_BEFORE -> delete(primaryKeyBytes)
 
 后续版本可引入 SchemaTracker，定期检查 Server 端 Schema 是否变更，保持 Client 与 Server
 的 Schema 一致性。V1 已明确不支持 Paimon 表 Schema 变更，因此当前不实现后台 tracker，
-只保留一次性 handshake schema negotiation。
+只保留一次性 handshake schema negotiation；这属于未来产品形态，不是当前 V1 的安全兜底。
 
 **工作机制**：
 
