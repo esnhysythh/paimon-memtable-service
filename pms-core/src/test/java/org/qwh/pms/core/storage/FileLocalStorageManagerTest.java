@@ -23,6 +23,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -32,10 +33,14 @@ class FileLocalStorageManagerTest {
     Path tempDir;
 
     private FileLocalStorageManager storage() throws IOException {
+        return storage(0);
+    }
+
+    private FileLocalStorageManager storage(long persistedSequenceId) throws IOException {
         FileLocalStorageManager storage = new FileLocalStorageManager(
             new StorageConfig(tempDir.toString(), 0, 0, 0, 0)
         );
-        storage.init();
+        storage.init(persistedSequenceId);
         return storage;
     }
 
@@ -375,6 +380,23 @@ class FileLocalStorageManagerTest {
         assertTrue(reloaded.metas().isEmpty());
         SSTMeta next = reloaded.flushToSST(immutable("k2", "v2".getBytes(), 2L));
         assertEquals(orphan.runId() + 1, next.runId());
+        assertEquals(orphan.minFlushId(), next.minFlushId());
+        assertEquals(orphan.maxFlushId(), next.maxFlushId());
+        assertArrayEquals("v2".getBytes(), get(reloaded, next, "k2").orElseThrow().bytes());
+    }
+
+    @Test
+    void failedFlushDoesNotConsumeFlushId() throws IOException {
+        FileLocalStorageManager storage = storage();
+        ImmutableMemTable failing = failIteratorOnce(
+            immutable("k1", "v1".getBytes(), 1L)
+        );
+
+        assertThrows(RuntimeException.class, () -> storage.flushToSST(failing));
+
+        SSTMeta completed = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        assertEquals(1L, completed.minFlushId());
+        assertEquals(1L, completed.maxFlushId());
     }
 
     @Test
@@ -424,7 +446,142 @@ class FileLocalStorageManagerTest {
         );
 
         IOException error = assertThrows(IOException.class, reloaded::init);
-        assertTrue(error.getMessage().contains("SST files are missing after flush boundary was persisted"));
+        assertTrue(error.getMessage().contains("Unpersisted flush boundary is not covered"));
+    }
+
+    @Test
+    void retiredCleanupRetriesUntilBothDataAndMetadataAreDeleted() throws IOException {
+        AtomicBoolean failMetadataOnce = new AtomicBoolean(true);
+        FileLocalStorageManager storage = new FileLocalStorageManager(
+            new StorageConfig(tempDir.toString(), 0, 0, 0, 0),
+            path -> {
+                if (path.getFileName().toString().endsWith(".meta.json")
+                        && failMetadataOnce.getAndSet(false)) {
+                    throw new IOException("injected metadata deletion failure");
+                }
+                Files.deleteIfExists(path);
+            }
+        );
+        storage.init();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        Path metaPath = tempDir.resolve("sst-000001-000001.meta.json");
+
+        storage.deleteSST(meta);
+
+        assertFalse(Files.exists(meta.path()));
+        assertTrue(Files.exists(metaPath));
+        storage.close();
+        assertFalse(Files.exists(metaPath));
+    }
+
+    @Test
+    void retiredCleanupDoesNotDeleteMetadataBeforeDataDeletionSucceeds() throws IOException {
+        AtomicBoolean failDataOnce = new AtomicBoolean(true);
+        FileLocalStorageManager storage = new FileLocalStorageManager(
+            new StorageConfig(tempDir.toString(), 0, 0, 0, 0),
+            path -> {
+                if (path.getFileName().toString().endsWith(".sst")
+                        && failDataOnce.getAndSet(false)) {
+                    throw new IOException("injected data deletion failure");
+                }
+                Files.deleteIfExists(path);
+            }
+        );
+        storage.init();
+        SSTMeta meta = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        Path metaPath = tempDir.resolve("sst-000001-000001.meta.json");
+
+        storage.deleteSST(meta);
+
+        assertTrue(Files.exists(meta.path()));
+        assertTrue(Files.exists(metaPath));
+        storage.close();
+        assertFalse(Files.exists(meta.path()));
+        assertFalse(Files.exists(metaPath));
+    }
+
+    @Test
+    void initRecoversDataDeletedMetadataRemainingFromOldestEviction() throws IOException {
+        AtomicBoolean failMetadataOnce = new AtomicBoolean(true);
+        FileLocalStorageManager storage = new FileLocalStorageManager(
+            new StorageConfig(tempDir.toString(), 0, 0, 0, 0),
+            path -> {
+                if (path.getFileName().toString().equals("sst-000001-000001.meta.json")
+                        && failMetadataOnce.getAndSet(false)) {
+                    throw new IOException("injected metadata deletion failure");
+                }
+                Files.deleteIfExists(path);
+            }
+        );
+        storage.init();
+        SSTMeta first = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+        storage.persistFlushedSequenceId(second.maxSequenceId());
+        storage.applyPersistedSequenceId(second.maxSequenceId());
+
+        storage.deleteSST(first);
+
+        assertFalse(Files.exists(first.path()));
+        assertTrue(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+        FileLocalStorageManager recovered = storage(second.maxSequenceId());
+
+        assertEquals(List.of(second.runId()),
+            recovered.metas().stream().map(SSTMeta::runId).toList());
+        assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+        assertArrayEquals(
+            "v2".getBytes(),
+            get(recovered, recovered.metas().get(0), "k2").orElseThrow().bytes()
+        );
+    }
+
+    @Test
+    void initRestartsFlushIdsWhenTheLocalCacheWasFullyEvicted() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta evicted = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        storage.persistFlushedSequenceId(evicted.maxSequenceId());
+        storage.applyPersistedSequenceId(evicted.maxSequenceId());
+        storage.deleteSST(evicted);
+
+        FileLocalStorageManager recovered = storage(evicted.maxSequenceId());
+        SSTMeta next = recovered.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+
+        assertEquals(1L, next.minFlushId());
+        assertEquals(1L, next.maxFlushId());
+    }
+
+    @Test
+    void initRejectsIncompleteSstInsideTheRetainedSuffix() throws IOException {
+        FileLocalStorageManager storage = storage();
+        storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        SSTMeta middle = storage.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+        SSTMeta last = storage.flushToSST(immutable("k3", "v3".getBytes(), 3L));
+        storage.persistFlushedSequenceId(last.maxSequenceId());
+        Files.delete(middle.path());
+
+        FileLocalStorageManager recovered = new FileLocalStorageManager(
+            new StorageConfig(tempDir.toString(), 0, 0, 0, 0)
+        );
+        IOException error = assertThrows(
+            IOException.class,
+            () -> recovered.init(last.maxSequenceId())
+        );
+
+        assertTrue(error.getMessage().contains("flush IDs are not continuous"));
+    }
+
+    @Test
+    void initDerivesSstStateFromPersistedSequenceBoundary() throws IOException {
+        FileLocalStorageManager storage = storage();
+        SSTMeta first = storage.flushToSST(immutable("k1", "v1".getBytes(), 1L));
+        SSTMeta second = storage.flushToSST(immutable("k2", "v2".getBytes(), 2L));
+        storage.persistFlushedSequenceId(second.maxSequenceId());
+
+        FileLocalStorageManager recovered = storage(first.maxSequenceId());
+
+        assertEquals(SSTState.SINKED, recovered.metas().get(0).state());
+        assertEquals(SSTState.NEW, recovered.metas().get(1).state());
+        assertTrue(Files.readString(tempDir.resolve("sst-000001-000001.meta.json"))
+            .contains("\"state\": \"SINKED\""));
     }
 
     @Test
@@ -533,7 +690,7 @@ class FileLocalStorageManagerTest {
     }
 
     @Test
-    void initPrefersCompactedMetaWhenInputMetasRemainAfterCrash() throws IOException {
+    void initPrefersCompactedSstWhenInputsRemainAfterCrash() throws IOException {
         FileLocalStorageManager storage = storage();
         SSTMeta first = storage.flushToSST(immutable("a", "old-a".getBytes(), 1L));
         SSTMeta second = storage.flushToSST(immutable("a", "new-a".getBytes(), 2L));
@@ -544,6 +701,7 @@ class FileLocalStorageManagerTest {
         SSTMeta compacted = storage.compactSSTs(List.of(first, second));
         SSTMetaStore metaStore = new SSTMetaStore(tempDir);
         metaStore.init();
+        // Simulate a crash before either compact input was deleted.
         Files.write(first.path(), firstData);
         Files.write(second.path(), secondData);
         metaStore.save(first);
@@ -555,6 +713,10 @@ class FileLocalStorageManagerTest {
         assertEquals(compacted.runId(), reloaded.metas().get(0).runId());
         assertEquals(1L, reloaded.metas().get(0).minFlushId());
         assertEquals(2L, reloaded.metas().get(0).maxFlushId());
+        assertFalse(Files.exists(first.path()));
+        assertFalse(Files.exists(second.path()));
+        assertFalse(Files.exists(tempDir.resolve("sst-000001-000001.meta.json")));
+        assertFalse(Files.exists(tempDir.resolve("sst-000002-000002.meta.json")));
     }
 
     @Test
@@ -591,6 +753,56 @@ class FileLocalStorageManagerTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new RuntimeException("blocked immutable iterator interrupted", e);
+                }
+                return delegate.iterator();
+            }
+
+            @Override
+            public Iterator<org.qwh.pms.core.memtable.model.Entry> iterator(
+                    Key startInclusive,
+                    Optional<Key> endExclusive) {
+                return delegate.iterator(startInclusive, endExclusive);
+            }
+
+            @Override
+            public long estimatedSize() {
+                return delegate.estimatedSize();
+            }
+
+            @Override
+            public int estimatedEntryCount() {
+                return delegate.estimatedEntryCount();
+            }
+
+            @Override
+            public long minSequenceId() {
+                return delegate.minSequenceId();
+            }
+
+            @Override
+            public long maxSequenceId() {
+                return delegate.maxSequenceId();
+            }
+
+            @Override
+            public long oldestWriteAtMillis() {
+                return delegate.oldestWriteAtMillis();
+            }
+        };
+    }
+
+    private static ImmutableMemTable failIteratorOnce(ImmutableMemTable delegate) {
+        AtomicBoolean failed = new AtomicBoolean();
+        return new ImmutableMemTable() {
+            @Override
+            public Value get(Key key) {
+                return delegate.get(key);
+            }
+
+            @Override
+            public Iterator<org.qwh.pms.core.memtable.model.Entry> iterator() {
+                if (failed.compareAndSet(false, true)) {
+                    throw new RuntimeException("injected iterator failure");
                 }
                 return delegate.iterator();
             }

@@ -142,6 +142,8 @@ flush boundary 使用独立的串行化边界，不与 SST 可见视图/read epo
 
 进程内如果 `flushToSST()` 已经发布 SST、但 flush boundary 写入失败，Director 保留一个非持久化 `FlushFlight(sourceImmutable, outputMeta)`。下一次 Flush 继续完成同一个 output 的 boundary 和 handoff，不再次调用 `flushToSST()`；flight 只在 Immutable 移除并将原 output 发布到 maintenance RunState 后清除。因此一次 Immutable 在线重试期间只产生一个 SST。进程崩溃后不恢复该 flight，仍使用上述 orphan + WAL replay 协议。
 
+`flushId` allocator 只在 `flushToSST()` 完成 data、meta、reader 和可见视图发布后推进；发布前失败不会消费 ID。重启时 orphan 也不参与 `nextFlushId` 计算，因此 WAL replay 产生的下一次 Flush 会原位覆盖该 orphan，保证恢复出的本地 run 后缀继续保持 flushId 连续。
+
 ### 4.3 Sink 与 prepared retry
 
 `SinkSelection(targetSequenceId, maxInputBytes)` 选择不超过目标 sequence 的最老连续 NEW 前缀：
@@ -186,7 +188,7 @@ select NEW prefix
 
 ### 4.5 Evict
 
-`evictOldestSinkedSST()` 不接受 run ID，因为 V1 只允许淘汰当前最老 SINKED run。方法不会隐式 compact；是否先 compact 由 server 调度层决定。物理文件删除受 SST read epoch 保护。
+`evictOldestSinkedSST()` 不接受 run ID，因为 V1 只允许淘汰当前最老 SINKED run。方法不会隐式 compact；是否先 compact 由 server 调度层决定。物理文件删除受 SST read epoch 保护，并按 data-first 顺序执行；只有 data/meta 都删除成功后 retired entry 才完成。data 已删而 meta 尚存的崩溃状态由下次启动识别为最老 evict 残留。
 
 ## 5. 并发与锁边界
 
@@ -227,10 +229,11 @@ select NEW prefix
 
 启动恢复顺序的关键约束：
 
-1. 加载并校验 SST 与 `flush-boundary.meta`。
-2. 加载 SinkMeta success，推导 NEW/SINKED 状态并修正 SST meta。
-3. 加载未完成 prepare；V1 只允许一个 durable pending prepare。
-4. replay `sequenceId > lastFlushedSequenceId` 的 WAL DATA 到 CurMemTable。
-5. 恢复全局 sequence 水位，并暴露 `recoveredUnpersistedData` 供调度器立即建立可见性 fence。
+1. 先加载 SinkMeta success，取得 durable `lastPersistedSequenceId`，并校验未完成 prepare 数量。
+2. 加载 `flush-boundary.meta`，由 storage recovery 扫描全部 SST 文件、构建 flushId 连续的本地可见后缀，并按 `lastPersistedSequenceId` 推导 NEW/SINKED。
+3. 初始化 WAL 并 replay `sequenceId > lastFlushedSequenceId` 的 DATA 到 CurMemTable。
+4. 在本地 SST reader view 建立后恢复未完成 prepare；V1 只允许一个 durable pending prepare。
+5. 若 recovered commit 推进了 `lastPersistedSequenceId`，再次幂等修正 SST 状态并执行 WAL truncate。
+6. 恢复全局 sequence 水位，并暴露 `recoveredUnpersistedData` 供调度器立即建立可见性 fence。
 
-启动时发现 WAL/SST/SinkMeta 损坏、边界交叉或 prepared metadata 不一致，应拒绝启动；不能将已参与恢复边界的数据静默降级为 miss。运行期后台操作的普通 `RuntimeException` 由 worker 记录并在下一周期重试，积压最终通过 flow control 限制新写入。更细的运行期 fatal 分类留待取得真实故障样本后再设计。
+storage recovery 只自动处理 compact 覆盖的旧输入、data-first 最老 evict 残留和尚未推进 boundary 的单 flush orphan。启动时发现保留后缀内部缺口、部分重叠、WAL/SST/SinkMeta 损坏、边界交叉或 prepared metadata 不一致，应拒绝启动；不能将已参与恢复边界的数据静默降级为 miss。运行期后台操作的普通 `RuntimeException` 由 worker 记录并在下一周期重试，积压最终通过 flow control 限制新写入。更细的运行期 fatal 分类留待取得真实故障样本后再设计。

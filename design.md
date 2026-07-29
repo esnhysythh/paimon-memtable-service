@@ -30,6 +30,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 - **本地 SST 分为 NEW 与 SINKED**：NEW 只存在于 PMS 本地与 WAL 恢复链路中；SINKED 已确认进入 Paimon，仍可作为本地热点窗口保留。
 - **同状态合并**：NEW 只与 NEW 合并，SINKED 只与 SINKED 合并。Sink 与本地 compact 相互独立，已经 Sink 的 SST 仍可继续 compact。
 - **最老优先淘汰**：只有 SINKED run 可以被淘汰，并且每次只淘汰最老的一个。V1 分别通过 NEW/SINKED 文件数量水位维护本地窗口，不在进程内实现磁盘剩余空间调度；部署侧为 storage 目录提供独立磁盘或配额与外部告警。
+- **连续本地 run 后缀**：当前可见 SST 的 flushId range 必须构成一个连续后缀；最老 run 可被淘汰，所以不要求从 1 开始。Flush 失败或 boundary orphan 恢复不消费 flushId。retired 文件按 data-first 顺序幂等清理，启动只自动修复 compact 覆盖、最老 evict 半删除和未推进 boundary 的 orphan，其他内部缺口直接失败并由人工介入。
 
 调度器由独立的 Flush worker 与 Maintenance worker 驱动。Maintenance 每次基于最新状态按固定优先级只选择一个操作，完成后重新采样，避免维护目的与 core 操作 API 耦合。详见 [pms-server.md](docs/pms-server.md) § 2.4。
 

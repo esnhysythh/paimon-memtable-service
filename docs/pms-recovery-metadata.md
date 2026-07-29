@@ -26,7 +26,7 @@ SinkMeta  = Paimon prepare/commit 进度与外部持久化边界
 - WAL 只记录数据变更，不再记录 flush/sink 控制事件。
 - Flush SST 与 Sink Paimon 都通过独立、可读、可校验、原子更新的 metadata 文件记录恢复所需信息。
 - WAL 截断以 `SinkMeta.success.persistedSequenceId` 为主边界，而不是以 Paimon `snapshotId` 为主边界。
-- SST 数据文件名 publish 后保持稳定，不包含 `NEW` / `SINKED` 状态；可靠状态来源必须是 metadata，而不是文件名。
+- SST 数据文件名 publish 后保持稳定，不包含 `NEW` / `SINKED` 状态；metadata 保存 run 结构，启动生命周期状态由 SinkMeta success 的 `persistedSequenceId` 推导，而不是依赖文件名或历史 runId。
 
 该选择的理由：
 
@@ -145,7 +145,7 @@ storage/
 
 - `state` 初期包含 `NEW` / `SINKED`。
 - `runId` 是物理唯一标识，只用于 reader cache、删除和排障；逻辑新旧顺序由 `minFlushId/maxFlushId` 表达。
-- `sstFile` 是稳定 SST 数据文件名；恢复时按 `minFlushId/maxFlushId` 查找实际存在的 SST 文件，并由 SinkMeta success 修正 metadata 中的 `state`。
+- `sstFile` 是稳定 SST 数据文件名；恢复时按 `minFlushId/maxFlushId` 查找实际存在的 SST 文件。metadata 中的旧 `state` 只用于观测，运行状态由 SinkMeta success 的 `lastPersistedSequenceId` 重新推导。
 - `minKeyBase64/maxKeyBase64` 保持 JSON 可读结构，同时避免二进制 key 破坏文本格式。
 - `oldestWriteAtMillis` 随 Flush 与 compact 保留该 run 中最早写入时间，供 server 计算 Paimon 可见性 lag。
 - SST 数据文件完整性仍由 SST footer 中的 full-file CRC 校验；启动时还会对比 `.meta.json` 与 SST properties 中的关键字段。
@@ -167,9 +167,9 @@ Flush 必须保持以下顺序：
 9. 推进 flush-boundary.meta(lastFlushedSequenceId = maxSequenceId)
 ```
 
-如果崩溃发生在 boundary 推进前，恢复时可以忽略该 SST，并通过 WAL 重放恢复数据。
+如果崩溃发生在 boundary 推进前，恢复时忽略该 SST，并通过 WAL 重放恢复数据。该单 flush orphan 不进入普通 cleanup，也不推进 `nextFlushId`；下一次 Flush 使用相同 flushId 原位覆盖它。
 
-如果 boundary 已经推进，恢复时必须能加载覆盖该 boundary 的 SST；若对应 SST 或 meta 缺失/损坏，应启动失败，避免跳过 WAL 后丢失数据。
+如果 boundary 已经推进且尚未被 `lastPersistedSequenceId` 覆盖，恢复出的可见 SST 后缀必须承载到该 boundary；若缺失或损坏，应启动失败，避免跳过 WAL 后丢失数据。已经进入 Paimon 的最老 SINKED cache 可以正常淘汰，不要求本地 SST 从 flushId 1 开始。
 
 ### 4.5 Flush Boundary
 
@@ -271,7 +271,7 @@ sink/
 
 - `persistedSequenceId` 是 WAL 安全截断的主边界。
 - `snapshotId` 表示 Paimon 外部提交结果，只能作为排障和外部一致性校验信息，不能单独决定 WAL 截断。
-- `sstIds` 是恢复时判断 SST 是否已经 sinked 的来源之一；本地 compact 后的新 runId 可能不在历史 sstIds 中，因此恢复还会使用 `persistedSequenceId` 将已覆盖 sequence 范围内的 SST 判为 sinked。
+- `sstIds` 用于恢复 exact prepared/finalizing batch；它不是长期 SST 状态边界，避免本地 cache 清空、runId 重新分配后与历史 ID 碰撞。启动时使用 `persistedSequenceId` 判定状态：run 的 max sequence 不超过它则为 SINKED，run 的 min sequence大于它则为 NEW，跨越边界则拒绝启动。
 
 ### 5.5 Sink 持久化顺序
 
@@ -304,33 +304,36 @@ Sink 必须保持以下顺序：
 目标恢复流程：
 
 ```text
-1. 初始化 storage
-   - 扫描 sst-*.meta.json 和 sst-*.sst
-   - 校验 meta/data 文件
-   - 加载 flush-boundary.meta
-   - 只注册 maxSequenceId <= lastFlushedSequenceId 的 SST
+1. 初始化 sink metadata
+   - 扫描 batch-*.prepare.json 和 batch-*.success.json
+   - 取得 durable lastPersistedSequenceId
+   - V1 校验最多只有一个 pending prepare
 
-2. 初始化 WAL
+2. 初始化 storage
+   - 加载 flush-boundary.meta
+   - 扫描并校验全部 sst-*.meta.json / sst-*.sst 文件
+   - 用单 candidate 贪心选择范围更大的 compact output，最终构建 flushId 连续的本地后缀
+   - 识别 compact 旧输入、data-first 最老 evict 残留和 flush-boundary orphan
+   - 按 lastPersistedSequenceId 推导 NEW/SINKED；内部缺口或无法解释的损坏 fatal
+
+3. 初始化 WAL
    - 扫描 WAL 文件头和 DATA record，恢复 lastSequenceId
 
-3. Replay WAL DATA
+4. Replay WAL DATA
    - sequenceId <= lastFlushedSequenceId: 跳过
    - sequenceId > lastFlushedSequenceId: 回放到 curMemTable
-
-4. 初始化 sink metadata
-   - 扫描 batch-*.prepare.json
-   - 扫描 batch-*.success.json
-   - success 中的 sstIds 和 persistedSequenceId 用于推导已 sinked SST
 
 5. 恢复未完成 sink
    - 对 prepare 存在但 success 不存在的 batch，使用原始 prepared payload 重试 commit
    - commit 成功后写 success metadata
 
 6. 修正本地 SST 状态
-   - 根据 success.sstIds 和 persistedSequenceId 将 SSTMeta state 更新为 SINKED
+   - recovered commit 推进 persistedSequenceId 后重新推导 SST state
    - SST 数据文件名保持不变
 
-7. 启动服务和后台任务
+7. best-effort 清理恢复规划识别出的 compact/evict 垃圾；失败保留文件，由下次启动重新识别并重试
+
+8. 启动服务和后台任务
 ```
 
 ## 7. WAL 截断
@@ -353,9 +356,12 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 |------|------------|----------|
 | DATA WAL 写入前崩溃 | 无 WAL DATA | 写入未成功，不恢复 |
 | DATA WAL 写入后、MemTable 可见前崩溃 | 有 WAL DATA | replay 到 curMemTable |
-| SST 文件写完、SSTMeta 未写 | 有 orphan SST 文件 | 忽略，由 WAL replay 恢复 |
-| SSTMeta 写完、flush boundary 未推进 | 有 SST/SSTMeta，但 boundary 未覆盖 | 忽略或作为 orphan，不注册 |
-| flush boundary 已推进、SST/SSTMeta 缺失 | boundary 指向缺失数据 | 启动失败，避免丢数据 |
+| SST 文件写完、SSTMeta 未写 | 有 orphan SST 文件 | 不注册、不清理、不推进 nextFlushId；由 WAL replay 后的下一次 Flush 原位覆盖 |
+| SSTMeta 写完、flush boundary 未推进 | 有 SST/SSTMeta，但 boundary 未覆盖 | 同上，作为可复用 orphan |
+| compact 输出已发布、旧输入只删除一部分 | 大范围完整输出覆盖旧输入 | 选择大范围输出，旧输入进入 best-effort cleanup |
+| 最老 SINKED data 已删、meta 删除失败 | meta-only 前缀，sequence 已由 Paimon 覆盖 | 不注册，作为已开始 evict 的垃圾继续清理 |
+| 保留后缀内部 SST/SSTMeta 缺失 | flushId 出现内部缺口 | 启动失败，人工介入 |
+| flush boundary 未被 Paimon 覆盖且本地尾部缺失 | boundary 指向无承载数据 | 启动失败，避免丢数据 |
 | Paimon prepare 成功、prepare meta 未写 | Paimon 可能有临时 data files | 不恢复 commit，后续重新 sink；可能遗留外部垃圾 |
 | prepare meta 已写、success meta 未写 | 可恢复 prepared commit | 重试 commit，成功后写 success |
 | success meta 已写、部分或全部 SSTMeta 未标记 SINKED | commit 已确认 | 进入 `FINALIZING`，按 exact batch success 幂等修正 SSTMeta、RunState 和 boundary，不再次 commit |
@@ -373,6 +379,8 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 - 运行期 durable success 之后的本地收尾失败会进入 `FINALIZING`，由 Maintenance 最高优先级重做；该路径只读取原 success metadata，不创建新 Paimon commit。
 - Flush boundary 已使用独立 `flush-boundary.meta`。
 - 运行期 flush boundary 写入失败时，非持久化 FlushFlight 会复用已经发布的 SST 完成重试；进程崩溃后仍按 orphan SST + WAL replay 恢复。
+- `SSTRecoveryPlanner` 已从 storage manager 中抽离目录扫描与恢复判断；可见集合必须构成 flushId 连续后缀，只自动修复 compact、最老 evict 和 boundary orphan 三类正常崩溃状态。
+- retired SST 使用 data-first 删除且不额外 force 目录，data/meta 均成功前不移除 cleanup entry；启动可识别并清理 data 已删、meta 尚存的最老 evict 残留。
 - WAL truncate 已按 `persistedSequenceId` / `maxSequenceId` 维度实现，并在 sink success 或 recovered prepare commit 后触发；删除失败的 WAL 仍保留在候选集合中，后续 truncate 可以重试。
 - `SinkMetaPayloadCodec` 作为 SinkMeta 中 prepared/success payload 的内部二进制编解码器使用。
 
@@ -388,6 +396,10 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 - flush boundary 未推进时 orphan SST 不注册。
 - flush boundary fail-once 后在线重试复用同一个 SST，最终只存在一个 local run。
 - flush boundary 已推进但 SST/SSTMeta 损坏时启动失败。
+- SST 写入失败和 boundary orphan 重启都不消费 flushId。
+- retired meta 删除 fail-once 后保留 cleanup entry 并可重试。
+- data 已删、meta 尚存的最老 evict 残留可重启，保留后缀内部出现同类缺口则启动失败。
+- compact output 完整而旧输入删除一半时选择 output 并清理输入垃圾。
 - prepare meta 存在、success meta 不存在时恢复 commit。
 - success meta 存在但 SSTMeta 仍为 NEW 时恢复为 SINKED。
 - durable success 后本地 metadata fail-once 时进入 `FINALIZING`，在线重试后只存在原 Paimon commit。

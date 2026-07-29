@@ -49,7 +49,8 @@ record SSTMeta(
 关键约束：
 
 - 可见 local run 的 `[minFlushId, maxFlushId]` 之间不允许重叠。
-- 同一状态队列内，只允许存在连续或有明确缺口的 run；compact 只能选择连续范围。
+- 当前进程内的全部可见 local run 必须构成一个 flushId 连续后缀；允许因为最老优先 evict 而不从 1 开始，但后缀内部不允许缺口。
+- Flush 只在 data/meta/reader/可见视图全部发布后消费 flushId；失败重试和 boundary orphan 恢复都复用原 flushId。
 - 逻辑新旧顺序按 `maxFlushId` 判断，而不是按 `runId`、文件名或创建时间判断。
 - `runId` 可以自增，也可以使用其他唯一生成方式；它只服务物理文件管理。
 
@@ -118,7 +119,15 @@ run.minFlushId >  persistedFlushId -> new
 
 `persistedSequenceId` 仍然用于 WAL truncate；`persistedFlushId` 用于本地 run 生命周期判断。二者服务不同边界，不应互相替代。
 
-第一阶段实现暂不改动 SinkMeta payload 结构，仍保留 `sstIds`，并额外使用 `persistedSequenceId` 修复 compact 后的 sinked 状态恢复：当 compact 后的新 `runId` 不在历史 `sstIds` 中，只要该 run 的 `maxSequenceId <= persistedSequenceId`，恢复时仍判定为 sinked run。后续引入 `persistedFlushId` 后，可把本地 run 生命周期判断从 sequence 高水位迁移到 flush 高水位。
+V1 不增加 `persistedFlushId`，仍保留 SinkMeta 中的 `sstIds` 以恢复 exact prepared/finalizing batch，但长期 NEW/SINKED 状态只按 `persistedSequenceId` 推导：
+
+```text
+run.maxSequenceId <= persistedSequenceId -> SINKED
+run.minSequenceId >  persistedSequenceId -> NEW
+其他                                      -> 边界交叉，拒绝启动
+```
+
+这依赖现有约束：Sink 只处理最老连续 NEW 前缀，compact 只合并同状态连续 run。若未来放宽任一约束，再引入 `persistedFlushId` 或 sinked range；V1 不提前增加该元数据。
 
 ## 7. Compact 规则
 
@@ -150,7 +159,18 @@ Compact 输出约束：
 
 发布 compact 结果时，应以元数据切换为准：新 run data、meta 与经过完整校验的 cached reader 均在可见视图 monitor 外准备，随后在短临界区内一次替换旧 run。查询只能观察到带完整 reader 的旧集合或新集合，不在 cache miss 时同步重新打开并扫描 SST。
 
-当前实现通过 read epoch 避免并发查询读到已删除文件：查询、scan、sink 和 compact 读取 SST 前会创建 `SSTReadSnapshot` 并注册当前 epoch；compact 发布新 run 或 evict 移除旧 run 后, 旧 run 进入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于旧 run 的 `retireEpoch` 时, storage 才关闭旧 reader 并删除旧 data/meta 文件。启动恢复时，如果一个无 meta 的 SST 文件的 flush 范围已经被可见 run 连续覆盖，则忽略该 orphan；如果 compact 输出 meta 已写入但旧输入 meta 尚未删除就崩溃，恢复时选择覆盖范围更大的 compact run。
+当前实现通过 read epoch 避免并发查询读到已删除文件：查询、scan、sink 和 compact 读取 SST 前会创建 `SSTReadSnapshot` 并注册当前 epoch；compact 发布新 run 或 evict 移除旧 run 后, 旧 run 进入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于旧 run 的 `retireEpoch` 时, storage 才关闭旧 reader。
+
+物理清理固定按 data-first 顺序执行，但作为本地 cache 清理不额外 force storage 目录。retired entry 只有在 data/meta 均删除成功后才移除；失败则留在内存中由后续 reclaim 重试。极端掉电若造成 unlink 持久化乱序，无法安全解释的状态仍直接 fatal。启动恢复由 `SSTRecoveryPlanner` 完成：
+
+1. 扫描 data/meta 文件，把完整 pair、缺 data 的 meta 和无 meta 的 data 分开。
+2. 完整 pair 按 `minFlushId`、`maxFlushId` 升序排列，只维护一个 candidate：相同起点时保留范围更大的 SST；后续 SST 被 candidate 完整覆盖时淘汰后续 SST；相邻时确认 candidate 并前进；缺口或部分交叉直接 fatal。
+3. 对最终连续后缀按 `lastPersistedSequenceId` 推导状态，结果只能是 SINKED 前缀加 NEW 后缀。
+4. 被 compact output 覆盖的文件进入 cleanup；位于保留后缀之前、且 `maxSequenceId <= lastPersistedSequenceId` 的 meta-only 文件视为 data 已删的最老 evict 残留并进入 cleanup。
+5. `minSequenceId > lastFlushedSequenceId` 的单 flush 文件是 boundary orphan：不注册、不清理，也不推进 `nextFlushId`，由下一次 Flush 原位覆盖。
+6. 内部缺口、部分重叠、无法由上述常见崩溃状态解释的损坏直接拒绝启动。
+
+若本地 cache 已全部正常淘汰，且 `lastFlushedSequenceId <= lastPersistedSequenceId`，允许空可见集合并从 flushId 1 建立新的本地连续序列。
 
 ## 8. 淘汰规则
 

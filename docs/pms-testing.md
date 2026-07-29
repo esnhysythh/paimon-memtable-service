@@ -26,7 +26,7 @@
 |------|---------|
 | CurMemTable | 并发 put/get、容量阈值触发 freeze |
 | ImmutableMemTable | Freeze 后只读、sequence/oldest-write 边界、Flush 发布后退出查询路径 |
-| LocalStorageManager | SST 写入 → 读取一致性、BloomFilter、`Optional<Value>` 三态、read epoch 延迟删除、多路归并保留最新 Key；锁外 Flush 准备期间旧可见快照不阻塞，发布后的 meta 始终存在 cached reader |
+| LocalStorageManager | SST 写入 → 读取一致性、BloomFilter、`Optional<Value>` 三态、read epoch 延迟删除、多路归并保留最新 Key；锁外 Flush 准备期间旧可见快照不阻塞，发布后的 meta 始终存在 cached reader；flushId 失败复用、retired data-first 删除重试与启动恢复规划 |
 | WALManager | 单盘写入 → 读取、CRC 校验正确性、Magic 检测 partial write |
 | RowCodec / PrimaryKeyCodec | `InternalRow` 编码 → 解码往返正确性、主键编码顺序一致性、schema 不匹配拒绝 |
 | BloomFilter | 假阳性率在预期范围内（如 < 1%）、不同 FPP 配置的效果 |
@@ -57,7 +57,9 @@
 | Sink metadata 部分写 | 多个 SST metadata 逐个标记时部分成功，重试后全部幂等收敛为 SINKED |
 | 流控水位线 | server 快速检查与 core WAL 前复查都能返回 OVERLOADED，拒绝批次不进入 WAL |
 | 本地 SST 合并 | 只合并同状态连续 run；NEW/SINKED 均可合并，查询与恢复边界不变 |
-| SST 淘汰 | 只淘汰最老 SINKED run，read epoch 结束后才物理删除 |
+| SST 淘汰 | 只淘汰最老 SINKED run，read epoch 结束后才物理删除；data/meta 全部成功前保留 cleanup entry |
+| SST 半删除恢复 | compact 覆盖的输入和最老 evict meta-only 残留可恢复并清理；保留后缀内部缺口 fatal |
+| flushId 连续性 | SST 写入失败、boundary orphan 重启均复用原 ID；本地 cache 全淘汰后允许从 1 建立新连续序列 |
 | WAL 截断 | SinkMeta success 的 `persistedSequenceId` 覆盖旧 WAL 文件时正确删除；删除失败的候选可由后续 truncate 重试 |
 | Scheduler 优先级 | prepared retry/finalizing、可见性 fence、NEW/SINKED 数量维护按固定优先级单步调和，progress 后重新采样 |
 | Scheduler 生命周期 | 周期信号合并、64-action slice 重排队、close 停止 delayed/periodic task 并等待在途 action；Flush/Maintenance 在慢快照返回后复查 running，不从旧 pass 启动新动作 |

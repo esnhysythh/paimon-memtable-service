@@ -157,11 +157,19 @@ interface SSTReadSnapshot extends AutoCloseable {
 }
 ```
 
-`SSTReadSnapshot` 的语义是 read epoch, 不是文件级 reader lease。创建 snapshot 时记录当前 SST 可见集合 epoch, 删除和 compact 会先从可见集合移除旧 SST, 推进 epoch, 再把旧 SST 放入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于某个 retired SST 的 `retireEpoch` 时, storage 才会关闭对应 reader 并删除 data/meta 文件。这样点查仍可按 SST 顺序按需读取并在命中后停止, 不需要提前获取列表中所有 SST 的 reader lease。
+`SSTReadSnapshot` 的语义是 read epoch, 不是文件级 reader lease。创建 snapshot 时记录当前 SST 可见集合 epoch, 删除和 compact 会先从可见集合移除旧 SST, 推进 epoch, 再把旧 SST 放入 retired queue。只有当所有活跃 snapshot 的最小 epoch 已经不早于某个 retired SST 的 `retireEpoch` 时, storage 才会关闭对应 reader并按 `data -> meta` 的顺序删除文件。retired entry 只有在两次删除都成功后才能移除；删除失败保留 entry，后续 reclaim 幂等重试。这样点查仍可按 SST 顺序按需读取并在命中后停止, 不需要提前获取列表中所有 SST 的 reader lease。
 
 **SSTMeta** 至少包含 `runId`、`minFlushId/maxFlushId`、文件路径、文件大小、entryCount、minKey、maxKey、minSequenceId、maxSequenceId、`oldestWriteAtMillis`、`createdAtMillis` 和状态。SSTMeta 会写入独立 `sst-*.meta.json`，启动时再与 SST 文件 properties 交叉校验。BucketDirector 使用 `SSTMeta` 做查询剪枝、状态快照、淘汰和 WAL/Sink 边界推进。`entryCount` 表示 SST 物理 entry 数，包含 tombstone 和跨 SST 的旧版本；它不能由 `sequenceId` 范围推导，也不表示去重后的 live row 数。
 
-SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` 表达稳定的 `minFlushId/maxFlushId` 范围。`NEW` / `SINKED` 状态写入 `sst-*.meta.json`, 可靠状态来源是 SST metadata 和 SinkMeta success, 不是数据文件名。启动扫描本地 SST 时，只有 `maxSequenceId <= lastFlushedSequenceId` 的 SST 会注册为有效本地文件；超过该边界的 SST 视为 orphan，不进入查询和 sink 列表，由 WAL replay 恢复对应数据。运行期若 SST 已发布但 flush boundary 写入失败，Director 通过非持久化 FlushFlight 复用该 SST 完成下一次重试，避免为同一个 Immutable 生成第二个 run。
+SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` 表达稳定的 `minFlushId/maxFlushId` 范围。`NEW` / `SINKED` 状态写入 `sst-*.meta.json` 供观测，但启动恢复不信任旧 state，而是使用 SinkMeta success 的 `lastPersistedSequenceId` 重新推导：`maxSequenceId <= boundary` 为 SINKED，`minSequenceId > boundary` 为 NEW，跨越 boundary 则拒绝启动。历史 `sstIds` 只服务 exact Sink finalization，不再作为长期 run 状态判定依据。
+
+启动扫描由 `SSTRecoveryPlanner` 集中完成。它对完整 data/meta pair 使用单 candidate 贪心选择范围最大的 compact 输出，最终可见 run 必须形成一个 flushId 连续的本地后缀；内部缺口、部分重叠、sequence/state 交叉和无法解释的损坏均拒绝启动。只自动处理三类正常崩溃残留：
+
+- compact 输出完整覆盖的旧输入文件；
+- `maxSequenceId <= lastPersistedSequenceId` 且位于可见后缀之前的 meta-only 最老 evict 残留；
+- `minSequenceId > lastFlushedSequenceId` 的单 flush orphan。
+
+orphan 不进入垃圾清理队列，也不推进 `nextFlushId`；WAL replay 后的下一次 Flush 复用并覆盖该 flushId。运行期若 SST 已发布但 flush boundary 写入失败，Director 通过非持久化 FlushFlight 复用同一个 SST 完成 handoff。`flushToSST` 自身也只在完整发布后推进 allocator，因此写 SST 或 meta 失败同样不会消费 flushId。
 
 **BloomFilter**：
 - 每个 SST 文件包含基于主键的 BloomFilter。
@@ -171,8 +179,8 @@ SST 数据文件 publish 后不再 rename, 文件名使用 `sst-%06d-%06d.sst` �
 
 **SST 文件校验**：
 - 打开或注册 SST 时校验 Footer 中的全文件 CRC32，覆盖 Footer 之前的全部数据。
-- 校验失败 → 标记该 SST 文件为损坏，记录告警日志。损坏 SST 中的数据从其他层（更新层的 MemTable 或 Paimon 历史数据点查）补全。
-- 若本地 `flush-boundary.meta` 已经记录 `lastFlushedSequenceId > 0`，说明 SST 已经参与 WAL 恢复边界。此时启动阶段发现 SST 损坏应失败，而不是静默跳过，否则可能因为 WAL replay 跳过已 flush sequence 而丢失数据。
+- 校验失败后由启动恢复规划判断：只有被完整 compact 输出覆盖的输入残留或尚未推进 flush boundary 的 orphan 可以忽略；其他损坏拒绝启动。
+- 若损坏位于最终保留的连续 SST 后缀中，不能静默跳过，否则可能因为 WAL replay 跳过已 flush sequence 而丢失数据。V1 不为人工删除、磁盘损坏等低概率内部缺口设计推断恢复。
 - V1 不做逐 Block 降级读取。
 
 **本地 Flush 恢复边界**：
@@ -406,7 +414,9 @@ Freeze 并到达水位，后台 Flush 也可以并发发布新的 NEW run。该�
 
 **Evict 删除磁盘文件**：
 - 只从可见集合移除最老 SINKED run。
-- storage 记录 `retireEpoch`；活跃 read snapshot 释放后再关闭 reader 并删除 data/meta 文件。
+- storage 记录 `retireEpoch`；活跃 read snapshot 释放后再关闭 reader。
+- 物理删除按 data、meta 顺序推进；任一步失败都保留 retired entry 供下一次 reclaim 重试。删除属于可重建本地 cache 的清理路径，V1 不为 unlink 增加 directory fsync；极端掉电造成目录项持久化乱序时允许恢复校验 fatal。
+- 若进程在 data 删除成功、meta 删除前崩溃，启动恢复把位于可见后缀之前且已由 `lastPersistedSequenceId` 覆盖的 meta-only run 识别为最老 evict 残留，继续清理而不注册为可见 SST。
 
 ### 5.3 内存可见性总结
 
@@ -424,35 +434,42 @@ Freeze 并到达水位，后台 Flush 也可以并发发布新的 NEW run。该�
 RecoveryManager 启动
         │
         ▼
-1. 加载本地 SST 和 flush boundary
+1. 加载 SinkMeta success，取得 lastPersistedSequenceId
         │
         ▼
-2. 初始化 WALManager，扫描 WAL 文件
+2. 加载 flush boundary，并规划本地 SST
+   - 从完整 data/meta pair 贪心选择覆盖范围最大的 compact 输出
+   - 最终可见 run 必须构成 flushId 连续后缀
+   - 识别 compact/oldest-evict 残留与 flush-boundary orphan
+   - 按 lastPersistedSequenceId 推导 NEW/SINKED
+        │
+        ▼
+3. 初始化 WALManager，扫描 WAL 文件
    获取 WAL 中记录的最高 sequenceId
         │
         ▼
-3. 重放 DATA 记录，恢复 curMemTable
+4. 重放 DATA 记录，恢复 curMemTable
    - 本地 SST 已覆盖的数据由 lastFlushedSequenceId 跳过
    - 扫描 DATA 记录中的 sequenceId，恢复 lastSequenceId，保证后续写入继续递增
    - 传输层由 LevelDB LogReader 逐 chunk 校验 CRC32C
    - 应用层解析 PMS Payload 时校验 sequenceId、keyLen/valueLen 合法性
         │
         ▼
-4. 加载 SinkMeta，检查是否存在 prepare 但无 success
+5. 检查是否存在 prepare 但无 success
    ┌───────────────────────────────────────────────────────┐
    │ 有 prepare，无 success                                │
    │ → 使用 SinkMeta 中保存的 prepared payload 和 fileRefs  │
    │   校验 Paimon data files 后重试 commit                 │
    ├───────────────────────────────────────────────────────┤
    │ 有 success                                            │
-   │ → 使用 success.sstIds 推导 sinkedSST                   │
+   │ → 使用 success.persistedSequenceId 推导 NEW/SINKED     │
    └───────────────────────────────────────────────────────┘
         │
         ▼
-5. 根据 SinkMeta success 修正 SST metadata 状态
+6. recovered prepare commit 推进 boundary 后，再次修正 SST 状态并截断 WAL
         │
         ▼
-6. 恢复完毕，启动 RPC 和后台任务
+7. 恢复完毕，启动 RPC 和后台任务
 ```
 
 ## 6. 核心状态机流转

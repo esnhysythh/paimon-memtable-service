@@ -128,15 +128,18 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     public void init() throws IOException {
-        storageManager.init();
         sinkMetaStore.init();
-        walManager.init();
-        RecoveryState recoveryState = recoverFromWAL();
+        // Storage recovery needs the durable Paimon boundary to distinguish an oldest evict
+        // residue from an unsafe hole in the local NEW suffix. Pending prepares are committed
+        // only after the local reader view has been reconstructed below.
         SinkRecoveryState initialSink = sinkMetaStore.load();
         validateSinglePendingPrepare(initialSink);
+        storageManager.init(initialSink.lastPersistedSequenceId());
+        walManager.init();
+        RecoveryState recoveryState = recoverFromWAL();
         sinkFlight = sinkFlightFromRecovery(initialSink);
         SinkRecoveryState recoveredSink = recoverPreparedSinks(initialSink);
-        storageManager.applySinkedSSTIds(recoveredSink.sinkedSSTIds(), recoveredSink.lastPersistedSequenceId());
+        storageManager.applyPersistedSequenceId(recoveredSink.lastPersistedSequenceId());
         walManager.truncate(recoveredSink.lastPersistedSequenceId());
         sinkFlight = SinkFlightSnapshot.idle();
         runState = RunState.fromMetas(storageManager.metas());
