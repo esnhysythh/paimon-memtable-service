@@ -115,7 +115,12 @@ Java SDK，负责 RPC 通信、batching、反压重试，并在 row-aware facade
 Flink Sink 实现，负责对接 Flink 记录格式，调用 `pms-client`。
 - 详见 [flink-connector-pms.md](docs/flink-connector-pms.md)。
 
-### 4.9 依赖方向
+### 4.9 pms-dist
+Linux 二进制发行包组装模块。它不包含业务实现，只把 `pms-server` 及其运行时依赖、Shell
+脚本和默认配置组装为展开目录与 `tar.gz`。发行包使用 `lib/*` classpath，不构建 fat JAR。
+- 详见 [pms-dist.md](docs/pms-dist.md)。
+
+### 4.10 依赖方向
 
 当前模块按协议契约、core、codec、server/client 外壳和 Paimon 适配层分层，依赖方向如下。
 
@@ -128,6 +133,7 @@ pms-lookup-paimon -> Paimon
 pms-server      -> pms-protocol + pms-core + pms-codec + pms-sink-paimon + pms-lookup-paimon
 pms-client      -> pms-protocol + pms-codec(row-aware facade)
 flink-connector -> pms-client
+pms-dist        -> pms-server(runtime distribution)
 ```
 
 ## 5. 设计文档索引
@@ -151,6 +157,7 @@ flink-connector -> pms-client
 | [pms-core-statistic.md](docs/pms-core-statistic.md) | 可观测性基础设施（待详细设计） |
 | [pms-benchmark.md](docs/pms-benchmark.md) | PMS benchmark 分层、pms-core db_bench-like 基准设计 |
 | [pms-server.md](docs/pms-server.md) | 服务端外壳 |
+| [pms-dist.md](docs/pms-dist.md) | Linux 二进制发行包、脚本与运行目录约定 |
 | [pms-client.md](docs/pms-client.md) | 客户端 SDK |
 | [flink-connector-pms.md](docs/flink-connector-pms.md) | Flink Connector |
 | [pms-testing.md](docs/pms-testing.md) | 测试策略 |

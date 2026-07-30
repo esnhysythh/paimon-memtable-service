@@ -13,6 +13,14 @@ mvn -pl pms-server -am process-classes exec:java \
 
 The bundled example config is at `src/main/resources/pms-server-example.properties`.
 
+For a Linux binary distribution, build the `pms-dist` module:
+
+```bash
+mvn -pl pms-dist -am package
+```
+
+See [pms-dist](../docs/pms-dist.md) for the archive layout and runtime scripts.
+
 For development, start the self-contained test server. It creates a default Paimon primary-key
 table and writes all state under `pms-server/target/pms-test-server/<timestamp>/`.
 
@@ -73,6 +81,14 @@ directories and the target Paimon table.
 | `pms.storage.sinked_sst.max_count` | `10` | Maintenance target for retained SINKED local SST count. |
 | `pms.operation.sink.batch_max_bytes_mb` | `1024` | Maximum input bytes for one Sink batch; one oversized oldest run may progress alone. |
 | `pms.operation.compact.max_input_size_mb` | `1024` | Maximum input bytes for one local compaction. |
+| `pms.lookup.cache.enabled` | `true` | Enables the rebuildable local value SST cache. |
+| `pms.lookup.cache.dir` | JVM temp directory | Lookup cache directory; must not overlap WAL, storage, or a local warehouse. |
+| `pms.lookup.cache.max_bytes` | `3 GiB` | Maximum local lookup cache size. |
+| `pms.lookup.cache.build_threshold` | `3` | File access count before a cache build is considered. |
+| `pms.lookup.cache.build_threads` | `2` | Cache build worker count. |
+| `pms.lookup.cache.build_timeout_ms` | `30000` | Timeout for one cache build. |
+| `pms.lookup.cache.retry_backoff_ms` | `60000` | Backoff after a failed cache build. |
+| `pms.lookup.direct.metadata_cache_entries` | `1024` | Direct Parquet lookup metadata cache entries. |
 | `pms.paimon.warehouse` | required | Paimon warehouse path. |
 | `pms.paimon.database` | required | Paimon database. |
 | `pms.paimon.table` | required | Paimon table. |
