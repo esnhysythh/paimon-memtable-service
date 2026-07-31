@@ -30,6 +30,7 @@
 | WALManager | 单盘写入 → 读取、CRC 校验正确性、Magic 检测 partial write |
 | RowCodec / PrimaryKeyCodec | `InternalRow` 编码 → 解码往返正确性、主键编码顺序一致性、非法格式与不支持类型拒绝 |
 | BloomFilter | 假阳性率在预期范围内（如 < 1%）、不同 FPP 配置的效果 |
+| Flink Connector | Factory/options、schema/type adapter、primary-key selector、DELETE filter、Lookup key 计划、object reuse |
 
 ### 2.2 测试工具
 
@@ -97,6 +98,21 @@ class PMSTestCluster implements AutoCloseable {
     void killPMS();  // 模拟进程崩溃
 }
 ```
+
+### 3.4 Flink Connector 集成测试
+
+`flink-connector-pms` 以 Flink `1.20.3` 为固定测试基线，分三层验证：
+
+| 层次 | 验证点 |
+|------|--------|
+| 轻量 wire integration | HTTP 测试服务继续使用真实 PMS handshake、key/row/batch codec，覆盖 Sink 与 sync/async Lookup |
+| Planner / Factory | SQL Factory discovery、Sink plan、完整主键 direct DELETE、扫描型 DELETE 拒绝 |
+| 真实端到端 | Flink MiniCluster + 真实 PMS Server + 本地 Paimon，覆盖 SQL Sink、processing-time Lookup Join、flush/sink 与 tombstone |
+
+Connector 发布包还需在 `package` 后检查：不包含 Flink class、不包含未 relocation 的
+Paimon class、保留 Factory service，并能直接从 shaded JAR 完成 `ServiceLoader`
+发现。当前由发布前手工 smoke 执行，接入 CI 后再迁移到独立集成测试 pipeline。详细
+契约和长期故障矩阵见 [flink-connector-pms.md](flink-connector-pms.md)。
 
 ---
 
