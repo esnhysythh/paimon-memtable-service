@@ -112,7 +112,13 @@ Java SDK，负责 RPC 通信、batching、反压重试，并在 row-aware facade
 - 详见 [pms-client.md](docs/pms-client.md)。
 
 ### 4.8 flink-connector-pms
-Flink Sink 实现，负责对接 Flink 记录格式，调用 `pms-client`。
+Flink 1.20 SQL/Table Connector，负责把 Flink `RowData` 适配为 PMS 写入与当前态点查：
+提供 At-Least-Once Sink、processing-time Lookup Join Source，以及仅接受完整主键常量
+等值条件的 SQL DELETE pushdown。Connector 依赖 `pms-client`，不向 `pms-core` 泄漏
+Flink/Paimon 行类型；MVP 不提供 Scan Source、Catalog、Connector 本地 Lookup cache 或
+Exactly-Once 协议。发布 JAR 将 Flink 依赖保持为 provided，重定位随包发布的 Paimon
+API/Common 类和 PMS 协议使用的 Jackson，并排除 Connector 未使用的 Paimon
+Core/Format 及重复传递依赖。
 - 详见 [flink-connector-pms.md](docs/flink-connector-pms.md)。
 
 ### 4.9 pms-dist
