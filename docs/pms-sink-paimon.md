@@ -109,7 +109,11 @@ delete/tombstone 不写入 row value bytes；它只由 PMS KV 层表达。
 
 当前 `commitIdentifier` 使用 `SinkBatch.maxSequenceId()`。
 
-该选择依赖 PMS 全局 sequence 单调递增，并要求 sink batch 串行提交。同一个 prepared commit 在 WAL recovery 中重试时会使用相同 commit identifier，从而复用 Paimon 的幂等提交能力。
+该选择依赖同一套 PMS 本地状态内 sequence 单调递增，并要求 sink batch 串行提交。
+server 为每套全新本地状态生成并持久化独立的 `commit_user`，所以本地 sequence 重置不会
+与旧实例的提交编号冲突。同一个 prepared commit 在恢复时使用原 `commit_user` 和
+`commitIdentifier`，保留 Paimon 的幂等提交能力；身份生成与恢复规则见
+[pms-server.md](pms-server.md) § 2.2。
 
 ## 5. Commit 流程
 

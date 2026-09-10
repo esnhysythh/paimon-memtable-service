@@ -46,7 +46,8 @@ WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteExcept
 `PmsTableService.open()` 在对外监听前完成本地状态恢复：
 
 ```text
-load/validate Paimon table and supported table profile
+load/create durable writer identity
+  -> load/validate Paimon table and supported table profile
   -> initialize local storage and flush boundary
   -> initialize SinkMeta and derive NEW/SINKED state
   -> initialize WAL and replay data beyond lastFlushedSequenceId
@@ -58,6 +59,24 @@ load/validate Paimon table and supported table profile
 ```
 
 启动时的 metadata 损坏、表 profile 不受支持、SST/flush boundary 不一致或非法 prepared 状态属于确定性错误，必须拒绝启动。server 不会把当前表 Schema 与旧进程或旧本地状态做主动比对；Schema 不变由上述产品约束保证。恢复出的、尚未由 `lastPersistedSequenceId` 覆盖的数据会使 scheduler 尽快建立新的 Paimon 可见性 fence，而不是等待可能失真的 wall-clock age。
+
+#### Writer 身份
+
+Paimon 按 `(commit_user, commitIdentifier)` 判定重复提交，而 PMS 使用本地 sequence 作为
+`commitIdentifier`。为避免全新本地目录从 sequence 1 开始后被旧提交编号过滤，server 首次
+启动时生成 `<pms.server.commit_user>-<12 位随机十六进制 ID>`，例如
+`pms-server-7e4c9a21b6d0`，将完整身份保存为 `storage/commit-user` 的一行文本。
+短 ID 取 UUID 的前 48 个随机 bit，用于低频的本地状态重建；不增加远端身份注册机制。
+
+身份通过同步写入临时文件、原子 rename 和目录 fsync，在打开 WAL、恢复 prepared Sink 前
+持久化。同一套本地状态的所有启动都读取原身份；全新 WAL/storage 目录生成新身份，sequence
+仍从 1 开始。这样无需增加远端 sequence 初始化，也不改变 core 的 Flush/Sink 边界。
+
+`pms.server.commit_user` 现在表示身份前缀，使用原状态时不能修改。迁移机器时须连同
+WAL/storage 一起保留 `commit-user`；全新部署使用全新 WAL/storage/cache 目录。身份文件
+缺失但 WAL/storage 已有内容、身份格式非法或前缀改变时，启动失败，不自动生成替代身份。
+只有首次初始化遗留的 `commit-user.tmp` 可以在没有其他本地状态时重试。
+V1 不自动迁移缺少身份文件的旧状态；升级前应使用旧版本完成 Sink，再使用全新目录启动。
 
 ### 2.3 配置管理
 

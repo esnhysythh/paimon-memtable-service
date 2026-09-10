@@ -61,6 +61,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -276,6 +277,83 @@ class PmsServerEndToEndTest {
             assertEquals(1L, number(recovery, "sinkedSSTCount"));
             assertEquals(Map.of("id", 1, "marker", "success-a"), server.get(Map.of("id", 1)).orElseThrow());
             assertEquals(Map.of(1, "success-a"), server.readIntStringRows());
+        }
+    }
+
+    @Test
+    void freshLocalStateCanContinueWritingToAnExistingPaimonTable() throws Exception {
+        PmsServerConfig firstConfig = new ConfigManager().from(baseProperties());
+        try (PMSTestServer server = PMSTestServer.create(firstConfig, schema())) {
+            try (PmsTableService first = PmsTableService.open(firstConfig)) {
+                first.write(Map.of("id", 1, "marker", "old"));
+                first.write(Map.of("id", 2, "marker", "delete-me"));
+                first.write(Map.of("id", 3, "marker", "keep"));
+                assertEquals(3L, first.freezeCurMemTable().fenceSequenceId());
+                first.flushImmutableMemTable();
+                sinkAllAvailable(first);
+            }
+            String firstCommitUser = server.table().latestSnapshot().orElseThrow().commitUser();
+
+            PmsServerConfig freshConfig = new ConfigManager().from(baseProperties(
+                tempDir.resolve("fresh"), tempDir.resolve("warehouse")
+            ));
+            try (PmsTableService fresh = PmsTableService.open(freshConfig)) {
+                assertEquals(0L, number(fresh.state(), "lastAssignedSequenceId"));
+                fresh.write(Map.of("id", 1, "marker", "updated"));
+                fresh.delete(Map.of("id", 2));
+                fresh.write(Map.of("id", 4, "marker", "inserted"));
+                // The same commit identifier must represent new data for a fresh local state.
+                assertEquals(3L, fresh.freezeCurMemTable().fenceSequenceId());
+                fresh.flushImmutableMemTable();
+                sinkAllAvailable(fresh);
+                assertEquals(3L, number(fresh.state(), "lastPersistedSequenceId"));
+            }
+
+            assertEquals(Map.of(1, "updated", 3, "keep", 4, "inserted"), server.readIntStringRows());
+            String freshCommitUser = server.table().latestSnapshot().orElseThrow().commitUser();
+            assertNotEquals(firstCommitUser, freshCommitUser);
+            assertTrue(freshCommitUser.matches("pms-server-[0-9a-f]{12}"));
+        }
+    }
+
+    @Test
+    void committedSinkRecoveryKeepsWriterIdentityAndDoesNotCommitTwice() throws Exception {
+        PmsServerConfig config = new ConfigManager().from(baseProperties());
+        try (PMSTestServer server = PMSTestServer.create(config, schema())) {
+            try (PmsTableService first = PmsTableService.open(config, (table, commitUser, storage) ->
+                    new SinkManager() {
+                        private final SinkManager delegate = new PaimonSinkManager(table, commitUser, storage);
+
+                        @Override
+                        public PreparedSinkCommit prepare(SinkBatch batch) {
+                            return delegate.prepare(batch);
+                        }
+
+                        @Override
+                        public SinkCommitResult commit(PreparedSinkCommit prepared) {
+                            delegate.commit(prepared);
+                            throw new RuntimeException("forced failure after Paimon commit");
+                        }
+                    })) {
+                first.write(Map.of("id", 1, "marker", "committed"));
+                first.freezeCurMemTable();
+                first.flushImmutableMemTable();
+                assertThrows(RuntimeException.class, () -> sinkAllAvailable(first));
+            }
+            var committedSnapshot = server.table().latestSnapshot().orElseThrow();
+
+            try (PmsTableService recovered = PmsTableService.open(config)) {
+                assertEquals(1L, number(recovered.state(), "lastPersistedSequenceId"));
+                assertEquals(committedSnapshot.id(), server.table().latestSnapshot().orElseThrow().id());
+                recovered.write(Map.of("id", 2, "marker", "after-restart"));
+                assertEquals(2L, recovered.freezeCurMemTable().fenceSequenceId());
+                recovered.flushImmutableMemTable();
+                sinkAllAvailable(recovered);
+            }
+            var nextSnapshot = server.table().latestSnapshot().orElseThrow();
+            assertEquals(committedSnapshot.commitUser(), nextSnapshot.commitUser());
+            assertEquals(committedSnapshot.id() + 1, nextSnapshot.id());
+            assertEquals(Map.of(1, "committed", 2, "after-restart"), server.readIntStringRows());
         }
     }
 
