@@ -62,7 +62,7 @@ directories and the target Paimon table.
 | --- | --- | --- |
 | `pms.server.host` | `127.0.0.1` | HTTP bind host. |
 | `pms.server.port` | `9090` | HTTP bind port. Use `0` in tests for a random port. |
-| `pms.server.commit_user` | `pms-server` | Paimon commit user. |
+| `pms.server.commit_user` | `pms-server` | Paimon writer identity prefix. A persisted 12-hex-digit suffix identifies each local-state lifetime; keep the prefix unchanged on restart. |
 | `pms.protocol.strict_http2` | `true` | Rejects non-HTTP/2 requests on binary protocol endpoints. |
 | `pms.protocol.max_key_bytes` | `65536` | Maximum encoded key bytes per protocol request item. |
 | `pms.protocol.max_row_bytes` | `16777216` | Maximum encoded row bytes per protocol request item. |
@@ -100,3 +100,10 @@ directories and the target Paimon table.
 | `pms.memtable.max_size_mb` | `256` | Current memtable size threshold. |
 | `pms.flowcontrol.overloaded_immutable_count` | `4` | Flow-control threshold. |
 | `pms.flowcontrol.overloaded_pending_sst_count` | `20` | Flow-control threshold. |
+
+The effective Paimon commit user (for example, `pms-server-7e4c9a21b6d0`) is stored in
+`pms.storage.dir/commit-user`. Preserve this file together with WAL/storage when moving the
+service. Fresh local state gets a new identity so restarting sequence numbers cannot cause
+Paimon to skip new data as duplicate commits. Existing state without this file is rejected;
+for an upgrade from the old format, finish sinking with the old version and then start with
+fresh WAL/storage/cache directories. See [writer identity and recovery](../docs/pms-server.md).

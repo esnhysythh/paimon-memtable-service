@@ -67,6 +67,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -160,14 +161,19 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
 
     static PmsTableService open(PmsServerConfig config, SinkManagerFactory sinkManagerFactory) throws Exception {
         LOG.info("Opening PMS table service for {}.{}", config.database(), config.table());
+        String commitUser = PmsWriterIdentity.loadOrCreate(
+            Path.of(config.coreConfig().wal().dir()),
+            Path.of(config.coreConfig().storage().dir()),
+            config.commitUser()
+        );
         PaimonTableLoader.LoadedTable loadedTable = new PaimonTableLoader().load(config);
         PMSBucketDirectorImpl director = new PMSBucketDirectorImpl(
             config.coreConfig(),
-            storage -> sinkManagerFactory.create(loadedTable.table(), config.commitUser(), storage)
+            storage -> sinkManagerFactory.create(loadedTable.table(), commitUser, storage)
         );
         try {
             director.init();
-            LOG.info("PMS table service opened for {}.{}", config.database(), config.table());
+            LOG.info("PMS table service opened for {}.{}, commitUser={}", config.database(), config.table(), commitUser);
             return new PmsTableService(config, loadedTable, director);
         } catch (IOException | RuntimeException e) {
             LOG.error("Failed to open PMS table service for {}.{}", config.database(), config.table(), e);

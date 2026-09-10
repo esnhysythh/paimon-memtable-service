@@ -28,6 +28,10 @@ SinkMeta  = Paimon prepare/commit 进度与外部持久化边界
 - WAL 截断以 `SinkMeta.success.persistedSequenceId` 为主边界，而不是以 Paimon `snapshotId` 为主边界。
 - SST 数据文件名 publish 后保持稳定，不包含 `NEW` / `SINKED` 状态；metadata 保存 run 结构，启动生命周期状态由 SinkMeta success 的 `persistedSequenceId` 推导，而不是依赖文件名或历史 runId。
 
+server 在打开这些组件前加载或创建 `storage/commit-user`，持久化本地状态对应的 Paimon
+writer 身份。恢复 prepared Sink 必须沿用该身份；全新本地状态使用新身份以隔离重置后的
+sequence。此文件由 server 管理，不进入 core 恢复协议，详见 [pms-server.md](pms-server.md) § 2.2。
+
 该选择的理由：
 
 - WAL 重新变成单一职责的数据日志，恢复时只负责重放尚未被本地 SST 覆盖的数据。
