@@ -6,7 +6,7 @@
 
 - 顶层架构设计: `./design.md`
 - 模块设计文档: `./docs`
-- 测试策略: `./docs/pms-testing.md`
+- 测试策略: `./docs/tests/pms-testing-strategy.md`
 
 开始非简单设计或实现前, 优先阅读 `design.md` 以及相关模块文档.
 
