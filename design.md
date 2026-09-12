@@ -126,7 +126,12 @@ Linux 二进制发行包组装模块。它不包含业务实现，只把 `pms-se
 脚本和默认配置组装为展开目录与 `tar.gz`。发行包使用 `lib/*` classpath，不构建 fat JAR。
 - 详见 [pms-dist.md](docs/pms-dist.md)。
 
-### 4.10 依赖方向
+### 4.10 pms-tests
+仓库内测试子项目，不进入 `pms-dist`，包含可复用的 `pms-testkit` 和显式 profile 执行的
+`pms-integration-tests`；后续 `pms-benchmark` 也放在该子项目下。生产模块不依赖任何测试模块。
+- 详见 [PMS 测试策略与测试子项目设计](docs/tests/pms-testing-strategy.md)。
+
+### 4.11 依赖方向
 
 当前模块按协议契约、core、codec、server/client 外壳和 Paimon 适配层分层，依赖方向如下。
 
@@ -140,6 +145,7 @@ pms-server      -> pms-protocol + pms-core + pms-codec + pms-sink-paimon + pms-l
 pms-client      -> pms-protocol + pms-codec(row-aware facade)
 flink-connector -> pms-client
 pms-dist        -> pms-server(runtime distribution)
+pms-tests       -> production modules（仅测试/benchmark，不进入生产依赖）
 ```
 
 ## 5. 设计文档索引
@@ -166,5 +172,7 @@ pms-dist        -> pms-server(runtime distribution)
 | [pms-dist.md](docs/pms-dist.md) | Linux 二进制发行包、脚本与运行目录约定 |
 | [pms-client.md](docs/pms-client.md) | 客户端 SDK |
 | [flink-connector-pms.md](docs/flink-connector-pms.md) | Flink Connector |
-| [pms-testing.md](docs/pms-testing.md) | 测试策略 |
+| [pms-testing-strategy.md](docs/tests/pms-testing-strategy.md) | 全项目测试策略、发布门槛与 `pms-tests` 子项目边界 |
+| [pms-testkit.md](docs/tests/pms-testkit.md) | 测试环境、资源所有权、Paimon fixture/verifier 与 PMS 子进程基础设施 |
+| [pms-integration-tests.md](docs/tests/pms-integration-tests.md) | 远端 HDFS、独立 PMS 进程与崩溃恢复集成测试 |
 | [paimon-primary-key-encoding.md](references/paimon-primary-key-encoding.md) | Paimon 主键序列化与排序语义参考 |

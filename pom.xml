@@ -19,6 +19,7 @@
         <module>flink-connector-pms</module>
         <module>pms-server</module>
         <module>pms-dist</module>
+        <module>pms-tests</module>
     </modules>
 
     <properties>
@@ -45,6 +46,11 @@
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.5.2</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
                     <version>3.5.2</version>
                 </plugin>
                 <plugin>
