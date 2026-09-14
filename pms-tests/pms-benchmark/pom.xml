@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>org.qwh</groupId>
+        <groupId>io.github.esnhysythh</groupId>
         <artifactId>pms-tests</artifactId>
         <version>0.1-SNAPSHOT</version>
     </parent>
@@ -14,7 +14,7 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.qwh</groupId>
+            <groupId>io.github.esnhysythh</groupId>
             <artifactId>pms-lookup-paimon</artifactId>
             <version>${project.version}</version>
         </dependency>
@@ -31,7 +31,7 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>org.qwh</groupId>
+            <groupId>io.github.esnhysythh</groupId>
             <artifactId>pms-core</artifactId>
             <version>${project.version}</version>
         </dependency>

@@ -194,7 +194,8 @@ select NEW prefix
 
 | 同步边界 | 保护内容 | 不应承担的工作 |
 |----------|----------|----------------|
-| `writeMutex` | writer queue、WAL/sequence/MemTable 提交顺序、Freeze 对象切换、写入前水位复查 | Flush/Sink/Compact/Evict IO，查询 |
+| `writeQueueMutex` | pending queue 入队、合批和 leader 交接 | WAL/MemTable 提交、等待请求完成 |
+| `writeMutex` | WAL/sequence/MemTable 提交顺序、Freeze 对象切换、写入前水位复查 | Flush/Sink/Compact/Evict IO，查询 |
 | `sstMaintenanceMutex` | Sink、prepared retry、Compact、Evict 的互斥与稳定选择/发布 | 普通写入、lookup、scan |
 | `lifecycleLock` | close 与在途操作的生命周期互斥 | 代替数据状态发布协议 |
 | `MemTableState` | current + immutable 列表的不可变聚合视图 | 长期缓存策略 |
@@ -202,6 +203,13 @@ select NEW prefix
 | SST read epoch | 查询已选择文件的存活期 | 调度决策 |
 
 慢操作遵循“锁内确认/发布边界，锁外或非写锁执行 IO”的原则。`sstMaintenanceMutex` 串行化 SST 生命周期操作，避免同时启动两个 Sink 或让 compact/evict 改变 Sink 输入；它不要求阻塞写入，因为新生成的 Immutable/SST 可以在下一轮快照中被处理。
+
+写入提交本身保持串行：调用线程入队后，leader 在 `writeMutex` 内执行 WAL append 与 MemTable
+apply；follower 通过每请求的 CountDownLatch 等待。自然合批只合并当时已排队的请求，不主动
+等待凑批，也不提供并行 WAL/MemTable 提交。leader 持续处理到队列清空才返回，因此它自己的
+请求即使已完成，也可能继续替其他请求工作；这会影响公平性与尾延迟。
+
+当前本地写入性能满足 MVP 需求，保留串行提交实现，暂不为线性扩展指标调整提交协议。
 
 ## 6. 状态快照
 

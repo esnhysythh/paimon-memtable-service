@@ -18,7 +18,7 @@ PMS V1 的测试体系需要回答三类问题：
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
-│ Benchmark：core 与 remote PMS workload、容量和性能趋势   │
+│ Benchmark：本地 core / Paimon lookup；远端 workload 后续 │
 ├──────────────────────────────────────────────────────────┤
 │ Integration：多组件状态机、本地 E2E、远端 HDFS、恢复     │
 ├──────────────────────────────────────────────────────────┤
@@ -177,12 +177,11 @@ Integration tests 与 benchmark 不互相依赖，也不通过 Maven test-jar �
 
 性能验证不进入常规单元/集成测试链路。`pms-tests/pms-benchmark` 提供本地 core 基准，以及
 真实本地 Paimon 文件的 direct/cached 查询基准。两类入口独立，数据准备不计入查询耗时。
-运行结果只作为本地或 CI 产物，不纳入源码提交。后续规划包括：
+运行结果只作为本地或 CI 产物，不纳入源码提交。当前已提供 core 的 db_bench-like 基线、
+独立的数据准备/warmup/measurement、正确性检查与结果输出。后续规划包括：
 
-- 直接调用 byte-oriented core API 的 db_bench-like 基线；
 - 经过 client、独立 PMS JVM 和远端 Paimon/HDFS 的系统 workload；
-- 顺序、uniform、hotset/Zipfian、倾斜数据、多 value size 和多 generation 数据集；
-- 独立的数据准备、warmup、measurement、正确性抽样和结果报告。
+- 在现有顺序/uniform/hotset 场景上扩充 Zipfian、更多 value size 和多 generation 数据集。
 
 构建、测量口径与当前能力见 [pms-benchmark.md](../pms-benchmark.md)。
 
@@ -196,7 +195,11 @@ MVP 发布前至少要求：
 - 成功 run 可安全清理，失败 run 能用保留材料定位；
 - 使用的 JDK、Paimon/Hadoop client、HDFS 环境和限制被记录。
 
-以下高成本工作延后，不作为当前首轮远端集成测试的完成条件：
+首轮 HDFS preflight/smoke/recovery 及连续 3 轮已通过，见 [验收记录](pms-remote-hdfs-acceptance-2026-09-11.md)。
+该结果是限定环境下的历史验收；源码发布仍需在当前改动上通过本地 `mvn verify`。
+远端多 bucket/分区复合主键见 [后续测试计划](pms-next-batch.md)，属于覆盖扩充。
+
+以下工作延后，不作为当前限定范围的 MVP 源码发布条件：
 
 - Flush data/meta/boundary、Sink prepare/commit/success 等精确位置的进程级 failpoint；
 - 长时间混合写入/查询/Sink 压测与正式性能 SLA；

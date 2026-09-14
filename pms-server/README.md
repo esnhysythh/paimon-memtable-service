@@ -1,7 +1,9 @@
 # pms-server
 
-`pms-server` is currently a thin, single-node runtime wrapper for development and integration testing.
-It exposes a small HTTP control surface while the internal PMS flow is still being built out.
+`pms-server` runs the single-node PMS service: HTTP/2 writes and lookups, local WAL/SST recovery,
+asynchronous Paimon sink, and historical lookup with a local file cache.
+See the [project README](../README.md) for the MVP support scope and validation limits.
+The normal server opens an existing Paimon table; only the development test server creates one.
 
 Start with a properties file:
 
