@@ -128,7 +128,7 @@ Linux 二进制发行包组装模块。它不包含业务实现，只把 `pms-se
 
 ### 4.10 pms-tests
 仓库内测试子项目，不进入 `pms-dist`，包含可复用的 `pms-testkit` 和显式 profile 执行的
-`pms-integration-tests`；后续 `pms-benchmark` 也放在该子项目下。生产模块不依赖任何测试模块。
+`pms-integration-tests`，以及提供本地 core 与 Paimon direct/cached 查询基准的 `pms-benchmark`。生产模块不依赖任何测试模块。
 - 详见 [PMS 测试策略与测试子项目设计](docs/tests/pms-testing-strategy.md)。
 
 ### 4.11 依赖方向

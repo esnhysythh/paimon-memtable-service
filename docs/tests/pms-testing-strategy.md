@@ -128,27 +128,27 @@ pms-tests/
 ├── pom.xml
 ├── pms-testkit/
 ├── pms-integration-tests/
-└── pms-benchmark/            # 后续阶段
+└── pms-benchmark/            # 本地 core / Paimon lookup 基准
 ```
 
 | 模块 | 类型 | 职责 | 状态 |
 |------|------|------|------|
 | `pms-testkit` | 普通 JAR | 环境解析、run 所有权、Paimon fixture/verifier、PMS 子进程、确定性数据 | 已实现 |
 | `pms-integration-tests` | Maven 测试模块 | 远端 HDFS 正确性、sink、lookup 和恢复测试 | 首轮验收及连续 3 轮通过，见 [验收记录](pms-remote-hdfs-acceptance-2026-09-11.md) |
-| `pms-benchmark` | 可执行程序 | core/remote workload、数据构造、性能采集与报告 | 后续阶段 |
+| `pms-benchmark` | 可执行程序 | 本地 core 插入/查询与 Paimon direct/cached 查询；remote workload 后续补充 | 本地版已实现 |
 
 依赖方向固定为：
 
 ```text
-pms-integration-tests ─┐
-                       ├──> pms-testkit ──> PMS public modules + Paimon API
-pms-benchmark         ─┘
+pms-integration-tests ──────> pms-testkit ──> PMS public modules + Paimon API
+pms-benchmark ──────────────> pms-core + pms-lookup-paimon
+future remote benchmark ───> pms-testkit
 
 production modules ──X──> pms-tests/*
 ```
 
-共享代码进入 `pms-testkit/src/main/java`。Integration tests 与 benchmark 不互相依赖，也不通过
-Maven test-jar 复用测试源码。
+远端共享代码进入 `pms-testkit/src/main/java`。本地基准直接使用对应生产模块。
+Integration tests 与 benchmark 不互相依赖，也不通过 Maven test-jar 复用测试源码。
 
 ### 5.2 构建与执行
 
@@ -157,7 +157,7 @@ Maven test-jar 复用测试源码。
 | `mvn test` | 运行常规测试并编译 testkit/远端测试源码，不连接远端 HDFS |
 | `mvn verify` | 默认仍不连接远端 HDFS |
 | `mvn -Premote-hdfs-it -pl pms-tests/pms-integration-tests -am verify` | 显式执行远端 HDFS 集成测试 |
-| benchmark 命令 | 后续由独立 CLI 提供，不绑定 Surefire/Failsafe |
+| benchmark 命令 | 独立 runner JAR / 本地矩阵脚本，不绑定 Surefire/Failsafe |
 
 远端 profile 使用 Maven Failsafe 的 `integration-test` 与 `verify` 阶段。环境准备和清理由 harness
 管理，不由静态初始化器或开发者 shell 脚本隐式执行。可复制的参数模板位于
@@ -175,14 +175,16 @@ Maven test-jar 复用测试源码。
 
 ## 6. Benchmark
 
-性能验证不进入常规单元/集成测试链路。后续 `pms-tests/pms-benchmark` 同时支持：
+性能验证不进入常规单元/集成测试链路。`pms-tests/pms-benchmark` 提供本地 core 基准，以及
+真实本地 Paimon 文件的 direct/cached 查询基准。两类入口独立，数据准备不计入查询耗时。
+运行结果只作为本地或 CI 产物，不纳入源码提交。后续规划包括：
 
 - 直接调用 byte-oriented core API 的 db_bench-like 基线；
 - 经过 client、独立 PMS JVM 和远端 Paimon/HDFS 的系统 workload；
 - 顺序、uniform、hotset/Zipfian、倾斜数据、多 value size 和多 generation 数据集；
 - 独立的数据准备、warmup、measurement、正确性抽样和结果报告。
 
-现有历史设计见 [pms-benchmark.md](../pms-benchmark.md)，待 benchmark 阶段结合遗留代码迁移和重写。
+构建、测量口径与当前能力见 [pms-benchmark.md](../pms-benchmark.md)。
 
 ## 7. 发布门槛与延后项
 
@@ -210,4 +212,4 @@ MVP 发布前至少要求：
 |------|------|
 | [pms-testkit.md](pms-testkit.md) | testkit API、组件和资源生命周期 |
 | [pms-integration-tests.md](pms-integration-tests.md) | 远端 HDFS 环境、场景、执行和失败诊断 |
-| [pms-benchmark.md](../pms-benchmark.md) | 现有 benchmark 历史设计，后续迁移 |
+| [pms-benchmark.md](../pms-benchmark.md) | 本地 benchmark 运行、测量口径和后续规划 |
