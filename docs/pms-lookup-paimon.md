@@ -214,7 +214,7 @@ cache directory 是纯性能层，不是恢复数据源。`ConfigManager` 会拒
 2. 已完成：接入 server 的 key 路由、snapshot install 与四态错误语义；删除生产 `ReadBuilder` 路径。
 3. 已完成：暴露成功 commit payload，接入普通 sink 的严格有序 delta 发布。
 4. 已完成：加入热点 value SST cache 的 server 配置、资源预算、基础指标与关键日志。
-5. 待实现：补充 lookup/cache 压测与更细粒度指标。
+5. 已实现本地 direct/cached 查询基准，见 [本地 Benchmark](pms-benchmark.md)；远端、混合负载与更细粒度指标后续补充。
 6. 待实现：接入 explicit compaction 的独立恢复 metadata 和统一发布。
 
 必须覆盖的集成测试包括：分区/多 bucket、复合 key、PUT/DELETE/MISS、L0 与 compaction、snapshot lazy rebuild、非法/重复/乱序 delta、commit 成功后 publish 失败、进程重启后不回放 delta、direct lookup 与 `ReadBuilder` 对照、cache build/evict 以及 schema/profile 拒绝。

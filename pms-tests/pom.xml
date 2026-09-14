@@ -17,5 +17,6 @@
     <modules>
         <module>pms-testkit</module>
         <module>pms-integration-tests</module>
+        <module>pms-benchmark</module>
     </modules>
 </project>
