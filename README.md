@@ -1,8 +1,16 @@
+[简体中文](README.md) | [English](README.en.md)
+
 # Paimon MemTable Service
 
-PMS 是 Apache Paimon 的单机写缓冲与点查服务。写入先进入本地 WAL/MemTable，再异步
-下沉到 Paimon；查询优先读取 PMS 本地层，未命中时查询 Paimon 历史文件，并为热点文件
-异步构建本地缓存。Paimon 表仍可供计算引擎执行分析查询。
+**为 Paimon 表提供实时写入与当前态点查的单机 KV 服务。**
+
+PMS 像 Paimon 表前的一层 MemTable：作为表的唯一写入入口，承接最新修改并异步下沉到
+Paimon；查询先检查本地最新状态，再访问 Paimon 历史数据。这个名字描述的是 PMS 在
+整体存储架构中的角色。
+
+PMS 内部采用包含 **WAL、MemTable、本地 SST 和 compaction 的轻量级 LSM KV 引擎**，
+提供本地存储与进程崩溃恢复能力。本地写入层保留最新状态窗口，独立的查询缓存则按需
+缓存 Paimon 历史文件；两者共同支持当前态主键点查。Paimon 表仍可供计算引擎执行分析查询。
 
 当前版本为 `0.1-SNAPSHOT`，已经具备限定范围内的 MVP 功能闭环，可从源码构建和试用。
 
