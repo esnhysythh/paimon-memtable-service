@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>org.qwh</groupId>
+        <groupId>io.github.esnhysythh</groupId>
         <artifactId>pms-tests</artifactId>
         <version>0.1-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
@@ -15,7 +15,7 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.qwh</groupId>
+            <groupId>io.github.esnhysythh</groupId>
             <artifactId>pms-client</artifactId>
             <version>${project.version}</version>
         </dependency>

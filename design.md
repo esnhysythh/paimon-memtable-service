@@ -4,7 +4,7 @@
 PMS 是一个独立于计算引擎的单机存储服务，作为 Apache Paimon 数据湖的加速层。
 - **核心价值**：提供实时（毫秒级）的数据新鲜度点查能力；作为高性能缓冲池，吸收高并发写入，降低对 Paimon 底层存储的 IO 压力与 Snapshot 膨胀。
 - **设计原则**：PMS 是绑定单一 Paimon 表的专用服务；PMS 是该 Paimon 表的**唯一写入者**，独占 Snapshot 生成权；不影响 Paimon 原有的 AP 分析能力；PMS 内部和 Sink 到 Paimon 的数据处理均遵循 Paimon Deduplicate Merge Engine 规则（同一主键只保留最新记录，最新记录为 DELETE 则删除全部同主键记录），不允许其他 Merge Engine，这保证了 PMS 内部数据处理和查询的简单性。
-- **V1 边界**：PMS 绑定的 Paimon 表 Schema 在产品生命周期内保持不变。与“PMS 是该表唯一写入者”相同，这是一项由部署与用户行为保证的前置条件，V1 不主动监控或阻止 Schema 变更，也不承诺变更后的读写行为。需要变更 Schema 时，应先停止上游写入并将当前 fence 完整 Sink 到 Paimon，停止 PMS 后使用全新的 WAL、storage 与 lookup cache 目录部署新实例，不复用旧 Schema 对应的本地状态。后续版本再考虑 Schema 变更的程序化检测与演进策略。
+- **V1 边界**：PMS 绑定的 Paimon 表 Schema 在 PMS 本地状态生命周期内保持不变。与“PMS 是该表唯一写入者”相同，这是一项由部署与用户行为保证的前置条件，V1 不主动监控或阻止 Schema 变更，也不承诺变更后的读写行为。需要变更 Schema 时，应先停止上游写入并将当前 fence 完整 Sink 到 Paimon，停止 PMS 后使用全新的 WAL、storage 与 lookup cache 目录部署新实例，不复用旧 Schema 对应的本地状态。后续版本再考虑 Schema 变更的程序化检测与演进策略。
 
 ## 2. 核心架构：双层 LSM 模型
 PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LSM 缓冲。
@@ -18,12 +18,12 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 详细流程参见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
 
-### 2.2 查询路径（pms-lookup-paimon 接入后的目标）
+### 2.2 当前查询路径
 点查请求分为默认完整表点查和 PMS-local 点查。默认 `get` 按层级穿透，命中即返回：`curMemTable → ImmutableMemTable → 本地 SST → pms-lookup-paimon`。`getLocal` 只查询 PMS 内部层，并返回 HIT / DELETED / MISS 三态；其中 DELETED 必须阻断后续历史数据查询。
 
 `pms-lookup-paimon` 为 `(partition, bucket)` 维护完整的 live `DataFileMeta` view，按 Paimon merge-tree 文件优先级执行 direct Parquet point lookup，并可为热点文件构建本地 value SST。其结果为 HIT / DELETED / MISS / UNKNOWN：只有完整有效 view 的 MISS 才返回 not found；UNKNOWN 表示 PMS 不能证明结果正确，server 必须返回可重试错误，不能将其降级为 MISS。生产路径不使用 Paimon `ReadBuilder`；它仅保留为测试和压测的正确性对照。详见 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md)。
 
-> direct Parquet 查询、普通 sink delta 发布、server 切换与热点 value SST cache 的 server 集成已实现。显式 compaction、压测和更细粒度指标仍按 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) 后续阶段推进。
+> direct Parquet 查询、普通 sink delta 发布、server 切换与热点 value SST cache 的 server 集成已实现。本地 core/direct/cached 基准已实现；显式 compaction、远端压测和更细粒度指标仍按 [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) 后续阶段推进。
 
 ### 2.3 分层保留与淘汰
 - **MemTable 是写缓冲，不是长期缓存**：ImmutableMemTable 只在等待 Flush 时参与查询。SST 完整落盘并原子发布后，源 ImmutableMemTable 从可见状态移除；不维护 `SST + MemTable` 双持缓存。
@@ -41,8 +41,8 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | WAL 与崩溃恢复 | V1 采用单盘 WAL，每条记录带 CRC32 校验和 Magic Number。WAL 只记录数据变更；Flush/Sink 使用独立可读 metadata 记录恢复边界与 Paimon prepare/commit 进度。 | [pms-core.md](docs/pms-core.md) § 5 / [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) |
 | 轻量级 Sequence | 每条写入分配单调递增 sequenceId，作为 freeze/flush/sink/WAL 截断的内部边界坐标。V1 不做 MVCC 多版本。 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) |
 | 本地 SST 格式 | 参考 LevelDB/RocksDB Block Based Table，保留 Data Block/Index/Footer 结构，不照搬 MVCC InternalKey；SST 查询使用 `Optional<Value>` 表达 miss/put/delete 三态。 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) |
-| SST 当前状态 | 汇总当前 SST/MockSink/WAL 恢复边界状态，并列出后续 RowCodec 与 Paimon sink 对接要求。 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) |
-| Paimon 独占与 Compaction | PMS 独占 Paimon 表写入与合并提交，基于 Paimon `TableWrite.compact(partition, bucket, fullCompaction)` / `prepareCommit` / `TableCommit` 原生 API 触发 Compaction | [pms-core.md](docs/pms-core.md) § 3.4 / [pms-sink-paimon.md](docs/pms-sink-paimon.md) § 10 |
+| SST 当前状态 | 汇总 SST/WAL 恢复边界、已接入的 RowCodec 与真实 Paimon sink。 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) |
+| Paimon 独占与 Compaction | 当前保留普通 sink 的 Paimon 隐式 compaction 与 snapshot 清理；独立显式 compaction 调度延后 | [pms-core.md](docs/pms-core.md) § 3.4 / [pms-sink-paimon.md](docs/pms-sink-paimon.md) § 10 |
 | Paimon 历史点查 | `pms-lookup-paimon` 维护 partition-bucket live 文件视图；成功 commit 后严格有序地发布 data/compact delta，失效后由完整 snapshot 重建 | [pms-lookup-paimon.md](docs/pms-lookup-paimon.md) |
 | 行编码与 Schema 兼容 | `pms-codec` 负责 Paimon `InternalRow` 与 PMS KV bytes 的转换；delete/tombstone 由 KV 层表达，不写入 row value。 | [pms-codec.md](docs/pms-codec.md) |
 | 外部协议 | `pms-protocol` 定义 HTTP/2 binary hot path 的 raw bytes wire contract、handshake、status 与 batch envelope；不解释 key/value bytes。 | [pms-protocol.md](docs/pms-protocol.md) |
@@ -63,7 +63,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 - `wal-engine`: V1 单盘 DATA WAL 的写入、索引与重放。
 - `sink`: 定义 `SinkManager` SPI、`SinkBatch`、`PreparedSinkCommit`、`SinkCommitResult` 和 `SinkMetaStore`；生产实现由 `pms-sink-paimon` 注入，core 测试使用 fake/mock。
 - `bucket-director`: 总协调器，管理状态机流转、查询穿透、后台任务协调。详见 [pms-core-bucket-director.md](docs/pms-core-bucket-director.md)。
-- `statistic`: 可观测性基础设施。TODO: 详细设计待核心组件稳定后再补充。
+- 可观测性：当前通过 core 状态快照与 server `/state` 暴露边界、水位和后台任务状态；独立 `statistic` 模块与统一指标注册接口尚未实现，作为后续演进。
 - 详见 [pms-core.md](docs/pms-core.md)。
 
 ### 4.2 pms-codec
@@ -84,7 +84,7 @@ Paimon 行格式与 PMS KV bytes 的适配层，依赖 Paimon 类型系统，但
 
 ### 4.4 pms-server
 PMS 的可执行外壳。负责解析配置、管理生命周期、暴露 RPC 接口、编排故障恢复流程。它是 pms-core 的消费者。
-- `rpc-server`: 对外暴露写入与点查接口，集成流控水位线；热路径目标为 `pms-protocol` 定义的 HTTP/2 binary raw bytes API。
+- `rpc-server`: 对外暴露写入与点查接口，集成流控水位线；热路径使用 `pms-protocol` 定义的 HTTP/2 binary raw bytes API。
 - `recovery-manager`: 启动恢复管理器。
 - `config-manager`: 配置管理器，启动时从外部配置源加载配置构造 `PMSConfig`，注入到各核心组件。V1 不支持运行时热更新。
 - `background-task-scheduler`: 两个独立 worker 驱动 Immutable Flush、可见性 fence、Sink、local compact 和 Evict；每次从 core 快照重新决策。
@@ -108,7 +108,7 @@ PMS 对外协议契约模块，不依赖 `pms-core`、`pms-codec` 或 Paimon run
 - 详见 [pms-protocol.md](docs/pms-protocol.md)。
 
 ### 4.7 pms-client
-Java SDK，负责 RPC 通信、batching、反压重试，并在 row-aware facade 中通过 `pms-codec` 完成行编码。落地顺序上先实现 raw bytes HTTP/2 client 与 batching client，再叠加依赖 `pms-codec` 的 row-aware facade。
+Java SDK，负责 RPC 通信、batching、反压重试，并在 row-aware facade 中通过 `pms-codec` 完成行编码。已实现 raw bytes HTTP/2 client、batching client 和依赖 `pms-codec` 的 row-aware facade。
 - 详见 [pms-client.md](docs/pms-client.md)。
 
 ### 4.8 flink-connector-pms
@@ -157,7 +157,7 @@ pms-tests       -> production modules（仅测试/benchmark，不进入生产依
 | [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) | 状态机协调器 |
 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) | 本地 SST 文件格式、LevelDB 对照、查询三态语义 |
 | [pms-core-local-run-compaction.md](docs/pms-core-local-run-compaction.md) | 基于 flushId range 的 local run、SST 命名、compact/sink/evict 边界设计 |
-| [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) | SST 当前实现状态、mock 边界与后续 codec 交接说明 |
+| [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) | SST 当前实现状态、恢复边界与 codec/sink 协作 |
 | [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) | WAL 只记录数据、SSTMeta/SinkMeta 独立记录恢复边界的设计 |
 | [pms-codec.md](docs/pms-codec.md) | Paimon 行编码、主键编码、RowKind 与 tombstone 边界 |
 | [pms-protocol.md](docs/pms-protocol.md) | PMS HTTP/2 binary 外部协议、handshake、status、batch envelope |

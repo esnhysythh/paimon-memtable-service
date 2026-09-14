@@ -9,7 +9,7 @@
 模块职责边界：
 
 ```text
-pms-core        -> 选择 SinkBatch、维护 WAL sink 状态机、推进 SST new/sinked 生命周期
+pms-core        -> 选择 SinkBatch、维护 SinkMeta 状态机、推进 SST new/sinked 生命周期
 pms-codec       -> key/value bytes 与 Paimon InternalRow 之间的编码/解码
 pms-sink-paimon -> SST iterator merge、row 转换、Paimon prepare/commit
 pms-server      -> 加载 Paimon table、创建 PaimonSinkManager、调度 sink
@@ -64,7 +64,7 @@ PMS V1 只支持 Paimon primary-key + deduplicate merge-engine 表。`PaimonSink
 
 ## 4. Prepare 流程
 
-`PaimonFlusher.prepare(SinkBatch)` 负责将一批 SST 预写入 Paimon，并返回可 WAL 持久化的 `PreparedSinkCommit`。
+`PaimonFlusher.prepare(SinkBatch)` 负责将一批 SST 预写入 Paimon，并返回可通过 SinkMeta 持久化的 `PreparedSinkCommit`。
 
 流程：
 
@@ -208,7 +208,7 @@ PMS 当前选择在 `DeleteRowFactory` 内做一层最小兼容：
 - 非主键 `NOT NULL` 字段下 tombstone delete 通过合成值写入 Paimon。
 - 复杂类型 `NOT NULL` 字段下 tombstone delete 使用空集合或递归 row，并通过真实 Parquet prepare/commit。
 - 真实 Paimon prepare/commit。
-- WAL prepared payload round-trip 后 commit。
+- SinkMeta prepared payload round-trip 后 commit。
 - 重复 commit 幂等。
 - nullable 非主键字段下 tombstone delete。
 - 多 SST merge 后真实写入 Paimon。
@@ -224,20 +224,15 @@ PMS 当前选择在 `DeleteRowFactory` 内做一层最小兼容：
 
 ### 9.1 表加载与配置
 
-当前模块接收已经创建好的 Paimon `Table`。后续 `pms-server` 需要负责：
-
-- 从配置加载 warehouse、database、table、catalog options。
-- 创建 Paimon catalog 和 table。
-- 构造 `PaimonSinkManager` 并注入 `PMSBucketDirectorImpl`。
+当前模块接收已经创建好的 Paimon `Table`。`pms-server` 已负责从配置加载 warehouse、
+database、table 与 catalog options，打开已有表，并将 `PaimonSinkManager` 注入 director。
+普通服务启动不自动建表；开发测试入口单独提供建表 fixture。
 
 ### 9.2 错误分类与重试策略
 
-当前失败会包装为 `RuntimeException`。后续 server/runtime 层应补充：
-
-- prepare 失败与 commit 失败分类。
-- recovery commit 重试退避。
-- 最大重试次数或 fatal 策略。
-- 文件丢失、权限错误、Paimon conflict、schema 不兼容等错误分类。
+prepare/commit 失败会向上抛出。core 已支持 prepared/finalizing flight 的在线重试，
+server maintenance worker 在下一次触发时重试；启动恢复会处理未完成的 prepared commit。
+最大重试次数、文件丢失/权限错误/conflict 等细分错误的自动处置仍属于后续运维工作。
 
 ### 9.3 Prepared File 校验
 
@@ -257,17 +252,13 @@ PMS 当前选择在 `DeleteRowFactory` 内做一层最小兼容：
 
 ### 9.5 观测指标
 
-建议后续暴露：
+当前 `/state` 已暴露 persisted sequence、最近 sink 结果与 pending prepared commit 等状态。
+input/output record count、prepare/commit 耗时等统一指标可按后续运维需要补充。
 
-- input/output record count。
-- sink batch SST 数量。
-- prepare/commit 耗时。
-- Paimon snapshot id。
-- persisted sequence id。
-- prepared file ref 数量。
-- pending prepared commit 数量。
+## 10. Paimon Compaction 后续方案（未实现）
 
-## 10. Paimon Compaction 集成方案
+当前 MVP 保留普通 sink 的 Paimon 隐式 compaction 和按表配置执行的 snapshot 清理。
+本节记录独立显式 compaction 的候选方案，不是当前实现，也不是 MVP 发布的前置条件。
 
 PMS 需要掌控 Paimon 表的合并，因为 PMS 是该表的唯一修改者。调研 Paimon 1.4.x 代码后，结论是：不应设计成调用 `Table.compact()`，因为 `Table` 没有这个 Java Program API；Paimon 的 compact 入口在 `TableWrite` 上：
 
@@ -292,7 +283,7 @@ commit.filterAndCommit(Map.of(commitIdentifier, messages));
 
 使用独立 commit user 的原因是 Paimon stream commit 的 `commitIdentifier` 需要在同一 commit user 下单调递增并可用于幂等过滤。普通 sink 已使用 `SinkBatch.maxSequenceId()` 作为 identifier；compaction 没有 PMS sequence 边界，应维护独立的本地单调 `compactionCommitId`。
 
-docs: record Paimon implicit compaction cleanup note当前 PMS 初期暂不急于切换到 `write-only=true`。普通 sink 可能携带 Paimon 写入端隐式 compaction 产生的 `CompactIncrement`，但该增量已经包含在同一份成功提交 payload 中，lookup view 可按统一 delta 正确更新。以分钟级 sink 频率为目标时，隐式 compaction 的延迟和指标可先作为后续优化项。
+当前 MVP 暂不切换到 `write-only=true`。普通 sink 可能携带 Paimon 写入端隐式 compaction 产生的 `CompactIncrement`，但该增量已经包含在同一份成功提交 payload 中，lookup view 可按统一 delta 正确更新。以分钟级 sink 频率为目标时，隐式 compaction 的延迟和指标可先作为后续优化项。
 
 需要注意：`write-only=true` 不只会关闭写入端隐式 compaction，也会跳过 Paimon snapshot expiration。当前未启用 `write-only=true` 时，Paimon 会在普通 commit 后按表配置清理过期 snapshot 及其不再被引用的旧文件；未来如果 PMS 接管 compaction 并启用 write-only sink，则也需要同步接管 snapshot/file 清理与对应指标。
 
@@ -312,7 +303,7 @@ PaimonCompactionPlanner
   -> save success compaction metadata
 ```
 
-候选枚举可先使用 `SnapshotReader.bucketEntries()`，它能得到 `partition`、`bucket`、`fileCount`、`fileSizeInBytes`、`recordCount` 和最近文件创建时间。V1 先按 `fileCount >= threshold` 或手动 full compact 触发即可；后续如果要精确识别 L0 文件数或 level 分布，再读取 manifest entries 或 `DataSplit.dataFiles()`。
+未来实现时，候选枚举可先使用 `SnapshotReader.bucketEntries()`，它能得到 `partition`、`bucket`、`fileCount`、`fileSizeInBytes`、`recordCount` 和最近文件创建时间。首版显式 compaction 可按 `fileCount >= threshold` 或手动 full compact 触发即可；后续如果要精确识别 L0 文件数或 level 分布，再读取 manifest entries 或 `DataSplit.dataFiles()`。
 
 ### 10.3 Metadata 与恢复
 
@@ -348,14 +339,14 @@ compact-success-${compactionId}.json
 
 1. 先调整 `PaimonSinkManager` 构造，让普通 sink 使用 `write-only=true` 的 table copy，并把 `prepareCommit` 的隐式 compaction 从写入路径剥离。
 2. 新增 `PaimonCompactionManager`、`PreparedPaimonCompaction`、`PaimonCompactionMetaStore`，复用现有 `PaimonCommitPayloadCodec` 和 file ref 校验逻辑。
-3. server scheduler 增加 `compactPaimon()`，V1 以 bucket file count 阈值和手动 full compact API 为触发条件。
+3. server scheduler 增加 `compactPaimon()`，以 bucket file count 阈值和手动 full compact API 为触发条件。
 4. 增加真实 Paimon 集成测试：write-only sink 不产生 compact snapshot；显式 compact 后文件数下降/compact snapshot 出现；prepare 后崩溃能 recovery commit；重复 recovery commit 幂等。
 
 ## 11. 与 pms-server 的交接
 
 ### 11.1 向 lookup 模块发布成功提交
 
-`pms-lookup-paimon` 维护 Paimon data-file live view，需要在 commit **成功后**获得同一批 `CommitMessage` 的 data/compact 文件增量。为保持 `pms-core` 不依赖 Paimon 类型，`PreparedSinkCommit.payload` 继续是 opaque bytes；但 `SinkCommitResult` 应向 server 暴露同一份 commit payload，并由 server 解码后直接发布给 lookup 模块。
+`pms-lookup-paimon` 维护 Paimon data-file live view，需要在 commit **成功后**获得同一批 `CommitMessage` 的 data/compact 文件增量。为保持 `pms-core` 不依赖 Paimon 类型，`PreparedSinkCommit.payload` 继续是 opaque bytes；`SinkCommitResult` 已向 server 暴露同一份 commit payload，并由 server 解码后直接发布给 lookup 模块。
 
 普通 sink、写入路径可能产生的 implicit compaction，以及未来 explicit compaction 都必须在同一张表的 commit/publish 串行约束下发布。compaction 使用独立 metadata 和 commit identifier，但提交成功后同样产出 `snapshotId + CommitMessage payload`。lookup 不重放历史 payload：发布失败或进程重启时以完整 bucket snapshot 重建。详见 [pms-lookup-paimon.md](pms-lookup-paimon.md)。
 
@@ -371,14 +362,5 @@ server API
   -> Paimon table
 ```
 
-server 第一阶段可先提供：
-
-- 写入 row。
-- 删除 primary key。
-- primary key 点查。
-- 手动 flush。
-- 手动 sink。
-- 状态快照。
-- 启动恢复。
-
-自动调度、退避、指标和后台任务可以在最小闭环跑通后逐步补齐。
+server 已提供 row 写入、主键删除、完整/本地点查、手动 flush/sink fence、状态快照与启动恢复，
+并接入自动 Flush/Maintenance 调度和失败重试。配置和生命周期见 [pms-server.md](pms-server.md)。

@@ -15,15 +15,10 @@ public class SkipListCurMemTable implements CurMemTable {
 
     private final MemTableConfig config;
     private final ConcurrentSkipListMap<Key, Value> map;
-    // Not AtomicLong: estimatedSize is for flush threshold heuristics only, not precise accounting.
-    // Concurrent updates may lose small deltas, but the 64B per-node overhead estimate already has
-    // far larger error margin. Making it precise (e.g. AtomicLong) doesn't fix the real race
-    // between "read size → decide freeze", so the added cost isn't justified.
-    // Same rationale for estimatedEntryCount below: volatile int ++ is not atomic, concurrent
-    // puts may lose increments. The count is always >= 0 and within ~1% of the true value under
-    // normal load, which is sufficient for freeze-threshold heuristics.
-    // TODO: freeze() reads estimatedEntryCount and estimatedSize non-atomically; the two values
-    // may be momentarily inconsistent. Acceptable for heuristics, but document if needed later.
+    // The director serializes put/freeze, including these boundary metadata updates.
+    // Volatile fields also allow diagnostic reads without taking the write lock; a diagnostic
+    // sample is not an atomic snapshot. estimatedSize is a freeze heuristic, not exact accounting.
+    // The concurrent map supports readers, but does not replace the write-boundary protocol.
     private volatile long estimatedSize;
     private volatile int estimatedEntryCount;
     private volatile long minSequenceId;

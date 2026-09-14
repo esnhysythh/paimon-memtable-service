@@ -188,11 +188,11 @@ orphan 不进入垃圾清理队列，也不推进 `nextFlushId`；WAL replay 后
 - `flushToSST` 成功写出 SST 后，BucketDirector 原子推进该边界到 `SSTMeta.maxSequenceId`。
 - 重启时先加载 `sst-*.meta.json`、校验 SST 文件和该边界，再 replay WAL；`sequenceId <= lastFlushedSequenceId` 的 DATA 记录由 SST 承载，不再回放到 curMemTable。
 - SST 文件、`sst-*.meta.json` 和 `flush-boundary.meta` 都必须在 rename 前 force 文件内容，并在 rename 后 force storage 目录，避免崩溃后边界可见但文件或目录项丢失。
-- 该边界只表示本地 SST 已覆盖的数据范围，不表示 Paimon 已 commit；未来 WAL truncate 仍需以 sink 成功后的 `persistedSequenceId` 为准。
+- 该边界只表示本地 SST 已覆盖的数据范围，不表示 Paimon 已 commit；WAL truncate 以 sink 成功后的 `persistedSequenceId` 为准。
 
 ### 3.3 WALManager
 
-V1 采用单盘 DATA WAL，保证数据变更的持久性和崩溃恢复能力。底层 I/O 和记录分片采用 LevelDB WAL 格式（32KB Block 对齐、CRC32C 逐 chunk 校验、FULL/FIRST/MIDDLE/LAST 分片重组），PMS 应用层 payload 只记录用户数据变更；Flush/Sink 进度通过独立 metadata 记录，详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
+V1 采用单盘 DATA WAL 支持进程崩溃恢复。普通写入返回成功表示 WAL append 完成且 MemTable 已可见，不逐次 force/fsync，也不表示已提交到 Paimon；不承诺每次已确认写入均能抵御机器掉电。底层 I/O 和记录分片采用 LevelDB WAL 格式（32KB Block 对齐、CRC32C 逐 chunk 校验、FULL/FIRST/MIDDLE/LAST 分片重组），PMS 应用层 payload 只记录用户数据变更；Flush/Sink 进度通过独立 metadata 记录，详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
 
 > **后续演进**：双盘 WAL（主盘 + 备盘同步写、互恢复）作为后续演进方向。
 
@@ -320,7 +320,7 @@ interface SinkManager {
 
 可观测性基础设施，提供低开销的指标采集与查询能力。
 
-TODO: 详细设计待核心组件稳定后再补充。初期仅定义 `MetricsRegistry` 接口，具体指标类型和体系待定。
+当前通过 core 状态快照和 server `/state` 暴露运行状态。独立 `MetricsRegistry` 接口与统一指标导出尚未实现，作为 MVP 之后的可观测性工作，见 [pms-core-statistic.md](pms-core-statistic.md)。
 
 ## 4. 流控与内存预算
 
@@ -386,7 +386,7 @@ Freeze 并到达水位，后台 Flush 也可以并发发布新的 NEW run。该�
 
 ### 5.1 核心原则
 
-- **写入短临界区**：`writeMutex` 只保护 writer queue、WAL/sequence/MemTable 提交顺序、Freeze 对象切换与写入前 backlog 复查。
+- **写入串行提交**：`writeQueueMutex` 保护队列与 leader 交接；`writeMutex` 保护 WAL/sequence/MemTable 提交顺序、Freeze 对象切换与写入前 backlog 复查。并发请求可合批，但提交执行本身不并行。
 - **慢 IO 不持写锁**：Flush、Sink、local compact、Evict 和查询不获取 `writeMutex`。
 - **不可变状态发布**：Cur/Immutable 通过 `MemTableState`，NEW/SINKED 通过 `RunState` 整体替换；调用方不会看到半更新列表。
 - **SST 生命周期由 read epoch 保护**：查询、scan、sink 与 compact 先获取 `SSTReadSnapshot`。被替换或淘汰的文件进入 retired queue，最后一个可能看到它的 epoch 结束后才物理删除。

@@ -138,7 +138,7 @@ applyDelta(partition, bucket, beforeFiles, afterFiles)
 
 ## 5. sink 与 compaction 的统一发布
 
-`PreparedSinkCommit.payload` 已经持有 Paimon `CommitMessage` 编码，但当前 `SinkCommitResult` 没有把它暴露到 server。实现 lookup delta 发布前，最小 API 调整为：
+`PreparedSinkCommit.payload` 已经持有 Paimon `CommitMessage` 编码，`SinkCommitResult` 已把它暴露到 server，当前接口为：
 
 ```java
 record SinkCommitResult(
@@ -150,7 +150,7 @@ record SinkCommitResult(
 ) {}
 ```
 
-`PaimonCommitter` 返回 `prepared.payload()`；`SinkMetaPayloadCodec` 同步持久化该值。`PMSBucketDirector.sinkToPaimon()` 改为返回 `Optional<SinkCommitResult>`，没有待提交 SST 时返回空。
+`PaimonCommitter` 返回 `prepared.payload()`；`SinkMetaPayloadCodec` 同步持久化该值。`PMSBucketDirector.sinkToPaimon()` 返回 `Optional<SinkCommitResult>`，没有待提交 SST 时返回空。
 
 server 直接解码 payload 并调用 lookup 模块发布，不增加 adapter：
 
@@ -215,6 +215,6 @@ cache directory 是纯性能层，不是恢复数据源。`ConfigManager` 会拒
 3. 已完成：暴露成功 commit payload，接入普通 sink 的严格有序 delta 发布。
 4. 已完成：加入热点 value SST cache 的 server 配置、资源预算、基础指标与关键日志。
 5. 已实现本地 direct/cached 查询基准，见 [本地 Benchmark](pms-benchmark.md)；远端、混合负载与更细粒度指标后续补充。
-6. 待实现：接入 explicit compaction 的独立恢复 metadata 和统一发布。
+6. MVP 之后：接入 explicit compaction 的独立恢复 metadata 和统一发布；当前保留普通 sink 的隐式 compaction。
 
 必须覆盖的集成测试包括：分区/多 bucket、复合 key、PUT/DELETE/MISS、L0 与 compaction、snapshot lazy rebuild、非法/重复/乱序 delta、commit 成功后 publish 失败、进程重启后不回放 delta、direct lookup 与 `ReadBuilder` 对照、cache build/evict 以及 schema/profile 拒绝。

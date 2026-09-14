@@ -258,6 +258,6 @@ key 必须非空；prefix 查询可以允许空 prefix，但 server 可基于配
 
 - POJO/Map 等业务对象映射层。
 - schema tracker 与 schema reload。
-- benchmark。
+- 经过 HTTP/2 client/server 的系统 benchmark；当前本地 core 与 Paimon direct/cached 基准已实现，见 [pms-benchmark.md](pms-benchmark.md)。
 
-这些内容分别进入后续 client 和 benchmark 阶段。
+这些扩展不属于当前 MVP 的必备能力。

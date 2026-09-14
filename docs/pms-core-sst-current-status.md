@@ -14,7 +14,7 @@
 - SST Footer 记录 Bloom/Index/Properties 的 `BlockHandle` 和全文件 CRC32。
 - SST 注册时会校验全文件 CRC32 并缓存 reader；点查路径通过缓存的 BloomFilter + Index Block 定位 Data Block，不重复扫描全文件 CRC。
 - SST 查询接口返回 `Optional<Value>`，可区分 miss、PUT 命中和 DELETE tombstone 命中。
-- SST 已暴露 ordered iterator，可按 key 顺序扫描 `Entry<Key, Value>`，供后续 sink 模块做多 SST streaming merge。
+- SST 已暴露 ordered iterator，可按 key 顺序扫描 `Entry<Key, Value>`，供真实 Paimon sink 做多 SST streaming merge。
 - Tombstone 在磁盘层由 `valueLen = -1` 表达，与 WAL DATA 记录一致。
 
 ### 2.2 BucketDirector 与本地恢复边界
@@ -45,7 +45,7 @@ interface SinkManager {
 
 - `SinkBatch`：记录本次 sink 覆盖的 SST 列表、batchId 和 sequence 范围。
 - `PreparedSinkCommit`：记录 prepare 阶段产物，包括 sstIds、sequence 范围、payload、fileRefs 和行数统计。
-- `SinkCommitResult`：记录 commit 成功后的 batchId、snapshotId、persistedSequenceId 和 sstIds。
+- `SinkCommitResult`：记录 commit 成功后的 batchId、snapshotId、persistedSequenceId、sstIds 和 commitPayload。
 - `SinkMetaStore`：负责将 prepare/success 信息写入独立可读 metadata，并在恢复时加载未完成 prepared commit。
 - `SinkMetaPayloadCodec`：作为 `SinkMetaStore` 内部二进制 payload 编码工具复用，便于 prepare/success round-trip。
 - `PaimonSinkManager`：生产环境由 `pms-server` 通过 `pms-sink-paimon` 注入真实实现。
@@ -94,23 +94,8 @@ Value.bytes  = serialized Paimon InternalRow
 Value null   = delete tombstone
 ```
 
-`pms-codec` 提供独立的行值与主键编码边界：
-
-```java
-interface RowCodec {
-    byte[] encode(InternalRow row);
-    InternalRow decode(byte[] bytes);
-}
-
-interface PrimaryKeyCodec {
-    byte[] encodeKey(InternalRow row);
-}
-
-interface RowCodecFactory {
-    RowCodec create(RowType rowType);
-    PrimaryKeyCodec createPrimaryKeyCodec(RowType rowType, List<String> primaryKeys);
-}
-```
+`pms-codec` 的 `PmsRowValueCodec` 负责完整行编码/解码，`RowValueView` 提供按字段读取的
+视图，`PmsPrimaryKeyCodec` 负责主键有序编码。core 只保存 opaque bytes，不依赖这些类型。
 
 约束：
 

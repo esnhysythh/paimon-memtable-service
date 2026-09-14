@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>org.qwh</groupId>
+        <groupId>io.github.esnhysythh</groupId>
         <artifactId>Paimon-MemTable-Service</artifactId>
         <version>0.1-SNAPSHOT</version>
     </parent>
@@ -14,12 +14,12 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.qwh</groupId>
+            <groupId>io.github.esnhysythh</groupId>
             <artifactId>pms-protocol</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
-            <groupId>org.qwh</groupId>
+            <groupId>io.github.esnhysythh</groupId>
             <artifactId>pms-codec</artifactId>
             <version>${project.version}</version>
         </dependency>

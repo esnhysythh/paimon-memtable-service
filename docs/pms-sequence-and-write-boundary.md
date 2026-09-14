@@ -55,7 +55,7 @@ sequence 只有在以下三个动作形成原子提交边界时才可靠：
 
 ## 3. LevelDB Java 版本的参考
 
-本项目参考了 `/Users/qinwenhao/workspace/leveldb` 中的 Java LevelDB 移植版。
+本节参考 Java LevelDB 移植版的 `org.iq80.leveldb.impl.DbImpl` 写入实现。
 
 ### 3.1 写入提交路径
 
@@ -75,7 +75,7 @@ mutex.unlock()
 对应源码位置：
 
 ```text
-/Users/qinwenhao/workspace/leveldb/leveldb/src/main/java/org/iq80/leveldb/impl/DbImpl.java
+leveldb/src/main/java/org/iq80/leveldb/impl/DbImpl.java
 ```
 
 关键点：
@@ -162,20 +162,15 @@ freezeCurMemTable:
 
 ### 4.3 CurMemTable 删除语义
 
-引入 sequence 后，删除不能再通过无 sequence 的静态 `Value.TOMBSTONE` 表达；该常量应移除。统一语义应为：
+当前删除通过携带 sequence 的 tombstone 写入 MemTable：
 
 ```java
 curMemTable.put(key, Value.tombstone(sequenceId));
 ```
 
-因此 `CurMemTable.delete(Key)` 不应继续作为新写入路径 API 存在，除非它显式接收 `sequenceId`。
-
-PMS 的 `Value` 不是普通 KV 系统里的任意 byte value，而是序列化后的 Paimon `InternalRow`。因此：
-
-- `Value.bytes == null` 只表示删除 tombstone。
-- 非 tombstone 的 `Value.bytes` 应由 RowCodec/序列化管理器生成，表示完整的 `InternalRow` 编码。
-- 即使业务列全部为 `NULL`，编码结果也应包含格式头、字段数量、null bitmap 等元信息，设计语义上不应是空 `byte[]`。
-- 当前 V1 底层字节接口暂不负责校验 `byte[]` 是否是合法行编码；该校验应在后续 RowCodec/序列化管理器接入后完成。
+`CurMemTable` 不提供无 sequence 的 `delete(Key)`。`Value.bytes == null` 表示 tombstone；
+其他 bytes 是 core 不解释的 opaque payload，底层允许空数组。server/client/sink 已通过
+`pms-codec` 完成 Paimon 行编码与解码；行格式约束属于 codec 与服务边界，不属于 core。
 
 ## 5. WAL 与 Sequence
 
@@ -191,11 +186,11 @@ repeated count times:
   keyLen(4) + key + valueLen(4) + value
 ```
 
-其中 `valueLen = -1` 表示 delete/tombstone；`valueLen >= 0` 表示 byte-oriented value payload。当前 core 允许空 value bytes 作为底层字节接口能力；后续 RowCodec 接入后，可在 codec/server 边界拒绝不符合 row value format 的 payload。
+其中 `valueLen = -1` 表示 delete/tombstone；`valueLen >= 0` 表示 byte-oriented value payload。当前 core 允许空 value bytes 作为底层字节接口能力；实际行编码与解码由已接入的 codec/server 边界负责。
 
 ### 5.2 WAL 文件头保存 Sequence 水位
 
-WAL 文件头保存文件创建时的 `lastSequenceId`。这样即使旧 WAL 文件被截断，而当前 WAL 文件暂时只有控制记录或为空，重启后仍能恢复全局 sequence 水位，避免从 1 重新开始分配。
+WAL 文件头保存文件创建时的 `lastSequenceId`。这样即使旧 WAL 文件被截断，而当前 WAL 文件暂时只有文件头而无 DATA 记录，重启后仍能恢复全局 sequence 水位，避免从 1 重新开始分配。
 
 ### 5.3 Sequence 允许有空洞
 
@@ -250,19 +245,21 @@ walFile.maxSequenceId <= persistedSequenceId
 
 WAL 写入天然是写路径的顺序点。Java LevelDB 的 `LogWriter.addRecord()` 本身也是 synchronized；DB 层还用 mutex 串行化 sequence/WAL/MemTable 提交。
 
-PMS 当前阶段接受短提交锁，是为了保证边界正确性。它不应显著低于 Java LevelDB 的锁模型，因为两者在提交路径上的锁粒度相近。
+PMS 当前阶段接受串行提交锁，是为了保证边界正确性。锁模型与本地 Java LevelDB 接近，但仅凭锁粒度相近不能推断吞吐相近；编码、分配、队列等待和文件写入成本仍需测量。
 
 ### 7.2 常见优化方向
 
-后续如果 WAL 成为瓶颈，可考虑：
+Writer Queue、自然 Group Commit 和 batch sequence 分配已实现；普通 DATA 写入不逐次 force。下面列出相关机制，其中并行 MemTable 和同步策略演进仍是候选方向：
 
 - **Writer Queue**：写线程入队，一个 leader 负责批量提交，followers 等待结果。
-- **Group Commit**：多个写请求合并成一个 WAL batch，减少系统调用和 fsync 次数。
+- **Group Commit**：多个写请求合并成一个 WAL batch，减少系统调用；只有采用同步写策略时才同时摊薄逐请求 fsync，当前普通 DATA 路径没有这部分收益。
 - **Batch Sequence Allocation**：一次为 batch 分配连续 sequence 范围。
 - **Parallel MemTable Writer**：WAL 顺序确定后并行写 MemTable，但必须有严格发布协议，保证 freeze 只能看到完整 batch 边界。
 - **Async Fsync / Sync Policy**：普通写只 append，按策略或控制记录 force；强一致写才同步 force。
 
 这些优化不能改变一个约束：WAL 顺序、sequence 顺序、MemTable 可见顺序、freeze 边界必须可证明一致。
+
+2026-09-14 决策：当前本地写入性能满足 MVP 需求，保留下节的串行提交实现，暂不推进 leader 交接、自旋等待、批内并行或流水线优化。
 
 ### 7.3 V1 当前写入队列优化决策
 
@@ -307,7 +304,7 @@ freeze:
 
 否则会破坏 Deduplicate 语义和 WAL/SST 边界一致性。
 
-## 8. 当前实现约束与后续 TODO
+## 8. 当前实现约束与延后项
 
 当前阶段的约束：
 
@@ -317,10 +314,8 @@ freeze:
 - sequence 可有空洞，但必须单调。
 - `lastFlushedSequenceId` 只用于 SST/WAL 本地恢复边界，不用于 Paimon sink 成功判定。
 
-后续 TODO：
+MVP 之后可按实际需要评估：
 
-- 移除或改造 `CurMemTable.delete(Key)`，避免无 sequence tombstone。
-- 为 WAL truncate 增加定期补偿式后台调度，避免只依赖 sink success 后的即时触发。
-- 将当前 BucketDirector 内部 writer queue 抽出为 WriteCoordinator。
-- 评估可配置 coalesce window，默认保持关闭，避免单线程写入空等退化。
-- 若未来需要 MVCC，将 MemTable/SST key 形态升级为 `(userKey, sequenceId)` 并引入 read sequence 可见性过滤。
+- WAL truncate 的定期补偿调度：当前启动恢复和 sink success 会触发截断，尚无独立周期任务；删除失败会暂时多占磁盘，不提前推进持久化边界。
+- 可配置 coalesce window 或写入协调器拆分：当前吞吐满足 MVP，不为性能目标或类拆分单独改动提交协议。
+- MVCC：需要改造 MemTable/SST key 与 read sequence 可见性过滤，不属于 V1。

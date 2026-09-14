@@ -37,3 +37,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+# Local review notes; keep outside source commits.
+/docs/*.local.md
+/docs/pms-write-path-optimization.md
