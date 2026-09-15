@@ -2,99 +2,214 @@
 
 # Paimon MemTable Service
 
-**A single-node KV service for real-time writes and current-state point lookups on Paimon tables.**
+Paimon MemTable Service (PMS) is a lightweight real-time KV service that sits in front of an Apache Paimon Primary Key Table.
 
-PMS acts like a MemTable layer in front of a Paimon table. As the table's sole writer, it accepts
-the latest changes and asynchronously persists them to Paimon. Reads check the latest local
-state before accessing historical data in Paimon. The name describes PMS's role in the overall
-storage architecture.
+The name **MemTable** is a metaphor. In an LSM store, new writes usually enter a mutable MemTable first and are later flushed into immutable SST files. PMS plays a similar role for a Paimon table: new data is written to PMS and becomes queryable immediately, then sinks asynchronously into Paimon. PMS mainly keeps a recent state window that is newer than Paimon, while Paimon remains the long-term persistent store.
 
-Internally, PMS uses a **lightweight LSM KV engine with a WAL, MemTables, local SSTs, and
-compaction**, providing local storage and process crash recovery. The local write layer retains
-a window of the latest state, while a separate query cache stores historical Paimon files on
-demand. Together, they serve current-state primary-key lookups. Compute engines can continue
-to query the Paimon table for analytics.
+```text
+        PUT / DELETE / GET
+                │
+                ▼
+        ┌───────────────┐
+        │      PMS      │
+        │ WAL / MemTable│
+        │   Local SST   │
+        └───────┬───────┘
+                │
+              sink
+                ▼
+        ┌───────────────┐
+        │    Paimon     │
+        │   PK / LSM    │
+        │ Parquet files │
+        └───────────────┘
+```
 
-The current version is `0.1-SNAPSHOT`. It provides a working MVP within the scope below and is
-available to build and try from source.
+PMS keeps a recent state window locally. Once data has been persisted to Paimon, the corresponding local state can gradually be evicted. Reads check the newer PMS state first and fall back to committed Paimon data when needed.
 
-## MVP scope
+From an LSM point of view, PMS can be thought of as **a mutable frontier above Paimon's LSM**.
 
-| Area | Current support |
-| --- | --- |
-| Deployment | Single node, bound to one existing Paimon table; PMS must be its sole writer |
-| Table | Primary key + `deduplicate` + `HASH_FIXED` buckets + Parquet; partition columns must be included in the primary key |
-| Schema | Must remain unchanged throughout the lifetime of the PMS local state; enforced by deployment practices |
-| Primary key | Non-null `INT`, `BIGINT`, `DATE`, `STRING`, non-LTZ `TIMESTAMP(P <= 6)`, and supported combinations; see the [lookup profile](docs/pms-lookup-paimon.md#7-首期-profile) |
-| Writes and recovery | Put/delete/batch, WAL, MemTables, local SSTs, asynchronous sink, SinkMeta recovery, and flow control |
-| Queries | Current-state primary-key lookups, local prefix queries, direct Paimon lookups, and a local file cache; tombstones prevent reads from falling through to older data |
-| Clients and integration | HTTP/2 h2c, Java client; Flink 1.20.3 At-Least-Once Sink, synchronous/asynchronous processing-time Lookup Join, and SQL DELETE with equality predicates covering the full primary key |
-| Deliverables | Maven multi-module source, Flink connector JAR, and a Linux distribution with startup/shutdown scripts |
+## Why PMS?
 
-A successful ordinary write means the WAL append has completed and the data is visible in the
-MemTable. **It does not perform an fsync for every write or mean the data has been committed to
-Paimon.** Current validation covers process crash recovery; PMS does not guarantee that every
-acknowledged write survives a machine power loss. To confirm visibility in Paimon, establish a
-sink fence through the administrative API and wait for the persisted sequence boundary to reach it.
+A common real-time lakehouse architecture maintains two complete stores:
 
-V1 does not provide distributed or multi-node service, concurrent external writers, schema
-evolution, MVCC or historical snapshot reads, a full-table scan source, or Exactly-Once semantics.
-Dedicated scheduling for explicit Paimon compaction is deferred. Ordinary sink commits retain
-Paimon's implicit compaction and snapshot cleanup according to table configuration. See the
-[codec documentation](docs/pms-codec.md) for supported row value types.
+```text
+Kafka / Flink
+   ├──> KV / OLTP database
+   └──> Paimon
+```
 
-## Build and run
+This provides good point-lookup latency, but it also means maintaining two full storage representations of the same logical data and dealing with consistency across two write paths.
 
-The build baseline is Java 17 and Maven 3.8.6, with Paimon 1.4.1 and Flink 1.20.3 pinned as
-dependencies. The Maven `groupId` is `io.github.esnhysythh`; see each POM for its artifactId.
+PMS explores a different approach: keep only a recent state window locally and reuse Paimon's existing storage structure as much as possible.
+
+For Parquet files already committed to Paimon, PMS can perform direct point lookups by taking advantage of the Primary Key ordering instead of eagerly rebuilding the whole table into another KV store. If a file becomes hot, PMS materializes a local lookup SST cache on demand:
+
+```text
+recent data   -> PMS MemTable / local SST
+cold history  -> direct Parquet lookup
+hot history   -> lookup SST cache
+```
+
+PMS is built around one question:
+
+> **If Paimon is already an LSM, how little additional storage is needed to turn it into a real-time current-state service?**
+
+## What can PMS do?
+
+The current version supports:
+
+- `PUT` / `DELETE` / batch writes
+- WAL, MemTable, local SSTs, and compaction
+- asynchronous sinking into Paimon
+- local-state recovery after process crashes
+- Primary Key current-state lookup
+- direct point lookup on Paimon Parquet files
+- access-frequency-based local lookup SST cache
+- HTTP/2 server and Java client
+- Flink At-Least-Once Sink
+- Flink synchronous / asynchronous processing-time Lookup Join
+- SQL `DELETE` with full Primary Key equality predicates
+
+For example:
+
+```text
+Paimon: K1 -> value-v1
+PMS:    K1 -> value-v2
+```
+
+A lookup returns `value-v2`.
+
+If PMS contains a tombstone:
+
+```text
+PMS: K1 -> DELETE
+```
+
+the lookup returns not found instead of falling through to the older `value-v1` in Paimon.
+
+## Paimon lookup
+
+Historical point lookups are implemented by `pms-lookup-paimon`.
+
+It maintains a live view of the data files for each partition / bucket in the current Paimon snapshot and searches candidate files according to Paimon's merge-tree file priority.
+
+For Parquet files, PMS first uses direct lookup:
+
+```text
+Primary Key
+    │
+    ▼
+candidate file
+    │
+    ▼
+locate row position
+    │
+    ▼
+read row
+```
+
+For files that are accessed repeatedly, PMS asynchronously builds a local Value SST cache. The cache is only a performance optimization: without it, PMS can still query the original Paimon Parquet file directly.
+
+See [docs/pms-lookup-paimon.md](docs/pms-lookup-paimon.md) for the detailed design.
+
+## Build
+
+Requirements:
+
+- Java 17
+- Maven 3.8.6+
+- Apache Paimon 1.4.1
+- Apache Flink 1.20.3
+
+Run the regular test and packaging checks:
 
 ```bash
-# Run regular unit/local integration tests and verify packaging; no remote HDFS access
 mvn verify
+```
 
-# Build the Linux distribution
+Build the Linux distribution:
+
+```bash
 mvn -pl pms-dist -am package
 ```
 
-The distribution is generated at `pms-dist/target/pms-0.1-SNAPSHOT/` and as a `.tar.gz` archive
-with the same base name. Before starting, edit `conf/pms-server.properties` to configure the
-existing table and durable WAL/storage paths, then run `bin/pms-server.sh`. See the
-[distribution documentation](docs/pms-dist.md) for configuration and background process management.
+Artifacts are generated at:
 
-For a local trial, start the development entry point, which creates a test table automatically,
-and use the HTTP examples in the [server README](pms-server/README.md):
+```text
+pms-dist/target/pms-0.1-SNAPSHOT/
+pms-dist/target/pms-0.1-SNAPSHOT.tar.gz
+```
+
+## Quick start
+
+Start the development server, which creates a test table automatically:
 
 ```bash
 mvn -pl pms-server -am process-classes exec:java \
   -Dexec.mainClass=org.qwh.pms.server.dev.PMSTestServerMain
 ```
 
-## Validation scope
+For a normal deployment, build the distribution first:
 
-- Regular Maven tests cover components, HTTP/2 reads/writes and recovery, and end-to-end Flink
-  MiniCluster integration using the local filesystem.
-- The first real HDFS acceptance suite covered an independent PMS process, reads/writes/deletes,
-  resuming with fresh local state, and kill/restart recovery, including three consecutive successful
-  rounds. The environment used HDFS 3.4.3 with one NameNode, one DataNode, simple authentication,
-  and a replication factor of one. PMS used the Hadoop 2.8.5 client. See the
-  [acceptance record](docs/tests/pms-remote-hdfs-acceptance-2026-09-11.md).
-- Remote acceptance used an unpartitioned table with one bucket and a BIGINT primary key.
-  Multiple buckets and partitioned tables with composite primary keys already have local coverage;
-  remote coverage extensions are described in the [follow-up test plan](docs/tests/pms-next-batch.md).
-- S3, HDFS HA/Kerberos, long-running stress tests, and deployment of the distribution on a target
-  Linux environment have not completed acceptance testing. They are outside the currently validated
-  environment scope; existing results do not establish production certification or a performance SLA.
+```bash
+mvn -pl pms-dist -am package
+```
 
-Local performance tools cover three scenarios: **core writes/queries, direct Paimon queries, and
-cached Paimon queries**. See the [benchmark documentation](docs/pms-benchmark.md) for commands
-and measurement semantics. The source repository contains reusable tools and documentation;
-run reports remain local or are stored as CI artifacts.
+Edit:
 
-## Documentation
+```text
+conf/pms-server.properties
+```
 
-The detailed design and module documents below are currently written in Chinese.
+Configure an existing Paimon table together with the WAL and local storage paths, then start PMS:
 
-- [Architecture and module index](design.md)
-- [Server configuration, scheduling, and recovery](docs/pms-server.md)
-- [Java client](docs/pms-client.md) / [Flink connector](docs/flink-connector-pms.md)
-- [Test strategy](docs/tests/pms-testing-strategy.md)
+```bash
+bin/pms-server.sh
+```
+
+See [pms-server/README.md](pms-server/README.md) for server configuration and HTTP examples, and [docs/pms-dist.md](docs/pms-dist.md) for distribution details.
+
+## Modules
+
+```text
+pms-core             local WAL / MemTable / SST / recovery
+pms-codec            Paimon key/value codec
+pms-protocol         network protocol
+pms-client           Java client
+pms-sink-paimon      Paimon sink
+pms-lookup-paimon    Paimon point lookup and lookup SST cache
+pms-server           standalone server
+flink-connector-pms  Flink integration
+pms-dist             Linux distribution
+pms-tests            integration tests and benchmarks
+```
+
+See [design.md](design.md) for the overall architecture and module layout.
+
+## Current limitations
+
+The current version is designed around:
+
+- a single node
+- a single writer
+- a fixed schema
+- a Paimon Primary Key Table
+- the `deduplicate` merge engine
+- `HASH_FIXED` buckets
+- Parquet data files
+- partition columns included in the Primary Key
+
+PMS currently does not provide multi-node operation, external concurrent writers, schema evolution, MVCC / historical snapshot queries, a Scan Source, or an Exactly-Once Sink.
+
+A successful normal write means the data has been appended to the PMS WAL and is visible to PMS reads. It does not mean the data has already been committed to Paimon, and normal writes do not perform an `fsync` for every request.
+
+See [design.md](design.md) and `docs/` for supported types, recovery semantics, and detailed runtime boundaries.
+
+## Project status
+
+Current version: `0.1-SNAPSHOT`
+
+## License
+
+MIT
