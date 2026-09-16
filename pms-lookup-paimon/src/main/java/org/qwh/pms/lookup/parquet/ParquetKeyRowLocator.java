@@ -34,15 +34,20 @@ public final class ParquetKeyRowLocator {
             long rowIndex = rowRange.fromInclusive();
             RecordReader.RecordIterator<InternalRow> batch;
             while ((batch = reader.readBatch()) != null) {
-                InternalRow row;
-                while ((row = batch.next()) != null) {
-                    if (keySpec.keyComparator().compare(row, key) == 0) {
-                        batch.releaseBatch();
-                        return rowIndex;
+                try {
+                    InternalRow row;
+                    while ((row = batch.next()) != null) {
+                        int comparison = keySpec.keyComparator().compare(row, key);
+                        // Paimon KeyValue files are ordered by the full primary key.
+                        // A greater key rules out the rest of this range, not other files.
+                        if (comparison >= 0) {
+                            return comparison == 0 ? rowIndex : -1L;
+                        }
+                        rowIndex++;
                     }
-                    rowIndex++;
+                } finally {
+                    batch.releaseBatch();
                 }
-                batch.releaseBatch();
             }
         }
         return -1L;
