@@ -8,7 +8,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Per-file cache for Parquet footer-derived direct lookup metadata. */
+/** Per-file cache for Parquet footer and lazily loaded page indexes. */
 public final class ParquetLookupMetadataCache {
 
     public static final int DEFAULT_MAX_ENTRIES = 1_024;
@@ -17,6 +17,8 @@ public final class ParquetLookupMetadataCache {
     private final int maxEntries;
     private final Map<ResolvedDataFileKey, ParquetLookupMetadata> cache =
             new LinkedHashMap<>(16, 0.75F, true);
+    // Guarded by cache. Invalidations must also fence loads performed outside the lock.
+    private long generation;
 
     public ParquetLookupMetadataCache(Options options) {
         this(options, DEFAULT_MAX_ENTRIES);
@@ -32,15 +34,21 @@ public final class ParquetLookupMetadataCache {
 
     public ParquetLookupMetadata getOrLoad(ResolvedDataFileKey key, ResolvedDataFile file)
             throws IOException {
+        final long loadGeneration;
         synchronized (cache) {
             ParquetLookupMetadata cached = cache.get(key);
             if (cached != null) {
                 return cached;
             }
+            loadGeneration = generation;
         }
 
         ParquetLookupMetadata loaded = load(file);
         synchronized (cache) {
+            // The in-flight caller may finish, but cannot resurrect an invalidated entry.
+            if (generation != loadGeneration) {
+                return loaded;
+            }
             ParquetLookupMetadata existing = cache.get(key);
             if (existing != null) {
                 return existing;
@@ -53,12 +61,14 @@ public final class ParquetLookupMetadataCache {
 
     public void invalidate(String fileName) {
         synchronized (cache) {
+            generation++;
             cache.keySet().removeIf(key -> key.fileName().equals(fileName));
         }
     }
 
     public void clear() {
         synchronized (cache) {
+            generation++;
             cache.clear();
         }
     }

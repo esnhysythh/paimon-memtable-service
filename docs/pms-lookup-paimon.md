@@ -110,10 +110,26 @@ Paimon 1.4.1 的 `ParquetReaderFactory.createReader(context)` 未提供 footer �
 该路径依赖 V1 固定 Schema 和完整顶层字段读取约束，不实现 Schema 演进或嵌套字段裁剪；
 缺少预期字段时失败，不能将缺失数据解释为 MISS。
 
-仅 footer 元数据按只读方式共享；输入流、selection、列向量与 reader 游标均由每次读取独立
-持有。装配失败时关闭已打开 reader，避免泄漏输入流。文件失效与 LRU 淘汰仍沿用现有缓存规则。
-这一步不缓存 ColumnIndex/OffsetIndex，不共享打开的 reader，也不改变候选顺序、DELETE
-或 UNKNOWN 语义。Paimon 升级时需回归公开装配接口、复杂值类型、并发读取和异常资源释放。
+footer 与已解析的 Page Index 按只读方式共享；输入流、selection、列向量与 reader 游标
+由每次读取独立持有。装配失败时关闭已打开 reader，避免泄漏输入流。
+Paimon 升级时需回归公开装配接口、复杂值类型、并发读取和异常资源释放。
+
+### 3.4 Page Index 缓存
+
+`ParquetLookupMetadata` 按文件持有 `ParquetPageIndexCache`，供筛选、主键定位和整行读取
+复用已解析的索引，减少重复读取与解析。
+
+- **ColumnIndex**：按主键筛选需要加载。
+- **OffsetIndex**：按 RowGroup 懒加载，首次访问时加载组内所有列的索引。命中查询需要完整
+  KeyValue，因此优先合并读取连续索引；布局分散、超过合并缓冲上限或涉及加密列时沿用逐列读取。
+  冷 MISS 同样会加载该组的 value 索引。
+
+同一组或条目的首次加载通过同步合并，完整成功后发布只读结果，失败可重试；不同组或条目
+可以并发加载，热查询无需加锁。索引读取通过 `ParquetFileReader` 的内部扩展入口接入，
+升级 Paimon 时需验证接口及索引只读共享的安全性。
+
+索引缓存与 footer 共用文件身份、LRU 淘汰和失效生命周期，容量按文件数限制（默认 1024），
+实际内存随列数和页数增长。文件失效后，已开始的查询可以完成，但旧加载结果不会重新写入缓存。
 
 ## 4. live 文件视图
 
