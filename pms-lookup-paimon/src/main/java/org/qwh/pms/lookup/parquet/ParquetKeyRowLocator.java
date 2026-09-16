@@ -7,7 +7,6 @@ import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.RoaringBitmap32;
 
-import org.qwh.pms.lookup.api.ResolvedDataFile;
 import org.qwh.pms.lookup.parquet.key.LookupKeySpec;
 
 import java.io.IOException;
@@ -26,12 +25,12 @@ public final class ParquetKeyRowLocator {
     }
 
     public long locate(
-            ResolvedDataFile file, RowRangeCandidate rowRange, InternalRow key)
+            ParquetLookupMetadata metadata, RowRangeCandidate rowRange, InternalRow key)
             throws IOException {
         RowType keyReadType = keySpec.keyType();
         RoaringBitmap32 selection = ParquetReaderSupport.rowRangeSelection(rowRange);
 
-        try (FileRecordReader<InternalRow> reader = newReader(file, keyReadType, selection)) {
+        try (FileRecordReader<InternalRow> reader = newReader(metadata, keyReadType, selection)) {
             long rowIndex = rowRange.fromInclusive();
             RecordReader.RecordIterator<InternalRow> batch;
             while ((batch = reader.readBatch()) != null) {
@@ -50,7 +49,7 @@ public final class ParquetKeyRowLocator {
     }
 
     private FileRecordReader<InternalRow> newReader(
-            ResolvedDataFile file, RowType readType, RoaringBitmap32 selection) throws IOException {
-        return ParquetReaderSupport.newReader(file, readType, selection, options, batchSize);
+            ParquetLookupMetadata metadata, RowType readType, RoaringBitmap32 selection) throws IOException {
+        return ParquetReaderSupport.newReader(metadata, readType, selection, options, batchSize);
     }
 }

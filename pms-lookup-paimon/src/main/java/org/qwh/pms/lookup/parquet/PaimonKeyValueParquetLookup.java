@@ -99,9 +99,9 @@ public class PaimonKeyValueParquetLookup implements DataFileLookup {
 
             for (RowRangeCandidate rowRange :
                     rowRangeProvider.candidateRowRanges(metadata, request.key())) {
-                long rowIndex = keyRowLocator.locate(resolved, rowRange, request.key());
+                long rowIndex = keyRowLocator.locate(metadata, rowRange, request.key());
                 if (rowIndex >= 0) {
-                    KeyValue keyValue = rowReader.read(resolved, rowIndex);
+                    KeyValue keyValue = rowReader.read(metadata, rowIndex);
                     if (keyValue.valueKind().isRetract()) {
                         return LookupResult.deleted(rowIndex);
                     }

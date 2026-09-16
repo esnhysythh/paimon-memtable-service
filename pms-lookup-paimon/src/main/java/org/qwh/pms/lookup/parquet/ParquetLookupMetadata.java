@@ -3,6 +3,7 @@ package org.qwh.pms.lookup.parquet;
 import org.apache.paimon.format.parquet.ParquetInputFile;
 import org.apache.paimon.format.parquet.ParquetUtil;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.utils.RoaringBitmap32;
 import org.qwh.pms.lookup.api.ResolvedDataFile;
 
 import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
@@ -41,11 +42,20 @@ public final class ParquetLookupMetadata {
         }
     }
 
+    ResolvedDataFile file() {
+        return file;
+    }
+
     ParquetFileReader newReader(Options options) throws IOException {
+        return newReader(options, null);
+    }
+
+    // Share only the footer. Each query owns its stream, selection and reader state.
+    ParquetFileReader newReader(Options options, RoaringBitmap32 selection) throws IOException {
         ParquetInputFile inputFile =
                 ParquetInputFile.fromPath(file.fileIO(), file.path(), file.fileSize());
         return new ParquetFileReader(
-                inputFile, footer, readOptions(file, options), inputFile.newStream(), null);
+                inputFile, footer, readOptions(file, options), inputFile.newStream(), selection);
     }
 
     List<RowGroupMetadata> rowGroups() {

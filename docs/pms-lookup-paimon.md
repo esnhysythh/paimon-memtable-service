@@ -97,6 +97,24 @@ table.store().pathFactory()
 
 不得按 table root 或文件名独立拼接路径；这会错误处理分区、bucket 或 external path 文件。
 
+### 3.3 Direct reader 与 footer 复用
+
+direct 保留“索引筛选 → 主键列定位行号 → 读取完整 KeyValue”的两阶段数据读取路径。
+同一次文件查询取得的 `ParquetLookupMetadata` 贯穿三个阶段；缓存命中后，key reader 与
+整行 reader 都通过带 footer 的 `ParquetFileReader` 构造入口创建，不再重复读取、解析 footer。
+
+Paimon 1.4.1 的 `ParquetReaderFactory.createReader(context)` 未提供 footer 注入入口，且内部
+装配方法为 private。因此 PMS 在 `ParquetReaderSupport` 中做最小装配：从文件 schema
+选取完整顶层字段，保留原物理类型和嵌套结构，再调用 Paimon 的公开字段/列向量工具与
+`VectorizedParquetRecordReader`。数据页读取、解压和类型解码继续复用 Paimon 实现。
+该路径依赖 V1 固定 Schema 和完整顶层字段读取约束，不实现 Schema 演进或嵌套字段裁剪；
+缺少预期字段时失败，不能将缺失数据解释为 MISS。
+
+仅 footer 元数据按只读方式共享；输入流、selection、列向量与 reader 游标均由每次读取独立
+持有。装配失败时关闭已打开 reader，避免泄漏输入流。文件失效与 LRU 淘汰仍沿用现有缓存规则。
+这一步不缓存 ColumnIndex/OffsetIndex，不共享打开的 reader，也不改变候选顺序、DELETE
+或 UNKNOWN 语义。Paimon 升级时需回归公开装配接口、复杂值类型、并发读取和异常资源释放。
+
 ## 4. live 文件视图
 
 `LiveFileIndex` 保存 `(partition, bucket) -> immutable Levels view`。`CandidatePlanner` 按 Paimon 的 level 语义选择候选：L0 查询所有 key-range 覆盖文件，L1+ 每层最多选择一个 sorted-run 文件；命中 PUT 或 DELETE 后立即停止。

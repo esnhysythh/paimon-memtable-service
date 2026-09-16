@@ -9,7 +9,6 @@ import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.RoaringBitmap32;
 
-import org.qwh.pms.lookup.api.ResolvedDataFile;
 import java.io.IOException;
 
 /** Reads one physical Paimon KeyValue row after the key locator has found its row ordinal. */
@@ -34,12 +33,12 @@ final class PaimonKeyValueRowReader {
         this.batchSize = batchSize;
     }
 
-    KeyValue read(ResolvedDataFile file, long rowIndex) throws IOException {
+    KeyValue read(ParquetLookupMetadata metadata, long rowIndex) throws IOException {
         RoaringBitmap32 selection = ParquetReaderSupport.singleRowSelection(rowIndex);
         KeyValueSerializer serializer = new KeyValueSerializer(keyType, valueType);
         try (FileRecordReader<InternalRow> reader =
                 ParquetReaderSupport.newReader(
-                        file, physicalRowType, selection, options, batchSize)) {
+                        metadata, physicalRowType, selection, options, batchSize)) {
             RecordReader.RecordIterator<InternalRow> batch;
             while ((batch = reader.readBatch()) != null) {
                 InternalRow row;
