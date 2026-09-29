@@ -88,25 +88,14 @@ public class PaimonKeyValueLookupService {
         return LookupResult.miss();
     }
 
+    /** Low-level update; committed batches must use {@link #applyCommittedMessages} for failure isolation. */
     public void applyDelta(
             BinaryRow partition,
             int bucket,
             List<DataFileMeta> beforeFiles,
             List<DataFileMeta> afterFiles) {
         FileLookupContext context = new FileLookupContext(partition, bucket);
-        try {
-            fileIndex.applyDelta(partition, bucket, beforeFiles, afterFiles);
-        } catch (RuntimeException e) {
-            fileLookup.invalidateBucket(context);
-            LOG.warn(
-                    "Failed to apply Paimon lookup delta; bucket invalidated: partition={}, bucket={}, beforeCount={}, afterCount={}",
-                    partition,
-                    bucket,
-                    beforeFiles == null ? 0 : beforeFiles.size(),
-                    afterFiles == null ? 0 : afterFiles.size(),
-                    e);
-            throw e;
-        }
+        fileIndex.applyDelta(partition, bucket, beforeFiles, afterFiles);
         if (beforeFiles != null) {
             beforeFiles.forEach(file -> fileLookup.invalidate(context, file));
         }
@@ -131,19 +120,60 @@ public class PaimonKeyValueLookupService {
     }
 
     /**
+     * Drops every view after an uncontained publication failure. The caller must hold the same
+     * lock used for commits, publication and snapshot installation. Cache cleanup is deferred
+     * until each bucket's snapshot is rebuilt; missing views cannot consult stale cache entries.
+     */
+    public void invalidateAllViews() {
+        fileIndex.clear();
+    }
+
+    /**
      * Applies one already committed Paimon commit to initialized bucket views.
      *
      * <p>Uninitialized buckets intentionally skip the delta: their first lookup must install a
      * complete latest snapshot, which already includes this commit. An invalid bucket remains
      * invalid until that rebuild happens.
+     *
+     * <p>The caller must serialize commits, publication and snapshot installation. A bucket-local
+     * failure is invalidated before continuing with other buckets. An escaping exception means
+     * publication could not be safely isolated and requires invalidating all views.
+     *
+     * @return the number of buckets invalidated by this publication
      */
-    public void applyCommittedMessages(List<CommitMessage> messages) {
+    public int applyCommittedMessages(List<CommitMessage> messages) {
+        int failedBucketCount = 0;
         for (CommitMessageDeltaExtractor.BucketFileDelta delta : commitDeltaExtractor.extract(messages)) {
-            if (fileIndex.bucketView(delta.partition(), delta.bucket()).isEmpty()) {
+            Optional<LiveBucketView> view = fileIndex.bucketView(delta.partition(), delta.bucket());
+            if (view.isEmpty() || !view.get().valid()) {
                 continue;
             }
-            applyDelta(delta.partition(), delta.bucket(), delta.beforeFiles(), delta.afterFiles());
+            try {
+                applyDelta(delta.partition(), delta.bucket(), delta.beforeFiles(), delta.afterFiles());
+            } catch (RuntimeException e) {
+                // Logical invalidation must succeed before cache cleanup or continuing publication.
+                // It also covers failures in per-file cleanup after the new view was published.
+                fileIndex.invalidate(delta.partition(), delta.bucket());
+                LOG.warn(
+                        "Paimon commit delta failed; lookup bucket invalidated: partition={}, bucket={}, beforeCount={}, afterCount={}",
+                        delta.partition(),
+                        delta.bucket(),
+                        delta.beforeFiles().size(),
+                        delta.afterFiles().size(),
+                        e);
+                try {
+                    fileLookup.invalidateBucket(new FileLookupContext(delta.partition(), delta.bucket()));
+                } catch (RuntimeException cleanupFailure) {
+                    LOG.warn(
+                            "Failed to clean cache for invalid lookup bucket: partition={}, bucket={}",
+                            delta.partition(),
+                            delta.bucket(),
+                            cleanupFailure);
+                }
+                failedBucketCount++;
+            }
         }
+        return failedBucketCount;
     }
 
     private void ensureSchemaMatches(DataFileMeta file) {

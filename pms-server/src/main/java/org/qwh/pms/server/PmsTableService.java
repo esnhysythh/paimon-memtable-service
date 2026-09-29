@@ -102,7 +102,6 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
     private final ExecutorService lookupBuildExecutor;
     private final PaimonCommitPayloadCodec commitPayloadCodec = new PaimonCommitPayloadCodec();
     private final ThreadLocal<RowKeyExtractor> rowKeyExtractors;
-    private volatile RuntimeException lookupPayloadDecodeFailure;
 
     @FunctionalInterface
     interface SinkManagerFactory {
@@ -236,7 +235,13 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
             return local;
         }
         GenericRow fullPrimaryKeyRow = rowMapper.fullPrimaryKeyRow((GenericRow) keyCodec.decodeKey(key), primaryKeys);
-        return lookupPaimonRaw(fullPrimaryKeyRow);
+        LookupResult result = lookupPaimonResult(fullPrimaryKeyRow);
+        return switch (result.kind()) {
+            case HIT -> RawLookupResult.hit(valueCodec.encode(table.rowType(), result.row().orElseThrow(), writerSchemaId));
+            case DELETED -> RawLookupResult.deleted();
+            case MISS -> RawLookupResult.miss();
+            case UNKNOWN -> throw new IllegalStateException("lookupPaimonResult must resolve UNKNOWN");
+        };
     }
 
     public RawLookupBatchResult prefixLocalRaw(byte[] prefix, int maxResults) {
@@ -260,51 +265,10 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
         if (local.type() == PmsLocalLookupResult.Type.DELETED) {
             return Optional.empty();
         }
-        return lookupPaimon(fullPrimaryKeyRow);
-    }
-
-    private RawLookupResult lookupPaimonRaw(GenericRow fullPrimaryKeyRow) {
-        if (lookupPayloadDecodeFailure != null) {
-            throw new PmsLookupUnavailableException(
-                "Paimon lookup commit delta publishing failed; restart or repair the lookup view",
-                lookupPayloadDecodeFailure
-            );
-        }
-        RowKeyExtractor extractor = rowKeyExtractors.get();
-        extractor.setRecord(fullPrimaryKeyRow);
-        BinaryRow partition = extractor.partition();
-        int bucket = extractor.bucket();
-        LookupRequest request = LookupRequest.fullRow(extractor.trimmedPrimaryKey());
-        LookupResult result;
-        try {
-            result = paimonLookup.lookup(partition, bucket, request);
-        } catch (IOException e) {
-            result = LookupResult.unknown();
-        } catch (SchemaMismatchException e) {
-            throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
-        }
-        if (result.kind() == LookupResult.Kind.UNKNOWN) {
-            try {
-                synchronized (paimonCommitPublishLock) {
-                    installSnapshot(partition, bucket);
-                    result = paimonLookup.lookup(partition, bucket, request);
-                }
-            } catch (IOException e) {
-                throw new PmsLookupUnavailableException(
-                    "Unable to rebuild Paimon lookup view for partition=" + partition + ", bucket=" + bucket,
-                    e
-                );
-            } catch (SchemaMismatchException e) {
-                throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
-            }
-        }
-        return switch (result.kind()) {
-            case HIT -> RawLookupResult.hit(valueCodec.encode(table.rowType(), result.row().orElseThrow(), writerSchemaId));
-            case DELETED -> RawLookupResult.deleted();
-            case MISS -> RawLookupResult.miss();
-            case UNKNOWN -> throw new PmsLookupUnavailableException(
-                "Paimon lookup is unavailable for partition=" + partition + ", bucket=" + bucket);
-        };
+        LookupResult result = lookupPaimonResult(fullPrimaryKeyRow);
+        return result.kind() == LookupResult.Kind.HIT
+            ? Optional.of(rowMapper.toJsonObject(result.row().orElseThrow()))
+            : Optional.empty();
     }
 
     public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
@@ -386,13 +350,8 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
         return protocolTableSchema;
     }
 
-    private Optional<Map<String, Object>> lookupPaimon(GenericRow fullPrimaryKeyRow) {
-        if (lookupPayloadDecodeFailure != null) {
-            throw new PmsLookupUnavailableException(
-                "Paimon lookup commit delta publishing failed; restart or repair the lookup view",
-                lookupPayloadDecodeFailure
-            );
-        }
+    /** Returns HIT, DELETED or MISS; an unresolved UNKNOWN is always an unavailable error. */
+    private LookupResult lookupPaimonResult(GenericRow fullPrimaryKeyRow) {
         RowKeyExtractor extractor = rowKeyExtractors.get();
         extractor.setRecord(fullPrimaryKeyRow);
         BinaryRow partition = extractor.partition();
@@ -412,21 +371,20 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
                     installSnapshot(partition, bucket);
                     result = paimonLookup.lookup(partition, bucket, request);
                 }
-            } catch (IOException e) {
+            } catch (SchemaMismatchException e) {
+                throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
+            } catch (IOException | RuntimeException e) {
                 throw new PmsLookupUnavailableException(
                     "Unable to rebuild Paimon lookup view for partition=" + partition + ", bucket=" + bucket,
                     e
                 );
-            } catch (SchemaMismatchException e) {
-                throw new PmsLookupUnavailableException("Paimon lookup schema mismatch", e);
             }
         }
-        return switch (result.kind()) {
-            case HIT -> Optional.of(rowMapper.toJsonObject(result.row().orElseThrow()));
-            case DELETED, MISS -> Optional.empty();
-            case UNKNOWN -> throw new PmsLookupUnavailableException(
+        if (result.kind() == LookupResult.Kind.UNKNOWN) {
+            throw new PmsLookupUnavailableException(
                 "Paimon lookup is unavailable for partition=" + partition + ", bucket=" + bucket);
-        };
+        }
+        return result;
     }
 
     private PmsLocalLookupResult getLocal(byte[] key) {
@@ -460,26 +418,32 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
         );
     }
 
+    // Called under paimonCommitPublishLock, after the Paimon commit and local finalization.
     private void publishCommittedLookupDelta(SinkCommitResult result) {
-        byte[] payload = result.commitPayload();
-        if (payload.length == 0) {
-            return;
-        }
-        List<org.apache.paimon.table.sink.CommitMessage> messages;
         try {
-            messages = commitPayloadCodec.decode(payload);
-        } catch (RuntimeException e) {
-            lookupPayloadDecodeFailure = e;
-            throw new PmsLookupUnavailableException(
-                "Paimon commit succeeded but its lookup delta could not be published", e);
-        }
-        try {
-            synchronized (paimonCommitPublishLock) {
-                paimonLookup.applyCommittedMessages(messages);
+            byte[] payload = result.commitPayload();
+            if (payload.length == 0) {
+                return;
             }
-        } catch (RuntimeException e) {
-            throw new PmsLookupUnavailableException(
-                "Paimon commit succeeded but its lookup delta could not be applied", e);
+            int failedBucketCount = paimonLookup.applyCommittedMessages(commitPayloadCodec.decode(payload));
+            if (failedBucketCount > 0) {
+                LOG.warn(
+                    "Paimon commit succeeded with invalid lookup buckets; snapshots will rebuild on demand: batch={}, snapshotId={}, failedBucketCount={}",
+                    result.batchId(),
+                    result.snapshotId(),
+                    failedBucketCount
+                );
+            }
+        } catch (RuntimeException | Error e) {
+            // The commit is durable. Drop every possibly incomplete view before allowing eviction;
+            // later lookups rebuild from complete snapshots without replaying the failed payload.
+            paimonLookup.invalidateAllViews();
+            if (e instanceof Error error) {
+                throw error;
+            }
+            LOG.warn(
+                "Paimon commit succeeded but lookup delta publication failed; all views cleared for snapshot rebuild on demand: batch={}, snapshotId={}",
+                result.batchId(), result.snapshotId(), e);
         }
     }
 

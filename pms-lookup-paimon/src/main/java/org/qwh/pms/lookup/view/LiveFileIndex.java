@@ -86,6 +86,11 @@ public class LiveFileIndex {
         buckets.put(key, BucketState.invalid(nextVersion(buckets.get(key))));
     }
 
+    /** Drops all views; subsequent lookups require complete snapshots again. */
+    public synchronized void clear() {
+        buckets.clear();
+    }
+
     private int restoredNumLevels(List<DataFileMeta> files) {
         int highestFileLevel = files.stream().mapToInt(DataFileMeta::level).max().orElse(-1);
         return Math.max(numLevels, highestFileLevel + 1);
