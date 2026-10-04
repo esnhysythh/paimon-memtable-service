@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Clock;
+import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -22,6 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
+import org.qwh.pms.core.bucket.PmsFatalException;
 import org.qwh.pms.core.bucket.LocalRunSnapshot;
 import org.qwh.pms.core.bucket.SinkFlightSnapshot;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
@@ -36,6 +38,50 @@ import org.qwh.pms.core.sink.SinkCommitResult;
 import org.qwh.pms.core.storage.SSTState;
 
 class PmsServerSchedulerTest {
+
+    @Test
+    void flushErrorStopsReconciliationAndNotifiesOwner() throws Exception {
+        assertWorkerFatal(true, new AssertionError("injected Flush error"));
+    }
+
+    @Test
+    void maintenanceErrorStopsReconciliationAndNotifiesOwner() throws Exception {
+        assertWorkerFatal(false, new AssertionError("injected maintenance error"));
+    }
+
+    @Test
+    void explicitFatalFailureIsNotRetriedAsAnOrdinaryRuntimeException() throws Exception {
+        assertWorkerFatal(true, new PmsFatalException("unrecoverable Flush", new IOException("broken state")));
+    }
+
+    private void assertWorkerFatal(boolean flush, Throwable failure) throws Exception {
+        MutableOperations operations = new MutableOperations();
+        if (flush) {
+            operations.addImmutable(1);
+            operations.flushFailure = failure;
+        } else {
+            operations.addRun(SSTState.NEW, 1, 700L * 1024 * 1024);
+            operations.addRun(SSTState.NEW, 2, 700L * 1024 * 1024);
+            operations.lastFlushedSequenceId = 2;
+            operations.sinkFailure = failure;
+        }
+        AtomicReference<Throwable> reported = new AtomicReference<>();
+        PmsServerScheduler scheduler = new PmsServerScheduler(
+            operations,
+            config(1, 1, 600_000, 1, 10, 1_024, 1_024),
+            Clock.systemUTC(),
+            reported::set
+        );
+        try {
+            scheduler.start();
+            waitUntil(() -> reported.get() != null);
+            assertEquals(failure, reported.get());
+            assertFalse((Boolean) scheduler.state().get("running"));
+        } finally {
+            assertTimeoutPreemptively(Duration.ofSeconds(5), scheduler::close);
+        }
+        assertEquals(1, flush ? operations.flushCalls : operations.sinkCalls);
+    }
 
     @Test
     void configKeepsFlushAndMaintenanceIntervalsIndependent() {
@@ -604,7 +650,8 @@ class PmsServerSchedulerTest {
         private int sinkFlightResumeCalls;
         private int compactCalls;
         private int evictCalls;
-        private RuntimeException flushFailure;
+        private Throwable flushFailure;
+        private Throwable sinkFailure;
         private volatile CountDownLatch flushStarted;
         private volatile CountDownLatch flushRelease;
         private volatile CountDownLatch sinkStarted;
@@ -697,7 +744,7 @@ class PmsServerSchedulerTest {
                 }
                 flushCalls++;
                 if (flushFailure != null) {
-                    throw flushFailure;
+                    throwFailure(flushFailure);
                 }
                 started = flushStarted;
                 release = flushRelease;
@@ -740,6 +787,10 @@ class PmsServerSchedulerTest {
         }
 
         private synchronized SinkOperationResult sinkToPaimonLocked(SinkSelection selection) {
+            if (sinkFailure != null) {
+                sinkCalls++;
+                throwFailure(sinkFailure);
+            }
             List<LocalRunSnapshot> selected = new ArrayList<>();
             long selectedBytes = 0;
             for (LocalRunSnapshot run : runs(SSTState.NEW)) {
@@ -870,6 +921,13 @@ class PmsServerSchedulerTest {
             immutableCount++;
             immutableMaxSequenceIds.addLast(maxSequenceId);
             lastAssignedSequenceId = Math.max(lastAssignedSequenceId, maxSequenceId);
+        }
+
+        private static void throwFailure(Throwable failure) {
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            throw (RuntimeException) failure;
         }
 
         private synchronized void blockNextFlush() {

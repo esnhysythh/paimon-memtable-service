@@ -116,9 +116,9 @@ try (PmsClient client = PmsClient.connect(config)) {
 | `SHUTTING_DOWN` | 服务停机 | 当前 endpoint 等待恢复或由上层切换 |
 | `INTERNAL_ERROR` | 普通服务端内部错误 | 不自动重试，由调用方处理 |
 
-若 WAL 已成功但 MemTable apply 失败，server 不返回普通 `INTERNAL_ERROR`：连接会失败，
-server runtime 进入 `FAILED` 并停止服务。此时该批写入结果未知，只能在 server 恢复后由
-业务幂等或上层检查机制处理。
+写入提交阶段异常会使 server runtime 进入 `FAILED` 并停止服务。触发故障和因 fatal 被拒绝的
+排队写入均表现为 HTTP 请求失败，没有正常 `WriteResult`。这类请求的写入结果未知，需在
+server 恢复后由调用方处理。
 
 ### 2.3 RowCodec / PrimaryKeyCodec（核心序列化边界）
 
@@ -178,8 +178,13 @@ DELETE/UPDATE_BEFORE -> delete(primaryKeyBytes)
 `SHUTTING_DOWN` 做有限次数指数退避重试。默认延迟为
 `10, 20, 40, 80, 160, 320, 640ms`，之后保持 640ms，上限默认 10 次。
 
-网络超时、连接中断、`INTERNAL_ERROR` 和 fatal 断连都可能对应未知写入结果，client 不自动
-重试，避免在没有 request id / 幂等协议的 V1 中制造重复提交。
+网络超时、连接中断、`INTERNAL_ERROR` 和 fatal 请求失败都可能对应未知写入结果，client 不自动
+重试；V1 不提供 request id 或请求去重协议。
+
+PMS 按写入到达顺序为同一 key 分配新 sequence，deduplicate 使后写值覆盖旧值。重复写入相同值
+可以收敛，但不保证旧请求晚到仍安全：`k=v1` 结果未知后，若 `k=v2` 已成功，再重试 `v1` 会覆盖
+`v2`；重试旧 PUT 也可能覆盖后来的 DELETE。调用方应在故障实例停止并完成恢复后，按原顺序
+重放，并避免同一 key 的后续写入越过待重试请求。
 
 ### 3.2 连接管理
 

@@ -30,7 +30,9 @@ binary endpoint 默认要求 HTTP/2。h2c client 应先访问 `/pms/api/v1/hands
 - `prefixLocal` 只查询本地层；完整表 prefix 查询在 V1 返回 `NOT_SUPPORTED`。
 - Paimon lookup 的 UNKNOWN 是可重试失败，不得映射为 MISS。生产查询路径不使用 `ReadBuilder`。
 
-写入入口先检查 runtime 必须为 `RUNNING`，再基于 `BucketStateSnapshot` 做一次快速水位判断。core 在 WAL append 前于写入临界区内复查相同水位，覆盖多个并发请求同时通过 server 检查的窗口。两次检查均不做容量预留；目标是及时停止扩大积压，而不是实现精确配额。
+读写与 handshake 入口要求 runtime 为 `RUNNING` 且 core 未进入 fatal。写入入口还基于 `BucketStateSnapshot` 做一次快速水位判断。core 在每个合并后的 WAL group 开始时，于已有 `writeMutex` 内复查 fatal 和水位；检查通过后该 group 属于在途提交。水位检查不做容量预留。
+
+JSON `/health` 与协议 `/pms/api/v1/health` 使用同一服务状态：runtime 为 `RUNNING` 且 core 未进入 fatal 时返回 HTTP 200 / `OK`，否则返回 HTTP 503 / `UNAVAILABLE`。过载不改变 health；业务请求仍按水位返回 `OVERLOADED`。
 
 | status | 含义 | 建议行为 |
 |--------|------|----------|
@@ -39,7 +41,11 @@ binary endpoint 默认要求 HTTP/2。h2c client 应先访问 `/pms/api/v1/hands
 | `SCHEMA_MISMATCH` | 防御性保留的 Schema 不一致状态 | 停止使用当前部署并检查产品约束 |
 | `SHUTTING_DOWN` | runtime 不再接收请求 | 切换实例或稍后重试 |
 
-WAL append 成功后若 MemTable apply 失败，core 抛出 `PmsFatalWriteException`。此时请求结果是 unknown outcome，runtime 进入 `FAILED` 并异步关闭 HTTP、scheduler 和 table service，等待重启恢复。
+写入通过准入检查后，提交阶段的任意异常均使 core 进入 fatal，并抛出统一的 `PmsFatalException`。提交阶段包括 WAL append、MemTable apply 与自动 Freeze；即使 WAL append 未成功返回，也可能已有数据写入。runtime 写 API 捕获该异常后进入 `FAILED`，异步关闭 HTTP、scheduler 和 table service，等待重启恢复。该路径同样覆盖直接调用 runtime 写 API 的请求。
+
+fatal 后 leader 在 WAL 前拒绝后续 queued group，并完成全部等待请求。触发故障和排队拒绝共用同一种异常，HTTP 请求失败，写入结果统一按 unknown outcome 处理；服务端不额外追踪每个请求是否进入 WAL，也不返回正常的零接受响应。只有在 runtime 入口明确未获准执行的新请求返回 `SHUTTING_DOWN` / `acceptedCount=0`。
+
+该策略以重启恢复换取较简单的故障处理：提交阶段即使碰到理论上可恢复的错误，也关闭实例；已经在途的请求不保证成功响应送达。deduplicate 支持重复写入相同值，但调用方仍需保证同一 key 的写入与重试顺序，见 [pms-client.md](pms-client.md) § 3.1。
 
 ### 2.2 启动与恢复
 
@@ -151,9 +157,11 @@ Sink 与 compact 不冲突：数据 Sink 后仍可在 SINKED 状态 compact。�
 
 #### 2.4.6 失败与日志
 
-Flush/Maintenance worker 捕获运行期 `RuntimeException`，记录失败并在下一个周期或已有 signal 重试；不维护单独 retry timer。积压达到 flow-control 水位后，写入会被 `OVERLOADED` 阻止。
+Flush/Maintenance worker 对普通 `RuntimeException` 记录失败并在下一个周期或已有 signal 重试，不维护单独 retry timer。积压达到 flow-control 水位后，写入会被 `OVERLOADED` 阻止。
 
-V1 不构建复杂的后台 fatal exception taxonomy。确定性配置、表 profile 与恢复损坏在启动阶段 fail fast；运行期只对已有明确语义的 fatal write 关闭 runtime。Schema 不变属于产品前置条件，不由后台任务主动监控。待故障注入与生产样本证明需要后，再增加少量显式 fatal 类型，而不是按异常消息猜测。
+worker 遇到 `Error` 或显式 `PmsFatalException` 时停止调和并通知 runtime。Sink 异常后的 metadata refresh 若再次失败，core 发布 fatal，并保留原始故障与 refresh 故障；不清空不确定的 flight 后重新提交。能够恢复为 `PREPARED_RETRY` / `FINALIZING` 的普通 Sink 故障仍按原状态重试。
+
+core 只记录并抛出 fatal，不主动回调服务层。runtime 写 API 和后台 worker 的故障回调共用同一关闭入口：先保证 core 停止准入，再将 runtime 标记为 `FAILED`，由独立线程关闭资源。异常向上传播期间，health 已能通过 core fatal 状态返回不可服务。首个故障原因保持不变；已经通过提交检查的 group 可以完成，后续 group 不再进入 WAL。单个 lookup bucket 的可恢复 view 失效仍由局部 snapshot rebuild 处理。Schema 不变属于产品前置条件，不由后台任务主动监控。
 
 所有实际 Flush 或 Maintenance 动作都使用统一日志标记：
 
@@ -192,6 +200,8 @@ RUNNING
 停机不主动 Freeze、Flush 或 Sink，也不建立最终 fence。尚在 Cur/Immutable/NEW 中的数据由 WAL、本地 SST、flush boundary 与 SinkMeta 在下次启动恢复。代价是停机期间 Paimon 可见性可能暂时落后，重启 replay 可能更慢；这对单机 V1 是可接受的，并显著减少停机路径与正常调和循环的重复状态机。
 
 Scheduler `close()` 不设置内部业务超时，而是等待已经开始的单步操作完成，避免在 SST/Paimon publish 中途主动中断。部署系统应在进程级配置 shutdown grace period；超过该时间可以终止进程，恢复协议负责处理边界前后的完整状态。
+
+fatal 关闭与普通关闭共用资源清理流程，但最终状态保持 `FAILED`。资源清理由独立的关闭互斥量串行化，等待 HTTP 请求和 worker 完成时不持有 runtime 状态锁，避免关闭线程与故障上报互相等待；worker 的 fatal 回调不等待资源关闭。`/state` 发现服务不可用时只读取 runtime 和仍存在的 scheduler 信息；与 fatal 或关闭并发的快照请求可能失败，不保证跨组件快照一致或故障期间持续可读。
 
 两个 reconciliation loop 在获取 `BucketStateSnapshot` 后、选择下一动作前再次检查运行状态，以避免被慢快照阻塞的旧 worker pass 在 shutdown 后通常再启动新动作。该检查是 KISS 的 best-effort 生命周期边界，不额外引入全局 action admission lock；与检查真正并发穿过的极小窗口按已经 in-flight 处理，并由 `close()` 等待完成。
 

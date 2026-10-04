@@ -69,6 +69,7 @@ PMS V1 的测试体系需要回答三类问题：
 | Prepared/Finalizing 在线恢复 | 重试同一个 durable sink flight，不重复 prepare 或 Paimon commit |
 | Sink metadata 部分写 | 部分成功后重试，所有 SST metadata 幂等收敛 |
 | 流控水位线 | server 快速检查和 core WAL 前复查均能拒绝过载批次 |
+| Fatal 与 queued writes | WAL 写入后 roll 失败、apply 故障和后台 fatal 均阻止后续 group、完成全部等待请求；已准入 group 可正常收尾，fatal 写入失败统一为 unknown outcome，WAL 恢复不包含被拒绝请求 |
 | 本地 SST 合并与淘汰 | 只处理合法连续 run，read epoch 结束后再物理删除 |
 | SST 半删除恢复 | 可恢复合法尾部残留，保留区间内部缺口必须 fatal |
 | WAL 截断 | persisted boundary 覆盖旧 WAL 时删除，失败候选可在后续重试 |
@@ -87,6 +88,7 @@ PMS V1 的测试体系需要回答三类问题：
 | WAL/SST 恢复 | 重启后已确认写入完整且不重复提交 |
 | SinkMeta prepare/success 恢复 | 分别从 prepared payload 和 durable success 完成收敛 |
 | Recovery-first 停机 | 停止入口和 scheduler 后直接关闭，由 WAL/SST/SinkMeta 在重启时恢复 |
+| Fatal 与 health | 两个 worker 上报不可恢复故障；HTTP 关闭前两个 health 均返回 503，普通关闭与 fatal 回调并发时无互锁且保留 FAILED |
 
 ### 4.3 远端 HDFS 集成测试
 

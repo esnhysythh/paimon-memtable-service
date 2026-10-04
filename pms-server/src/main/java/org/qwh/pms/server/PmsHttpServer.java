@@ -16,7 +16,7 @@ import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.util.Callback;
-import org.qwh.pms.core.bucket.PmsFatalWriteException;
+import org.qwh.pms.core.bucket.PmsFatalException;
 import org.qwh.pms.protocol.api.PmsHandshake;
 import org.qwh.pms.protocol.api.PmsProtocolConstants;
 import org.qwh.pms.protocol.api.PmsStatus;
@@ -128,10 +128,11 @@ public final class PmsHttpServer implements AutoCloseable {
                 }
             } catch (ResponseTooLargeException e) {
                 writeErrorStatus(path, response, HttpStatus.SERVICE_UNAVAILABLE_503, PmsStatus.OVERLOADED, callback);
-            } catch (PmsFatalWriteException e) {
-                LOG.error("Fatal PMS write failure: method={}, path={}", request.getMethod(), path, e);
+            } catch (PmsFatalException e) {
+                LOG.error("Fatal PMS failure: method={}, path={}", request.getMethod(), path, e);
                 callback.failed(e);
-                runtime.failFatalAsync(e);
+            } catch (PmsServiceUnavailableException e) {
+                writeErrorStatus(path, response, HttpStatus.SERVICE_UNAVAILABLE_503, PmsStatus.SHUTTING_DOWN, callback);
             } catch (IllegalArgumentException | IOException e) {
                 LOG.warn("Bad PMS protocol request: method={}, path={}, message={}", request.getMethod(), path, e.getMessage());
                 writeErrorStatus(path, response, HttpStatus.BAD_REQUEST_400, PmsStatus.BAD_REQUEST, callback);
@@ -144,7 +145,7 @@ public final class PmsHttpServer implements AutoCloseable {
         private boolean handleJsonDebug(Request request, Response response, Callback callback, String path) {
             try {
                 switch (path) {
-                    case "/health" -> handleJson(request, response, callback, "GET", () -> ok(Map.of("status", "OK")));
+                    case "/health" -> handleJson(request, response, callback, "GET", this::health);
                     case "/write" -> handleJson(request, response, callback, "POST", () -> {
                         runtime.write(requestObject(request));
                         return ok(Map.of("status", "OK"));
@@ -209,10 +210,9 @@ public final class PmsHttpServer implements AutoCloseable {
                         return false;
                     }
                 }
-            } catch (PmsFatalWriteException e) {
-                LOG.error("Fatal PMS JSON debug write failure: method={}, path={}", request.getMethod(), path, e);
+            } catch (PmsFatalException e) {
+                LOG.error("Fatal PMS JSON debug failure: method={}, path={}", request.getMethod(), path, e);
                 callback.failed(e);
-                runtime.failFatalAsync(e);
             } catch (Exception e) {
                 LOG.error("PMS JSON debug dispatch failed: method={}, path={}", request.getMethod(), path, e);
                 writeJson(response, HttpStatus.INTERNAL_SERVER_ERROR_500, Map.of("status", "ERROR", "message", e.getMessage()), callback);
@@ -224,7 +224,13 @@ public final class PmsHttpServer implements AutoCloseable {
             if (!requireMethod(request, response, callback, "GET")) {
                 return;
             }
-            writeJsonBytes(response, HttpStatus.OK_200, "{\"status\":\"OK\"}".getBytes(StandardCharsets.UTF_8), callback);
+            writeJson(response, health(), callback);
+        }
+
+        private ResponseBody health() {
+            return runtime.isHealthy()
+                ? ok(Map.of("status", "OK"))
+                : new ResponseBody(HttpStatus.SERVICE_UNAVAILABLE_503, Map.of("status", "UNAVAILABLE"));
         }
 
         private void handleHandshake(Request request, Response response, Callback callback) {
@@ -318,7 +324,7 @@ public final class PmsHttpServer implements AutoCloseable {
                     return;
                 }
                 writeJson(response, handler.handle(), callback);
-            } catch (PmsFatalWriteException e) {
+            } catch (PmsFatalException e) {
                 throw e;
             } catch (PmsOverloadedException e) {
                 LOG.warn("PMS JSON debug write overloaded: method={}, path={}", request.getMethod(), request.getHttpURI());

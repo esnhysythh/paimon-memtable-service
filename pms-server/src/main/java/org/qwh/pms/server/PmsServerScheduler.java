@@ -13,9 +13,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.LocalRunSnapshot;
+import org.qwh.pms.core.bucket.PmsFatalException;
 import org.qwh.pms.core.bucket.SinkFlightSnapshot;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
 import org.qwh.pms.core.bucket.operation.CompactionSelection;
@@ -58,6 +60,7 @@ public final class PmsServerScheduler implements AutoCloseable {
     private final Operations operations;
     private final PmsSchedulerConfig config;
     private final Clock clock;
+    private final Consumer<Throwable> fatalFailureHandler;
     private final ScheduledExecutorService flushExecutor;
     private final ScheduledExecutorService maintenanceExecutor;
     private final AtomicBoolean flushQueuedOrRunning = new AtomicBoolean();
@@ -73,14 +76,21 @@ public final class PmsServerScheduler implements AutoCloseable {
     // 唯一跨 Operation 保留的计划状态; 零表示当前没有生效的可见性 fence.
     private final AtomicLong pendingPaimonFenceSequenceId = new AtomicLong();
 
-    public PmsServerScheduler(PmsTableService service, PmsSchedulerConfig config) {
-        this(requireService(service), config, Clock.systemUTC());
+    public PmsServerScheduler(
+            PmsTableService service, PmsSchedulerConfig config, Consumer<Throwable> fatalFailureHandler) {
+        this(requireService(service), config, Clock.systemUTC(), fatalFailureHandler);
     }
 
     PmsServerScheduler(Operations operations, PmsSchedulerConfig config, Clock clock) {
+        this(operations, config, clock, failure -> {});
+    }
+
+    PmsServerScheduler(
+            Operations operations, PmsSchedulerConfig config, Clock clock, Consumer<Throwable> fatalFailureHandler) {
         this.operations = Objects.requireNonNull(operations, "operations must not be null");
         this.config = config == null ? PmsSchedulerConfig.defaults() : config;
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.fatalFailureHandler = Objects.requireNonNull(fatalFailureHandler, "fatalFailureHandler must not be null");
         this.flushExecutor = newWorker("flush");
         this.maintenanceExecutor = newWorker("maintenance");
     }
@@ -236,6 +246,8 @@ public final class PmsServerScheduler implements AutoCloseable {
         flushRunning = true;
         try {
             reconcileFlush("IMMUTABLE_BACKLOG");
+        } catch (PmsFatalException | Error e) {
+            failFatal(e);
         } catch (RuntimeException e) {
             LOG.error("PMS Flush worker reconciliation failed; retrying on the next worker trigger", e);
         } finally {
@@ -250,11 +262,19 @@ public final class PmsServerScheduler implements AutoCloseable {
         maintenanceRunning = true;
         try {
             reconcileMaintenance();
+        } catch (PmsFatalException | Error e) {
+            failFatal(e);
         } catch (RuntimeException e) {
             LOG.error("PMS maintenance worker reconciliation failed; retrying on the next worker trigger", e);
         } finally {
             maintenanceRunning = false;
         }
+    }
+
+    private void failFatal(Throwable failure) {
+        running = false;
+        LOG.error("PMS background worker failed fatally; stopping reconciliation", failure);
+        fatalFailureHandler.accept(failure);
     }
 
     private void reconcileFlush(String reason) {

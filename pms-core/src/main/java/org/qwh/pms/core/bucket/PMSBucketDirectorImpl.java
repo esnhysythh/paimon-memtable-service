@@ -109,7 +109,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     private final Object sstMaintenanceMutex = new Object();
     private boolean writeLeaderActive;
     private volatile boolean closed = false;
-    private volatile RuntimeException fatalFailure;
+    private volatile PmsFatalException fatalFailure;
 
     public PMSBucketDirectorImpl(PMSConfig config, Function<FileLocalStorageManager, SinkManager> sinkManagerFactory) {
         Objects.requireNonNull(config, "config must not be null");
@@ -348,8 +348,8 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     public FreezeResult freezeCurMemTable() {
         lifecycleLock.readLock().lock();
         try {
-            ensureNotClosed();
             synchronized (writeMutex) {
+                ensureNotClosed();
                 return doFreezeLocked();
             }
         } finally {
@@ -454,8 +454,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                     sinkFlight = sinkFlightForCommitted(result, toSink);
                     return finalizeCommittedSink(result, toSink);
                 } catch (RuntimeException e) {
-                    refreshSinkFlightAfterFailureUnderLease();
+                    refreshSinkFlightAfterFailureUnderLease(e);
                     throw e;
+                } catch (Error e) {
+                    throw markFatal(e);
                 }
             } finally {
                 lifecycleLock.readLock().unlock();
@@ -483,8 +485,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
                         case IDLE -> SinkOperationResult.noop();
                     };
                 } catch (RuntimeException e) {
-                    refreshSinkFlightAfterFailureUnderLease();
+                    refreshSinkFlightAfterFailureUnderLease(e);
                     throw e;
+                } catch (Error e) {
+                    throw markFatal(e);
                 }
             } finally {
                 lifecycleLock.readLock().unlock();
@@ -686,30 +690,40 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
 
     private void processWriteBatch(List<WriteBatchRequest> batch) {
         Throwable failure = null;
-        boolean walAppended = false;
-        try {
-            synchronized (writeMutex) {
+        synchronized (writeMutex) {
+            try {
+                // One admission check per WAL group; already admitted groups finish under this lock.
+                ensureNotClosed();
                 rejectWriteIfOverloadedLocked();
-                List<DataWrite> writes = flattenWrites(batch);
-                long sequenceBegin = walManager.appendDataRecords(writes);
-                walAppended = true;
-                int sequenceOffset = 0;
-                for (WriteBatchRequest request : batch) {
-                    for (WriteOp op : request.ops()) {
-                        long sequenceId = sequenceBegin + sequenceOffset++;
-                        Value value = op.value() != null
-                            ? new Value(op.value(), sequenceId)
-                            : Value.tombstone(sequenceId);
-                        memTables.current().put(new Key(op.key()), value);
-                    }
-                }
-                maybeFreezeLocked();
+                commitWriteBatch(batch);
+            } catch (Throwable t) {
+                failure = t;
             }
-        } catch (Throwable t) {
-            failure = walAppended ? markFatalAfterWalAppend(t) : t;
         }
         for (WriteBatchRequest request : batch) {
             request.complete(failure);
+        }
+    }
+
+    /** Caller holds writeMutex and has passed admission checks. */
+    private void commitWriteBatch(List<WriteBatchRequest> batch) {
+        try {
+            long sequenceBegin = walManager.appendDataRecords(flattenWrites(batch));
+            int sequenceOffset = 0;
+            for (WriteBatchRequest request : batch) {
+                for (WriteOp op : request.ops()) {
+                    long sequenceId = sequenceBegin + sequenceOffset++;
+                    Value value = op.value() != null
+                        ? new Value(op.value(), sequenceId)
+                        : Value.tombstone(sequenceId);
+                    memTables.current().put(new Key(op.key()), value);
+                }
+            }
+            maybeFreezeLocked();
+        } catch (Throwable t) {
+            // WAL append can fail after writing (for example during roll). Treat the whole
+            // commit phase as uncertain instead of trying to infer how much was persisted.
+            throw markFatal(t);
         }
     }
 
@@ -754,13 +768,21 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         return count;
     }
 
-    private RuntimeException markFatalAfterWalAppend(Throwable failure) {
-        RuntimeException fatal = new PmsFatalWriteException(
-            "WAL append succeeded but MemTable apply failed; PMSBucketDirector must be restarted",
-            failure
-        );
-        fatalFailure = fatal;
-        return fatal;
+    public PmsFatalException fatalFailure() {
+        return fatalFailure;
+    }
+
+    /** Stops admission without waiting for the currently admitted WAL group or closing resources. */
+    public PmsFatalException markFatal(Throwable failure) {
+        Objects.requireNonNull(failure, "failure must not be null");
+        synchronized (writeQueueMutex) {
+            if (fatalFailure == null) {
+                String message = failure.getMessage() == null ? failure.toString() : failure.getMessage();
+                fatalFailure = failure instanceof PmsFatalException fatal
+                    ? fatal : new PmsFatalException(message, failure);
+            }
+            return fatalFailure;
+        }
     }
 
     private void collectLatestFromSSTs(TreeMap<Key, Value> latest, SSTReadSnapshot snapshot, Key start, Optional<Key> end) {
@@ -801,6 +823,19 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     /** Caller must hold a lifecycle read lease. */
+    private void refreshSinkFlightAfterFailureUnderLease(RuntimeException originalFailure) {
+        try {
+            refreshSinkFlightAfterFailureUnderLease();
+        } catch (RuntimeException | Error refreshFailure) {
+            PmsFatalException failure = new PmsFatalException(
+                "Cannot determine Sink flight state after failure; PMSBucketDirector must be restarted",
+                originalFailure
+            );
+            failure.addSuppressed(refreshFailure);
+            throw markFatal(failure);
+        }
+    }
+
     private void refreshSinkFlightAfterFailureUnderLease() {
         SinkFlightSnapshot failedFlight = sinkFlight;
         if (!failedFlight.active()) {
@@ -1248,8 +1283,9 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
     }
 
     private void ensureNotClosed() {
-        if (fatalFailure != null) {
-            throw fatalFailure;
+        PmsFatalException failure = fatalFailure;
+        if (failure != null) {
+            throw failure;
         }
         if (closed) throw new IllegalStateException("PMSBucketDirector is closed");
     }

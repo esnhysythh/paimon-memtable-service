@@ -194,8 +194,8 @@ select NEW prefix
 
 | 同步边界 | 保护内容 | 不应承担的工作 |
 |----------|----------|----------------|
-| `writeQueueMutex` | pending queue 入队、合批和 leader 交接 | WAL/MemTable 提交、等待请求完成 |
-| `writeMutex` | WAL/sequence/MemTable 提交顺序、Freeze 对象切换、写入前水位复查 | Flush/Sink/Compact/Evict IO，查询 |
+| `writeQueueMutex` | pending queue 入队、合批、leader 交接与首个 fatal 原因发布 | WAL/MemTable 提交、等待请求完成 |
+| `writeMutex` | WAL/sequence/MemTable 提交顺序、Freeze 对象切换、提交前 fatal 与水位复查 | Flush/Sink/Compact/Evict IO，查询 |
 | `sstMaintenanceMutex` | Sink、prepared retry、Compact、Evict 的互斥与稳定选择/发布 | 普通写入、lookup、scan |
 | `lifecycleLock` | close 与在途操作的生命周期互斥 | 代替数据状态发布协议 |
 | `MemTableState` | current + immutable 列表的不可变聚合视图 | 长期缓存策略 |
@@ -208,6 +208,12 @@ select NEW prefix
 apply；follower 通过每请求的 CountDownLatch 等待。自然合批只合并当时已排队的请求，不主动
 等待凑批，也不提供并行 WAL/MemTable 提交。leader 持续处理到队列清空才返回，因此它自己的
 请求即使已完成，也可能继续替其他请求工作；这会影响公平性与尾延迟。
+
+每个 WAL group 在 `writeMutex` 内读取一次 volatile `fatalFailure`，通过检查后视为在途提交。提交阶段（WAL append、MemTable apply、自动 Freeze）的任意异常均在释放该锁前发布 fatal；参数校验与过载拒绝不属于提交阶段。WAL append 可能在写入后滚动文件时抛错，因此不根据其返回与否判断写入结果。显式 Freeze 也在该锁内检查 fatal，避免冻结部分 apply 的 MemTable。外部后台故障可以直接发布 fatal，无需等待当前 group 结束或逐行检查。
+
+fatal 后 leader 继续取出 queued group，在 WAL 前拒绝并调用每个请求的 completion，直到队列清空。等待者释放其生命周期读锁后，`close()` 才能取得生命周期写锁。所有 fatal 写入失败共用 `PmsFatalException`，统一表达 unknown outcome，不细分原故障与排队拒绝；首个 fatal 原因保留至实例关闭。
+
+Director 只记录 fatal 并通过操作异常向上传播，由服务层安排关闭；core 不持有故障回调，也不依赖 server、RPC 或行编码模块。health 可直接读取 fatal 状态，无需等待写入 leader 返回。故障处理不维护额外的请求结果状态机，不保证在途请求的响应送达。
 
 当前本地写入性能满足 MVP 需求，保留串行提交实现，暂不为线性扩展指标调整提交协议。
 
@@ -244,4 +250,4 @@ apply；follower 通过每请求的 CountDownLatch 等待。自然合批只合�
 5. 若 recovered commit 推进了 `lastPersistedSequenceId`，再次幂等修正 SST 状态并执行 WAL truncate。
 6. 恢复全局 sequence 水位，并暴露 `recoveredUnpersistedData` 供调度器立即建立可见性 fence。
 
-storage recovery 只自动处理 compact 覆盖的旧输入、data-first 最老 evict 残留和尚未推进 boundary 的单 flush orphan。启动时发现保留后缀内部缺口、部分重叠、WAL/SST/SinkMeta 损坏、边界交叉或 prepared metadata 不一致，应拒绝启动；不能将已参与恢复边界的数据静默降级为 miss。运行期后台操作的普通 `RuntimeException` 由 worker 记录并在下一周期重试，积压最终通过 flow control 限制新写入。更细的运行期 fatal 分类留待取得真实故障样本后再设计。
+storage recovery 只自动处理 compact 覆盖的旧输入、data-first 最老 evict 残留和尚未推进 boundary 的单 flush orphan。启动时发现保留后缀内部缺口、部分重叠、WAL/SST/SinkMeta 损坏、边界交叉或 prepared metadata 不一致，应拒绝启动；不能将已参与恢复边界的数据静默降级为 miss。运行期后台操作的普通 `RuntimeException` 由 worker 记录并在下一周期重试，积压最终通过 flow control 限制新写入。后台 `Error`、写入提交阶段异常以及无法确定 Sink flight 的 metadata refresh 失败进入 fatal 路径，停止准入并由所属服务关闭实例。

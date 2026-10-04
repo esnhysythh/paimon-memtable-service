@@ -285,8 +285,10 @@ leader:
 - `put/delete` 是 size=1 batch 的便捷入口，不拥有独立提交语义。
 - `writeBatch` 是 external batch 边界，V1 不返回 per-record status，也不表达部分成功。
 - 若参数校验或写入水位复查在 WAL append 前失败，整批不改变本地状态；水位拒绝映射为
-  `OVERLOADED`。若 WAL append 成功后 MemTable apply 失败，PMS 应进入 fatal 路径，不能将该请求
-  伪装成普通 `acceptedCount=0` 失败。
+  `OVERLOADED`。通过准入检查后，提交阶段的任意异常均使 PMS 进入 fatal 路径。WAL append
+  抛错也可能已有数据写入，因此统一按 unknown outcome 处理，不返回普通 `acceptedCount=0` 失败。
+- fatal 在已有提交锁内按 WAL group 复查，不逐行检查。已通过检查的 group 按在途提交处理；尚未通过检查的 queued group 不再 append，leader 仍完成其全部等待请求。故障后的显式 Freeze 也受同一提交锁内的状态检查保护。
+- 故障 group 与 queued group 共用 `PmsFatalException`，对外均按 unknown outcome 处理。该策略不追踪每个请求的实际接受情况，也不保证在途请求的成功响应送达；恢复后的重试由调用方保持同一 key 的顺序。
 - 第一版不主动等待 coalesce window；leader 只 drain 当前已经排队的请求。这样单线程循环写不会因为空等聚合窗口而退化。
 - batch 内 MemTable apply 暂时保持串行。PMS 当前 MemTable 是 `userKey -> latest Value`，不是 LevelDB 的 `(userKey, sequenceId)` internal key；若并发 apply，同一 key 的低 sequence 写入可能后完成并覆盖高 sequence，造成旧值复活。
 - freeze 只在完整 batch apply 后触发，避免一个 WAL batch 被 freeze 切成半个可见边界。

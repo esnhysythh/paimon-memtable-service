@@ -5,7 +5,7 @@ import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
-import org.qwh.pms.core.bucket.PmsFatalWriteException;
+import org.qwh.pms.core.bucket.PmsFatalException;
 import org.qwh.pms.core.bucket.PmsWriteOverloadedException;
 import org.qwh.pms.protocol.api.RawKvEntry;
 import org.qwh.pms.protocol.api.RawLookupBatchResult;
@@ -19,6 +19,8 @@ public final class PmsServerRuntime implements AutoCloseable {
 
     private final PmsServerConfig config;
     private final TableServiceOpener tableServiceOpener;
+    // Resource cleanup may wait for workers; fatal publication never acquires this mutex.
+    private final Object closeMutex = new Object();
 
     private volatile PmsRuntimeStatus status = PmsRuntimeStatus.NEW;
     private volatile PmsTableService service;
@@ -50,7 +52,19 @@ public final class PmsServerRuntime implements AutoCloseable {
         this.tableServiceOpener = tableServiceOpener;
     }
 
-    public synchronized PmsServerRuntime start() throws Exception {
+    public PmsServerRuntime start() throws Exception {
+        synchronized (closeMutex) {
+            try {
+                return startServices();
+            } catch (Exception e) {
+                // Startup cleanup also releases the state monitor before waiting for requests/workers.
+                closeQuietly(this);
+                throw e;
+            }
+        }
+    }
+
+    private synchronized PmsServerRuntime startServices() throws Exception {
         if (status == PmsRuntimeStatus.RUNNING) {
             return this;
         }
@@ -59,7 +73,7 @@ public final class PmsServerRuntime implements AutoCloseable {
         }
         try {
             service = tableServiceOpener.open(config);
-            scheduler = new PmsServerScheduler(service, config.scheduler());
+            scheduler = new PmsServerScheduler(service, config.scheduler(), this::failFatalAsync);
             httpServer = new PmsHttpServer(config, this);
             startedAt = now();
             stoppingAt = null;
@@ -75,12 +89,6 @@ public final class PmsServerRuntime implements AutoCloseable {
             return this;
         } catch (Exception e) {
             markFailed(e);
-            closeQuietly(httpServer);
-            closeQuietly(scheduler);
-            closeQuietly(service);
-            httpServer = null;
-            scheduler = null;
-            service = null;
             throw e;
         }
     }
@@ -97,69 +105,76 @@ public final class PmsServerRuntime implements AutoCloseable {
     }
 
     public PmsTableService service() {
-        if (service == null) {
-            throw new IllegalStateException("PMS table service is not started");
+        PmsTableService current = service;
+        if (current == null) {
+            throw new PmsServiceUnavailableException("PMS table service is not available, status=" + status);
         }
-        return service;
+        return current;
     }
 
     public PmsTableSchema protocolTableSchema() {
-        return service().protocolTableSchema();
+        return requireRunning().protocolTableSchema();
     }
 
     public void write(Map<String, Object> rowValues) {
-        requireAcceptingWrites();
         try {
-            service().write(rowValues);
+            requireAcceptingWrites().write(rowValues);
         } catch (PmsWriteOverloadedException e) {
             throw overloaded(e);
+        } catch (PmsFatalException e) {
+            failFatalAsync(e);
+            throw e;
         }
     }
 
     public void delete(Map<String, Object> primaryKeyValues) {
-        requireAcceptingWrites();
         try {
-            service().delete(primaryKeyValues);
+            requireAcceptingWrites().delete(primaryKeyValues);
         } catch (PmsWriteOverloadedException e) {
             throw overloaded(e);
+        } catch (PmsFatalException e) {
+            failFatalAsync(e);
+            throw e;
         }
     }
 
     public void writeRawBatch(List<RawKvEntry> entries) {
-        requireAcceptingWrites();
         try {
-            service().writeRawBatch(entries);
+            requireAcceptingWrites().writeRawBatch(entries);
         } catch (PmsWriteOverloadedException e) {
             throw overloaded(e);
+        } catch (PmsFatalException e) {
+            failFatalAsync(e);
+            throw e;
         }
     }
 
     public Optional<Map<String, Object>> get(Map<String, Object> primaryKeyValues) {
-        return service().get(primaryKeyValues);
+        return requireRunning().get(primaryKeyValues);
     }
 
     public RawLookupResult getLocalRaw(byte[] key) {
-        return service().getLocalRaw(key);
+        return requireRunning().getLocalRaw(key);
     }
 
     public RawLookupResult getFullRaw(byte[] key) {
-        return service().getFullRaw(key);
+        return requireRunning().getFullRaw(key);
     }
 
     public PmsLocalLookupResult getLocal(Map<String, Object> primaryKeyValues) {
-        return service().getLocal(primaryKeyValues);
+        return requireRunning().getLocal(primaryKeyValues);
     }
 
     public List<Map<String, Object>> prefixScan(Map<String, Object> primaryKeyPrefixValues) {
-        return service().prefixScan(primaryKeyPrefixValues);
+        return requireRunning().prefixScan(primaryKeyPrefixValues);
     }
 
     public List<Map<String, Object>> prefixLocal(Map<String, Object> primaryKeyPrefixValues) {
-        return service().prefixLocal(primaryKeyPrefixValues);
+        return requireRunning().prefixLocal(primaryKeyPrefixValues);
     }
 
     public RawLookupBatchResult prefixLocalRaw(byte[] prefix) {
-        return service().prefixLocalRaw(prefix, config.protocol().maxBatchEntries());
+        return requireRunning().prefixLocalRaw(prefix, config.protocol().maxBatchEntries());
     }
 
     public long flush() {
@@ -173,10 +188,14 @@ public final class PmsServerRuntime implements AutoCloseable {
     }
 
     public Map<String, Object> state() {
-        Map<String, Object> result = service == null ? new LinkedHashMap<>() : new LinkedHashMap<>(service.state());
+        PmsTableService current = service;
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (status == PmsRuntimeStatus.RUNNING && current != null && current.fatalFailure() == null) {
+            result.putAll(current.state());
+        }
         Map<String, Object> runtime = new LinkedHashMap<>();
         runtime.put("status", status.name());
-        runtime.put("acceptingWrites", acceptingWrites());
+        runtime.put("acceptingWrites", isHealthy());
         runtime.put("startedAt", startedAt);
         runtime.put("stoppingAt", stoppingAt);
         runtime.put("stoppedAt", stoppedAt);
@@ -184,74 +203,72 @@ public final class PmsServerRuntime implements AutoCloseable {
         runtime.put("lastFailureMessage", lastFailureMessage);
         runtime.put("recovery", recoverySummary);
         result.put("runtime", runtime);
-        if (scheduler != null) {
-            result.put("scheduler", scheduler.state());
+        PmsServerScheduler currentScheduler = scheduler;
+        if (currentScheduler != null) {
+            result.put("scheduler", currentScheduler.state());
         }
         return result;
     }
 
     @Override
-    public synchronized void close() throws Exception {
-        if (status == PmsRuntimeStatus.STOPPED || status == PmsRuntimeStatus.NEW) {
-            return;
-        }
-        if (status == PmsRuntimeStatus.FAILED) {
-            closeAfterFatal();
-            return;
-        }
-        LOG.info("PMS server runtime shutdown requested, status={}", status);
-        status = PmsRuntimeStatus.SHUTTING_DOWN;
-        stoppingAt = now();
-        Exception failure = null;
-
-        closeQuietly(httpServer);
-        httpServer = null;
-
-        if (scheduler != null) {
+    public void close() throws Exception {
+        synchronized (closeMutex) {
+            synchronized (this) {
+                if (status == PmsRuntimeStatus.STOPPED || status == PmsRuntimeStatus.NEW) {
+                    return;
+                }
+                LOG.info("PMS server runtime shutdown requested, status={}", status);
+                if (status != PmsRuntimeStatus.FAILED) {
+                    status = PmsRuntimeStatus.SHUTTING_DOWN;
+                    stoppingAt = now();
+                }
+            }
+            closeQuietly(httpServer);
+            httpServer = null;
             closeQuietly(scheduler);
             scheduler = null;
-        }
 
-        if (service != null) {
             try {
-                service.close();
-            } catch (Exception e) {
-                if (failure == null) {
-                    failure = e;
-                } else {
-                    failure.addSuppressed(e);
+                if (service != null) {
+                    service.close();
                 }
-                markFailed(e);
+            } catch (Exception e) {
+                synchronized (this) {
+                    markFailed(e);
+                }
+                throw e;
             } finally {
                 service = null;
             }
+            synchronized (this) {
+                if (status != PmsRuntimeStatus.FAILED) {
+                    status = PmsRuntimeStatus.STOPPED;
+                    stoppedAt = now();
+                }
+            }
+            LOG.info("PMS server runtime shutdown completed, status={}", status);
         }
-
-        if (failure != null) {
-            throw failure;
-        }
-        status = PmsRuntimeStatus.STOPPED;
-        stoppedAt = now();
-        LOG.info("PMS server runtime shutdown completed");
     }
 
-    private boolean acceptingWrites() {
-        return status == PmsRuntimeStatus.RUNNING;
+    public boolean isHealthy() {
+        PmsTableService current = service;
+        return status == PmsRuntimeStatus.RUNNING && current != null && current.fatalFailure() == null;
     }
 
-    private void requireAcceptingWrites() {
-        if (!acceptingWrites()) {
-            throw new PmsServiceUnavailableException("PMS server is not accepting writes, status=" + status);
-        }
-        if (service().isWriteOverloaded()) {
+    private PmsTableService requireAcceptingWrites() {
+        PmsTableService current = requireRunning();
+        if (current.isWriteOverloaded()) {
             throw new PmsOverloadedException("PMS write backlog reached the configured overload watermark");
         }
+        return current;
     }
 
-    private void requireRunning() {
-        if (service == null || status != PmsRuntimeStatus.RUNNING) {
+    private PmsTableService requireRunning() {
+        PmsTableService current = service;
+        if (status != PmsRuntimeStatus.RUNNING || current == null || current.fatalFailure() != null) {
             throw new PmsServiceUnavailableException("PMS server is not running, status=" + status);
         }
+        return current;
     }
 
     private static PmsOverloadedException overloaded(PmsWriteOverloadedException cause) {
@@ -259,16 +276,21 @@ public final class PmsServerRuntime implements AutoCloseable {
     }
 
     private PmsServerScheduler scheduler() {
-        if (scheduler == null) {
+        PmsServerScheduler current = scheduler;
+        if (current == null) {
             throw new PmsServiceUnavailableException("PMS server scheduler is not available, status=" + status);
         }
-        return scheduler;
+        return current;
     }
 
-    void failFatalAsync(PmsFatalWriteException failure) {
+    void failFatalAsync(Throwable failure) {
         synchronized (this) {
             if (status == PmsRuntimeStatus.FAILED || status == PmsRuntimeStatus.STOPPED) {
                 return;
+            }
+            PmsTableService current = service;
+            if (current != null) {
+                failure = current.markFatal(failure);
             }
             markFailed(failure);
         }
@@ -277,23 +299,17 @@ public final class PmsServerRuntime implements AutoCloseable {
         cleanup.start();
     }
 
-    private synchronized void closeAfterFatal() {
-        if (status != PmsRuntimeStatus.FAILED) {
-            return;
-        }
-        LOG.error("PMS server runtime is stopping after a fatal write failure: {}", lastFailureMessage);
-        closeQuietly(httpServer);
-        httpServer = null;
-        closeQuietly(scheduler);
-        scheduler = null;
-        closeQuietly(service);
-        service = null;
+    private void closeAfterFatal() {
+        LOG.error("PMS server runtime is stopping after a fatal failure: {}", lastFailureMessage);
+        closeQuietly(this);
     }
 
     private void markFailed(Throwable e) {
-        status = PmsRuntimeStatus.FAILED;
-        failedAt = now();
-        lastFailureMessage = e.getMessage();
+        if (status != PmsRuntimeStatus.FAILED) {
+            failedAt = now();
+            lastFailureMessage = e.getMessage();
+            status = PmsRuntimeStatus.FAILED;
+        }
     }
 
     private static void closeQuietly(AutoCloseable closeable) {

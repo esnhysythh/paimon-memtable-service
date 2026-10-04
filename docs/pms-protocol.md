@@ -129,12 +129,16 @@ snapshot，不承担运行期 Schema 监控。后续版本再考虑程序化检�
 | 1 | `BAD_REQUEST` | 请求格式或 endpoint 语义错误 |
 | 2 | `OVERLOADED` | server 过载，写入或查询被拒绝 |
 | 3 | `SCHEMA_MISMATCH` | schema 不匹配的防御性保留状态；出现时调用方应停止使用当前部署 |
-| 4 | `SHUTTING_DOWN` | server 正在停机 |
+| 4 | `SHUTTING_DOWN` | server 正在停机或已因 fatal 停止服务，请求未获准执行 |
 | 5 | `INTERNAL_ERROR` | server 内部错误 |
 | 6 | `LOOKUP_UNAVAILABLE` | 完整表点查无法证明结果正确，可重试 |
 
 `LOOKUP_UNAVAILABLE` 是 PMS 主项目相对 protocol-demo 的收口修正。`pms-lookup-paimon`
 的 `UNKNOWN` 必须映射为该状态或等价可重试错误，不能降级为 `MISS`。
+
+写入提交阶段的任意异常均使 core 进入 fatal。触发故障和因 fatal 被拒绝的排队写入统一按 unknown outcome 处理，server 使该 HTTP 请求失败，不返回正常的 `WriteResult`。仅在 runtime 入口明确未获准执行的新请求返回 `SHUTTING_DOWN` / `acceptedCount=0`。
+
+`GET /pms/api/v1/health` 与 JSON `GET /health` 在 runtime 为 `RUNNING` 且 core 未进入 fatal 时返回 HTTP 200 / `{"status":"OK"}`，其他状态返回 HTTP 503 / `{"status":"UNAVAILABLE"}`。health 不执行存储探测，过载由业务响应表达。
 
 `LookupResultType` 只表示 `status = OK` 时的每个 key 查询结果：
 
@@ -191,15 +195,17 @@ v1 decoder 必须：
 
 v1 采用整批语义：
 
-- 请求格式错误、过载、停机或内部错误：整批失败，`acceptedCount = 0`。
+- 请求格式错误、过载或 runtime 入口停机拒绝：整批未接受，`acceptedCount = 0`。
+- 普通内部错误：`INTERNAL_ERROR` / `acceptedCount = 0`，client 不据此自动重试。
 - 成功：整批成功，`acceptedCount = recordCount`。
 - v1 不使用 `acceptedCount` 表达部分成功。
+- fatal：HTTP 请求失败，没有正常 `WriteResult`，整批结果未知。
 
 PMS core 已提供 `writeBatch(List<WriteOp>)`，server adapter 将一个
 `RecordBatch` 映射成一次 core batch 写入：WAL 整体写入，memTable 按 batch 内顺序
-apply。若 WAL 成功后 apply 失败，server 不应返回普通非 `OK` 掩盖状态；当前 PMS
-core 抛出专用 fatal 异常，server runtime 进入 `FAILED` 并停止服务，当前请求通过断连暴露
-unknown outcome。
+apply。WAL append 即使抛错，也可能已有数据写入；提交阶段异常统一抛出
+`PmsFatalException`，server runtime 进入 `FAILED` 并停止服务。原故障与排队拒绝不作
+结果分类，均通过 HTTP 请求失败暴露 unknown outcome，恢复后的重试需由调用方保持同一 key 的顺序。
 
 ## 8. KeyBatch 与查询响应
 

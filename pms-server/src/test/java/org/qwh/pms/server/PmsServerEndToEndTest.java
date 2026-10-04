@@ -17,7 +17,8 @@ import org.qwh.pms.client.PmsRawClient;
 import org.qwh.pms.codec.PmsPrimaryKeyCodec;
 import org.qwh.pms.codec.PmsRowValueCodec;
 import org.qwh.pms.core.bucket.PMSBucketDirector;
-import org.qwh.pms.core.bucket.PmsFatalWriteException;
+import org.qwh.pms.core.bucket.PmsFatalException;
+import org.qwh.pms.core.memtable.CurMemTable;
 import org.qwh.pms.core.bucket.SinkFlightSnapshot;
 import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
@@ -813,7 +814,7 @@ class PmsServerEndToEndTest {
             PmsServerRuntime runtime = server.runtime();
 
             runtime.failFatalAsync(
-                new PmsFatalWriteException("injected fatal write", new IOException("apply failed"))
+                new PmsFatalException("injected fatal write", new IOException("apply failed"))
             );
 
             waitUntil(() -> runtime.status() == PmsRuntimeStatus.FAILED && httpServerStopped(runtime));
@@ -821,6 +822,115 @@ class PmsServerEndToEndTest {
             @SuppressWarnings("unchecked")
             Map<String, Object> runtimeState = (Map<String, Object>) runtime.state().get("runtime");
             assertEquals("injected fatal write", runtimeState.get("lastFailureMessage"));
+        }
+    }
+
+    @Test
+    void fatalStateRejectsBothHealthEndpointsAndReadsBeforeHttpCloses() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
+            PmsServerRuntime runtime = server.runtime();
+            PmsTableService service = runtime.service();
+            var closeMutex = PmsServerRuntime.class.getDeclaredField("closeMutex");
+            closeMutex.setAccessible(true);
+            synchronized (closeMutex.get(runtime)) {
+                assertEquals(200, server.getResult("/health").statusCode());
+                assertEquals(200, server.getResult(PmsProtocolConstants.API_PREFIX + "/health").statusCode());
+                synchronized (runtime) {
+                    // Hold runtime publication back to exercise the gap before fatal propagates.
+                    service.markFatal(new AssertionError("injected background fatal"));
+                    assertEquals(PmsRuntimeStatus.RUNNING, runtime.status());
+                    assertEquals(503, server.getResult("/health").statusCode());
+                    assertEquals(503, server.getResult(PmsProtocolConstants.API_PREFIX + "/health").statusCode());
+                    runtime.failFatalAsync(service.fatalFailure());
+                }
+                runtime.failFatalAsync(new AssertionError("later failure"));
+
+                assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
+                assertFalse(runtime.isHealthy());
+                assertNotNull(service.fatalFailure());
+                assertEquals("injected background fatal", service.fatalFailure().getMessage());
+                assertEquals(503, server.getResult("/health").statusCode());
+                assertEquals(503, server.getResult(PmsProtocolConstants.API_PREFIX + "/health").statusCode());
+                assertEquals(503, server.postResult("/get", "{\"id\":1}").statusCode());
+                assertEquals(503, server.postResult("/write", "{\"id\":1,\"marker\":\"rejected\"}").statusCode());
+                PmsRuntimeRawKvStore rawStore = new PmsRuntimeRawKvStore(runtime);
+                assertEquals(PmsStatus.SHUTTING_DOWN, rawStore.put(new byte[]{1}, new byte[]{2}));
+                assertEquals(PmsStatus.SHUTTING_DOWN, rawStore.getLocal(new byte[]{1}).status());
+                @SuppressWarnings("unchecked")
+                Map<String, Object> state = (Map<String, Object>) runtime.state().get("runtime");
+                assertEquals("injected background fatal", state.get("lastFailureMessage"));
+            }
+            runtime.close();
+            assertTrue(httpServerStopped(runtime));
+        }
+    }
+
+    @Test
+    void writeFailureReachesRuntimeWithoutHttpAndKeepsUnknownOutcome() throws Exception {
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema()).start()) {
+            PmsServerRuntime runtime = server.runtime();
+            var directorField = PmsTableService.class.getDeclaredField("director");
+            directorField.setAccessible(true);
+            Object director = directorField.get(runtime.service());
+            var stateField = director.getClass().getDeclaredField("memTables");
+            stateField.setAccessible(true);
+            Object state = stateField.get(director);
+            var current = state.getClass().getDeclaredMethod("current");
+            current.setAccessible(true);
+            // Seal the current table to fail its next apply after WAL append, without production hooks.
+            ((CurMemTable) current.invoke(state)).freeze();
+            PmsRuntimeRawKvStore rawStore = new PmsRuntimeRawKvStore(runtime);
+            assertThrows(PmsFatalException.class, () -> rawStore.put(new byte[]{1}, new byte[]{2}));
+            assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
+            runtime.close();
+        }
+    }
+
+    @Test
+    void backgroundFatalDuringNormalCloseDoesNotDeadlockOrOverwriteFailedState() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AssertionError failure = new AssertionError("injected Sink error during close");
+        try (PMSTestServer server = PMSTestServer.create(tempDir, schema());
+             PmsServerRuntime runtime = new PmsServerRuntime(server.config(), (table, user, storage) -> new SinkManager() {
+                 @Override
+                 public PreparedSinkCommit prepare(SinkBatch batch) {
+                     entered.countDown();
+                     try {
+                         assertTrue(release.await(5, TimeUnit.SECONDS));
+                     } catch (InterruptedException e) {
+                         throw new AssertionError(e);
+                     }
+                     throw failure;
+                 }
+
+                 @Override
+                 public SinkCommitResult commit(PreparedSinkCommit prepared) {
+                     throw new AssertionError("commit must not run");
+                 }
+             }).start()) {
+            var executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+            try {
+                runtime.write(Map.of("id", 1, "marker", "before-fatal"));
+                runtime.sink();
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                var closing = executor.submit(() -> {
+                    runtime.close();
+                    return null;
+                });
+                waitUntil(() -> runtime.status() == PmsRuntimeStatus.SHUTTING_DOWN);
+                release.countDown();
+                closing.get(5, TimeUnit.SECONDS);
+                assertEquals(PmsRuntimeStatus.FAILED, runtime.status());
+                assertFalse(runtime.isHealthy());
+                @SuppressWarnings("unchecked")
+                Map<String, Object> state = (Map<String, Object>) runtime.state().get("runtime");
+                assertEquals(failure.getMessage(), state.get("lastFailureMessage"));
+            } finally {
+                release.countDown();
+                executor.shutdownNow();
+                assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            }
         }
     }
 

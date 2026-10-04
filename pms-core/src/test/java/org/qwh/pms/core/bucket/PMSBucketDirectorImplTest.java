@@ -12,6 +12,9 @@ import org.qwh.pms.core.bucket.operation.SinkOperationResult;
 import org.qwh.pms.core.bucket.operation.SinkSelection;
 import org.qwh.pms.core.config.*;
 import org.qwh.pms.core.memtable.model.Entry;
+import org.qwh.pms.core.memtable.CurMemTable;
+import org.qwh.pms.core.memtable.SkipListCurMemTable;
+import org.qwh.pms.core.memtable.model.Key;
 import org.qwh.pms.core.memtable.model.Value;
 import org.qwh.pms.core.sink.PreparedSinkCommit;
 import org.qwh.pms.core.sink.SinkBatch;
@@ -34,6 +37,10 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -85,6 +92,176 @@ class PMSBucketDirectorImplTest {
     }
 
     // ── Write path ──
+
+    @Test
+    void walRollFailureStopsServingEvenWhenAppendDidNotReturn() throws Exception {
+        PMSConfig base = config(1_000_000, 256);
+        PMSConfig cfg = new PMSConfig(
+            base.memtable(), new WalConfig(base.wal().dir(), 1, false),
+            base.storage(), base.sink(), base.flowcontrol(), base.paimon()
+        );
+        byte[] key = "k1".getBytes();
+        byte[] value = new byte[1024 * 1024];
+        Path blockedRoll = tempDir.resolve("wal/wal-000002.log");
+        PMSBucketDirectorImpl dir = newDirector(cfg);
+        dir.init();
+        try {
+            // The DATA record is written to file 1 before opening file 2 fails.
+            Files.createDirectory(blockedRoll);
+            PmsFatalException failure = assertThrows(PmsFatalException.class, () -> dir.put(key, value));
+            assertEquals("WAL roll failed", failure.getCause().getMessage());
+            assertSame(failure, dir.fatalFailure());
+            assertSame(failure, assertThrows(PmsFatalException.class,
+                () -> dir.put("rejected".getBytes(), value)));
+            assertThrows(PmsFatalException.class, dir::freezeCurMemTable);
+        } finally {
+            dir.close();
+        }
+        Files.delete(blockedRoll);
+        PMSBucketDirectorImpl recovered = newDirector(cfg);
+        recovered.init();
+        try {
+            assertEquals(1L, recovered.stateSnapshot().lastAssignedSequenceId());
+            assertArrayEquals(value, recovered.get(key).orElseThrow());
+            assertTrue(recovered.get("rejected".getBytes()).isEmpty());
+        } finally {
+            recovered.close();
+        }
+    }
+
+    @Test
+    void fatalApplyRejectsQueuedGroupsCompletesWaitersAndRecoversWal() throws Exception {
+        assertFatalWithQueuedWrites(true);
+    }
+
+    @Test
+    void backgroundFatalAllowsAdmittedGroupToFinishButRejectsQueuedGroups() throws Exception {
+        assertFatalWithQueuedWrites(false);
+    }
+
+    private void assertFatalWithQueuedWrites(boolean failApply) throws Exception {
+        PMSConfig cfg = config(1_000_000, 256);
+        PMSBucketDirectorImpl dir = newDirector(cfg);
+        dir.init();
+        CountDownLatch applying = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        RuntimeException applyFailure = new IllegalStateException("injected MemTable apply failure");
+        var memTable = new SkipListCurMemTable(cfg.memtable()) {
+            @Override
+            public void put(Key key, Value value) {
+                super.put(key, value);
+                applying.countDown();
+                try {
+                    assertTrue(release.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+                if (failApply) {
+                    throw applyFailure;
+                }
+            }
+        };
+        Field stateField = PMSBucketDirectorImpl.class.getDeclaredField("memTables");
+        stateField.setAccessible(true);
+        var constructor = stateField.getType().getDeclaredConstructor(CurMemTable.class, List.class);
+        constructor.setAccessible(true);
+        stateField.set(dir, constructor.newInstance(memTable, List.of()));
+        var executor = Executors.newFixedThreadPool(4);
+        try {
+            Future<?> first = executor.submit(() -> dir.writeBatch(List.of(
+                WriteOp.put("k1".getBytes(), "v1".getBytes()),
+                WriteOp.put("k2".getBytes(), "v2".getBytes())
+            )));
+            assertTrue(applying.await(5, TimeUnit.SECONDS));
+            Future<?> second = executor.submit(() -> dir.put("queued1".getBytes(), "v".getBytes()));
+            Future<?> third = executor.submit(() -> dir.put("queued2".getBytes(), "v".getBytes()));
+            awaitQueuedWrites(dir, 2);
+            if (!failApply) {
+                var failure = dir.markFatal(new AssertionError("injected worker error"));
+                assertSame(failure, dir.markFatal(new AssertionError("later failure")));
+            }
+            Future<?> close = executor.submit(dir::close);
+            release.countDown();
+            if (failApply) {
+                Throwable failure = assertThrows(ExecutionException.class,
+                    () -> first.get(5, TimeUnit.SECONDS)).getCause();
+                assertSame(dir.fatalFailure(), failure);
+                assertSame(applyFailure, failure.getCause());
+            } else {
+                first.get(5, TimeUnit.SECONDS);
+            }
+            for (Future<?> queued : List.of(second, third)) {
+                Throwable failure = assertThrows(ExecutionException.class,
+                    () -> queued.get(5, TimeUnit.SECONDS)).getCause();
+                assertSame(dir.fatalFailure(), failure);
+            }
+            close.get(5, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            dir.close();
+        }
+        PMSBucketDirectorImpl recovered = newDirector(cfg);
+        recovered.init();
+        try {
+            assertEquals(2L, recovered.stateSnapshot().lastAssignedSequenceId());
+            assertArrayEquals("v1".getBytes(), recovered.get("k1".getBytes()).orElseThrow());
+            assertArrayEquals("v2".getBytes(), recovered.get("k2".getBytes()).orElseThrow());
+            assertTrue(recovered.get("queued1".getBytes()).isEmpty());
+            assertTrue(recovered.get("queued2".getBytes()).isEmpty());
+        } finally {
+            recovered.close();
+        }
+    }
+
+    private static void awaitQueuedWrites(PMSBucketDirectorImpl dir, int count) throws Exception {
+        Field mutexField = PMSBucketDirectorImpl.class.getDeclaredField("writeQueueMutex");
+        Field queueField = PMSBucketDirectorImpl.class.getDeclaredField("pendingWrites");
+        mutexField.setAccessible(true);
+        queueField.setAccessible(true);
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+            while (true) {
+                synchronized (mutexField.get(dir)) {
+                    if (((java.util.Deque<?>) queueField.get(dir)).size() == count) {
+                        return;
+                    }
+                }
+                Thread.sleep(1);
+            }
+        });
+    }
+
+    @Test
+    void sinkMetadataRefreshFailureStopsServingAndPreservesBothCauses() throws Exception {
+        RuntimeException original = new IllegalStateException("prepare failed");
+        SinkManager sinkManager = new MockSinkManager() {
+            @Override
+            public PreparedSinkCommit prepare(SinkBatch batch) {
+                try {
+                    Files.writeString(tempDir.resolve("storage/sink/broken.prepare.json"), "invalid");
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+                throw original;
+            }
+        };
+        PMSBucketDirectorImpl dir = newDirector(config(1_000_000, 256), sinkManager);
+        dir.init();
+        try {
+            flushEntry(dir, "k1", "v1");
+            PmsFatalException failure = assertThrows(PmsFatalException.class,
+                () -> dir.sinkToPaimon(allAvailableSinkSelection()));
+            assertSame(original, failure.getCause());
+            assertEquals(1, failure.getSuppressed().length);
+            assertSame(dir.fatalFailure(), failure);
+            assertThrows(PmsFatalException.class, () -> dir.put("k2".getBytes(), "v2".getBytes()));
+            assertThrows(PmsFatalException.class, () -> dir.get("k1".getBytes()));
+            assertThrows(PmsFatalException.class, dir::freezeCurMemTable);
+        } finally {
+            dir.close();
+        }
+    }
 
     @Test
     void putAndGet() throws IOException {

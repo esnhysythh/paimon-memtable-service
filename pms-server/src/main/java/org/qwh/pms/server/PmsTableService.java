@@ -42,6 +42,7 @@ import org.qwh.pms.lookup.view.LiveFileIndex;
 import org.qwh.pms.core.bucket.BucketStateSnapshot;
 import org.qwh.pms.core.bucket.PMSBucketDirector.WriteOp;
 import org.qwh.pms.core.bucket.PMSBucketDirectorImpl;
+import org.qwh.pms.core.bucket.PmsFatalException;
 import org.qwh.pms.core.bucket.RecoverySummary;
 import org.qwh.pms.core.bucket.operation.CompactionResult;
 import org.qwh.pms.core.bucket.operation.CompactionSelection;
@@ -204,6 +205,14 @@ public final class PmsTableService implements PmsServerScheduler.Operations, Aut
             .toList();
         director.writeBatch(ops);
         LOG.debug("Wrote raw batch to PMS: recordCount={}", entries.size());
+    }
+
+    public PmsFatalException fatalFailure() {
+        return director.fatalFailure();
+    }
+
+    public PmsFatalException markFatal(Throwable failure) {
+        return director.markFatal(failure);
     }
 
     public boolean isWriteOverloaded() {

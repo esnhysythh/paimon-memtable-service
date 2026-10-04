@@ -50,6 +50,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 | 并发模型 | 写入路径保持短临界区以对齐 WAL 顺序、MemTable 可见顺序和 sequence 边界；Freeze 使用对象切换；SST 查询通过 read epoch 快照隔离 compact/evict；慢 IO 不持写入锁 | [pms-core.md](docs/pms-core.md) § 5 |
 | 后台调度 | Flush 与 Maintenance 两个单线程 worker；按 Paimon 可见性 fence 和 NEW/SINKED 数量水位执行单步调和 | [pms-server.md](docs/pms-server.md) § 2.4 |
 | 停机 | 进入 `SHUTTING_DOWN` 后停止接收请求并关闭 scheduler，不强制 Freeze/Flush/Sink；未下沉数据由 WAL、本地 SST 和 SinkMeta 在下次启动恢复 | [pms-server.md](docs/pms-server.md) § 2.5 |
+| Fatal 与健康状态 | 写入提交异常或不可恢复后台故障停止 core 后续提交，runtime 进入 `FAILED` 并异步关闭；排队写入全部完成通知，fatal 写入失败统一为 unknown outcome，health 返回不可服务 | [pms-server.md](docs/pms-server.md) § 2.4.6 / [pms-core-bucket-director.md](docs/pms-core-bucket-director.md) § 5 |
 
 > **后续演进**：双盘 WAL（主盘 + 备盘同步写、互恢复）作为后续演进方向，V1 不实现。
 
