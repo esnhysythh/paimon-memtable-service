@@ -1,7 +1,6 @@
 package org.qwh.pms.core.wal;
 
 import org.qwh.pms.core.wal.util.ByteBufferSupport;
-import org.qwh.pms.core.wal.util.Closeables;
 import org.qwh.pms.core.wal.util.Slice;
 import org.qwh.pms.core.wal.util.SliceInput;
 import org.qwh.pms.core.wal.util.SliceOutput;
@@ -9,10 +8,10 @@ import org.qwh.pms.core.wal.util.Slices;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
+import java.nio.file.StandardOpenOption;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.qwh.pms.core.wal.LogConstants.BLOCK_SIZE;
@@ -42,8 +41,18 @@ public class MMapLogWriter
         if (fileNumber < 0) throw new IllegalArgumentException("fileNumber is negative");
         this.file = file;
         this.fileNumber = fileNumber;
-        this.fileChannel = new RandomAccessFile(file, "rw").getChannel();
-        mappedByteBuffer = fileChannel.map(MapMode.READ_WRITE, 0, PAGE_SIZE);
+        this.fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.CREATE_NEW,
+            StandardOpenOption.READ, StandardOpenOption.WRITE);
+        try {
+            mappedByteBuffer = fileChannel.map(MapMode.READ_WRITE, 0, PAGE_SIZE);
+        } catch (IOException | RuntimeException e) {
+            try {
+                fileChannel.close();
+            } catch (IOException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
     }
 
     @Override
@@ -56,26 +65,12 @@ public class MMapLogWriter
     public synchronized void close()
             throws IOException
     {
-        closed.set(true);
+        if (!closed.compareAndSet(false, true)) return;
 
-        destroyMappedByteBuffer();
-
-        if (fileChannel.isOpen()) {
+        try (fileChannel) {
+            destroyMappedByteBuffer();
             fileChannel.truncate(fileOffset);
         }
-
-        // close the channel
-        Closeables.closeQuietly(fileChannel);
-    }
-
-    @Override
-    public synchronized void delete()
-            throws IOException
-    {
-        close();
-
-        // try to delete the file
-        file.delete();
     }
 
     private void destroyMappedByteBuffer()

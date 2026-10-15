@@ -5,7 +5,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.GatheringByteChannel;
 import java.nio.charset.Charset;
 
 public final class SliceInput
@@ -179,14 +178,6 @@ public final class SliceInput
         int length = destination.remaining();
         slice.getBytes(position, destination);
         position += length;
-    }
-
-    public int readBytes(GatheringByteChannel out, int length)
-            throws IOException
-    {
-        int readBytes = slice.getBytes(position, out, length);
-        position += readBytes;
-        return readBytes;
     }
 
     public void readBytes(OutputStream out, int length)

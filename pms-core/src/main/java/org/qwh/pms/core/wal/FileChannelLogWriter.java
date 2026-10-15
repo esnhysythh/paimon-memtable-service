@@ -1,17 +1,15 @@
 package org.qwh.pms.core.wal;
 
-import org.qwh.pms.core.wal.util.Closeables;
 import org.qwh.pms.core.wal.util.Slice;
 import org.qwh.pms.core.wal.util.SliceInput;
 import org.qwh.pms.core.wal.util.SliceOutput;
 import org.qwh.pms.core.wal.util.Slices;
 
 import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.qwh.pms.core.wal.LogConstants.BLOCK_SIZE;
@@ -31,14 +29,21 @@ public class FileChannelLogWriter
     private int blockOffset;
 
     public FileChannelLogWriter(File file, long fileNumber)
-            throws FileNotFoundException
+            throws IOException
     {
         if (file == null) throw new NullPointerException("file is null");
         if (fileNumber < 0) throw new IllegalArgumentException("fileNumber is negative");
 
         this.file = file;
         this.fileNumber = fileNumber;
-        this.fileChannel = new FileOutputStream(file).getChannel();
+        this.fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+    }
+
+    FileChannelLogWriter(File file, long fileNumber, FileChannel channel)
+    {
+        this.file = file;
+        this.fileNumber = fileNumber;
+        this.fileChannel = channel;
     }
 
     @Override
@@ -49,30 +54,12 @@ public class FileChannelLogWriter
 
     @Override
     public synchronized void close()
+            throws IOException
     {
-        closed.set(true);
-
-        // try to forces the log to disk
-        try {
+        if (!closed.compareAndSet(false, true)) return;
+        try (fileChannel) {
             fileChannel.force(true);
         }
-        catch (IOException ignored) {
-        }
-
-        // close the channel
-        Closeables.closeQuietly(fileChannel);
-    }
-
-    @Override
-    public synchronized void delete()
-    {
-        closed.set(true);
-
-        // close the channel
-        Closeables.closeQuietly(fileChannel);
-
-        // try to delete the file
-        file.delete();
     }
 
     @Override
@@ -111,7 +98,7 @@ public class FileChannelLogWriter
                 if (bytesRemainingInBlock > 0) {
                     // Fill the rest of the block with zeros
                     // todo lame... need a better way to write zeros
-                    fileChannel.write(ByteBuffer.allocate(bytesRemainingInBlock));
+                    writeFully(ByteBuffer.allocate(bytesRemainingInBlock));
                 }
                 blockOffset = 0;
                 bytesRemainingInBlock = BLOCK_SIZE - blockOffset;
@@ -171,10 +158,19 @@ public class FileChannelLogWriter
         Slice header = newLogRecordHeader(type, slice, slice.length());
 
         // write the header and the payload
-        header.getBytes(0, fileChannel, header.length());
-        slice.getBytes(0, fileChannel, slice.length());
+        writeFully(header.toByteBuffer());
+        writeFully(slice.toByteBuffer());
 
         blockOffset += HEADER_SIZE + slice.length();
+    }
+
+    private void writeFully(ByteBuffer buffer) throws IOException
+    {
+        while (buffer.hasRemaining()) {
+            if (fileChannel.write(buffer) <= 0) {
+                throw new IOException("WAL write made no progress");
+            }
+        }
     }
 
     private Slice newLogRecordHeader(LogChunkType type, Slice slice, int length)

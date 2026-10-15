@@ -1,5 +1,6 @@
 package org.qwh.pms.core.wal;
 
+import java.io.IOException;
 import java.util.List;
 
 public interface WALManager {
@@ -10,7 +11,7 @@ public interface WALManager {
 
     long lastSequenceId();
 
-    void replay(ReplayCallback callback);
+    void recover(long durableSequenceId, ReplayCallback callback) throws IOException;
 
     void truncate(long safeSequenceId);
 

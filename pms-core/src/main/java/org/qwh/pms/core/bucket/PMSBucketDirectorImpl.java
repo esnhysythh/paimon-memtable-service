@@ -135,8 +135,7 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         SinkRecoveryState initialSink = sinkMetaStore.load();
         validateSinglePendingPrepare(initialSink);
         storageManager.init(initialSink.lastPersistedSequenceId());
-        walManager.init();
-        RecoveryState recoveryState = recoverFromWAL();
+        RecoveryState recoveryState = recoverFromWAL(initialSink.lastPersistedSequenceId());
         sinkFlight = sinkFlightFromRecovery(initialSink);
         SinkRecoveryState recoveredSink = recoverPreparedSinks(initialSink);
         storageManager.applyPersistedSequenceId(recoveredSink.lastPersistedSequenceId());
@@ -167,10 +166,10 @@ public class PMSBucketDirectorImpl implements PMSBucketDirector {
         LOG.info("PMSBucketDirector initialized, curMemTable entries={}", memTables.current().estimatedEntryCount());
     }
 
-    private RecoveryState recoverFromWAL() {
+    private RecoveryState recoverFromWAL(long lastPersistedSequenceId) throws IOException {
         long lastFlushedSequenceId = storageManager.lastFlushedSequenceId();
         CollectingReplayCallback cb = new CollectingReplayCallback(lastFlushedSequenceId);
-        walManager.replay(cb);
+        walManager.recover(Math.max(lastFlushedSequenceId, lastPersistedSequenceId), cb);
 
         for (var record : cb.dataRecords) {
             Key key = new Key(record.key);

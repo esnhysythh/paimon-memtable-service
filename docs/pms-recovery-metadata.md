@@ -1,19 +1,8 @@
 # PMS Recovery Metadata 设计文档
 
-## 1. 背景
+## 1. 职责划分
 
-旧实现中，PMS 的恢复元信息分散在不同位置：
-
-- 数据变更写入 WAL 的 `DATA` 记录。
-- Sink Paimon 的 prepare/success 也写入 WAL。
-- Flush SST 的本地恢复边界写入 `storage/flush-boundary.meta`。
-- SST 是否已经 sinked 由 success metadata 推导，并写回 SST metadata state。
-
-这套实现可以工作，但职责边界不够清晰：WAL 既是数据日志，又承载部分后台状态机；Flush 和 Sink 同样是后台物化进度，却分别使用不同持久化方式。V1 的新恢复模型把这些信息整理为更容易解释、测试和人工排障的结构。
-
-## 2. 目标决策
-
-PMS V1 采用以下恢复元信息模型：
+PMS V1 使用独立的 DATA WAL、SSTMeta、flush boundary 和 SinkMeta 恢复本地状态及 Paimon 提交进度：
 
 ```text
 Data WAL  = 用户数据变更事实
@@ -21,63 +10,38 @@ SSTMeta   = 本地 SST 物化进度与文件元信息
 SinkMeta  = Paimon prepare/commit 进度与外部持久化边界
 ```
 
-最终决策：
+WAL 保持顺序追加的数据日志；低频的 Flush/Sink 进度通过可读、可校验、原子更新的 metadata 文件保存，便于独立验证恢复边界与排障。
 
-- WAL 只记录数据变更，不再记录 flush/sink 控制事件。
-- Flush SST 与 Sink Paimon 都通过独立、可读、可校验、原子更新的 metadata 文件记录恢复所需信息。
-- WAL 截断以 `SinkMeta.success.persistedSequenceId` 为主边界，而不是以 Paimon `snapshotId` 为主边界。
-- SST 数据文件名 publish 后保持稳定，不包含 `NEW` / `SINKED` 状态；metadata 保存 run 结构，启动生命周期状态由 SinkMeta success 的 `persistedSequenceId` 推导，而不是依赖文件名或历史 runId。
+## 2. 恢复边界
 
-server 在打开这些组件前加载或创建 `storage/commit-user`，持久化本地状态对应的 Paimon
-writer 身份。恢复 prepared Sink 必须沿用该身份；全新本地状态使用新身份以隔离重置后的
-sequence。此文件由 server 管理，不进入 core 恢复协议，详见 [pms-server.md](pms-server.md) § 2.2。
+- WAL 只记录数据变更，不记录 flush/sink 控制事件。
+- `lastFlushedSequenceId` 决定哪些 WAL DATA 已由本地 SST 承载，无需再次回放。
+- WAL 回收使用 `SinkMeta.success.persistedSequenceId`，不使用 Paimon `snapshotId`。
+- SST 数据文件名发布后保持稳定，不包含 `NEW` / `SINKED` 状态；metadata 保存 run 结构，启动时按 `persistedSequenceId` 推导状态。
 
-该选择的理由：
-
-- WAL 重新变成单一职责的数据日志，恢复时只负责重放尚未被本地 SST 覆盖的数据。
-- Flush 和 Sink 都是低频后台操作，用人类可读 metadata 不会形成性能瓶颈。
-- 独立 metadata 更利于现场排障，可以直接查看某个 SST 或 sink batch 的边界、文件引用和提交状态。
-- 未来如果要迁移 WAL 格式，可以减少控制事件兼容负担。
+server 在打开这些组件前加载或创建 `storage/commit-user`，持久化本地状态对应的 Paimon writer 身份。恢复 prepared Sink 沿用该身份；全新本地状态使用新身份以隔离重置后的 sequence。此文件由 server 管理，不进入 core 恢复协议，详见 [pms-server.md](pms-server.md) § 2.2。
 
 ## 3. Data WAL
 
 ### 3.1 职责
 
-WAL 只回答一个问题：
-
-```text
-有哪些用户数据变更在崩溃后必须重放？
-```
-
-WAL 不再表达：
-
-- 某个 SST 是否 flush 成功。
-- 某个 SST 是否已经 sink 到 Paimon。
-- 某次 Paimon prepare/commit 是否完成。
-- 某个 Paimon snapshot 是否存在。
+WAL 保存用户数据变更，恢复时用于重放尚未被本地 SST 覆盖的 DATA。SST 物化状态、Paimon prepare/commit 进度和 snapshot 信息由对应的 metadata 管理，不写入 DATA WAL。
 
 ### 3.2 应用层记录格式
 
-WAL 中只有一种应用层数据记录，因此 PMS 应用层不再需要 `type` 字段：
+每个逻辑记录包含一个 DATA batch，整数采用 little-endian：
 
 ```text
-DATA:
-┌────────────┬──────────┬──────────┬────────────┬──────────┐
-│ sequenceId │ keyLen   │ key      │ valueLen   │ value    │
-│ (8 byte)   │ (4 byte) │ (N byte) │ (4 byte)   │ (M byte) │
-└────────────┴──────────┴──────────┴────────────┴──────────┘
+recordType(1, 0x42) + sequenceBegin(8) + count(4)
+重复 count 次：keyLen(4) + key(N) + valueLen(4) + value(M)
 
-valueLen >= 0  -> put/upsert, value 为 serialized InternalRow bytes
-valueLen = -1  -> delete/tombstone, 无 value bytes
+valueLen >= 0 -> put/upsert，value 为 opaque bytes
+valueLen = -1 -> delete/tombstone，无 value bytes
 ```
 
-说明：
+batch 内 sequence 连续分配，batch 之间只要求单调递增。恢复先验证完整 batch 的类型、count、长度、sequence 和剩余字节，再交给回调；不兼容旧的无类型单条 DATA 编码。core 不解析 Paimon 行内容。
 
-- `sequenceId` 仍是 PMS 内部恢复和截断的主边界坐标。
-- `valueLen = -1` 继续表达 delete/tombstone，与 MemTable/SST 的 tombstone 语义保持一致。
-- `valueLen = 0` 不表达 tombstone，也不表达业务 NULL；接入 RowCodec 后应由 codec 边界决定是否允许空 payload。
-- 传输层仍可以继续使用 LevelDB WAL chunk 格式及 CRC32C 校验。
-- WAL 文件头仍应保留 magic/version/lastSequenceId 等文件级信息，以支持格式演进和旧 WAL 截断后恢复 sequence 水位。
+物理层使用 32 KiB block 和 CRC32C，校验覆盖 chunk type 与 payload。每文件的首条 FULL 记录为 `PMS\0(4) + reserved(8, 必须为 0) + lastSequenceId(8)`，共 20 字节；用于承接已回收文件的 sequence 水位。
 
 ### 3.3 Replay 规则
 
@@ -88,7 +52,11 @@ load SSTMeta + flush boundary
 replay WAL DATA where sequenceId > lastFlushedSequenceId
 ```
 
-`sequenceId <= lastFlushedSequenceId` 的 DATA 记录由本地 SST 承载，不再回放到 `curMemTable`。
+`sequenceId <= lastFlushedSequenceId` 的 DATA 记录不再回放到 `curMemTable`，但仍须通过 WAL 结构与 CRC 校验。
+
+只有最新 WAL 在有效文件头之后的未完成 DATA 尾部、以及符合格式的全零预分配后缀可被丢弃；其余已检测到的损坏拒绝启动。完整记录 CRC 错误没有尾部豁免。接受的尾部先截到最后完整逻辑记录并 force，再创建后继 writer，使再次重启仍能恢复。
+
+零字节/不完整文件头统一失败，V1 不自动推断创建中断、不实现跳坏记录或时间点抢救。不逐次 fsync 的 DATA 仅提供既定进程恢复能力；完整文件或有效后缀被删除可能无法检测。详细规则见 [pms-core.md](pms-core.md) § 3.3。
 
 ## 4. SSTMeta
 
@@ -305,7 +273,7 @@ Sink 必须保持以下顺序：
 
 ## 6. 恢复流程
 
-目标恢复流程：
+启动恢复流程：
 
 ```text
 1. 初始化 sink metadata
@@ -320,12 +288,16 @@ Sink 必须保持以下顺序：
    - 识别 compact 旧输入、data-first 最老 evict 残留和 flush-boundary orphan
    - 按 lastPersistedSequenceId 推导 NEW/SINKED；内部缺口或无法解释的损坏 fatal
 
-3. 初始化 WAL
-   - 扫描 WAL 文件头和 DATA record，恢复 lastSequenceId
+3. 校验并恢复 WAL（单次顺序扫描）
+   - 检查文件名、连续编号、CRC、文件头、完整 DATA batch 与跨文件水位
+   - 最老 header 水位 <= max(flushed, persisted) <= WAL 恢复水位
+   - 暂存 sequenceId > lastFlushedSequenceId 的 DATA；其他 DATA 仍执行完整校验
+   - 只容忍最新有效文件头后的未完成 DATA/合法零后缀
+   - 全部输入通过验证后，截断允许的尾部并 force；失败不创建后继 WAL
+   - 设置 allocator 并创建带可信水位的新 writer
 
-4. Replay WAL DATA
-   - sequenceId <= lastFlushedSequenceId: 跳过
-   - sequenceId > lastFlushedSequenceId: 回放到 curMemTable
+4. 将暂存 DATA 回放到 curMemTable
+   - sequenceId <= lastFlushedSequenceId 的记录不重复应用
 
 5. 恢复未完成 sink
    - 对 prepare 存在但 success 不存在的 batch，使用原始 prepared payload 重试 commit
@@ -342,16 +314,17 @@ Sink 必须保持以下顺序：
 
 ## 7. WAL 截断
 
-WAL 截断应以 sink success metadata 中的 `persistedSequenceId` 为主：
+WAL 回收使用 sink success metadata 中的 `persistedSequenceId`：
 
 ```text
-walFile.maxSequenceId <= latestPersistedSequenceId
+walFile.highWatermark <= latestPersistedSequenceId
 ```
 
 附加约束：
 
-- 当前正在写入的 WAL 文件永不删除。
-- 若 WAL 文件只包含头部或无 DATA，可以依赖文件头中的 sequence 水位判断是否保留。
+- 按编号升序只删除安全前缀；遇 current、首个不可回收文件或首个删除失败停止。
+- `highWatermark` 为文件头水位与完整 DATA sequence 的最大值，合法 header-only/水位 0 的文件也参与回收。
+- current 文件永不删除，保留 sequence 水位；失败候选留待后续重试。
 - `snapshotId` 可用于确认外部 Paimon 状态，但不应替代 PMS 内部 sequence 边界。
 
 ## 8. 崩溃矩阵
@@ -359,6 +332,10 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 | 场景 | 持久化结果 | 恢复行为 |
 |------|------------|----------|
 | DATA WAL 写入前崩溃 | 无 WAL DATA | 写入未成功，不恢复 |
+| 最新 DATA batch 未写完 | 有效文件头和完整记录前缀、末条半写 | 丢弃整个末 batch，截断并 force 后再开启新 writer |
+| 新 WAL 文件头未写完 | 零字节或无效文件头 | 启动失败，人工介入 |
+| 完整 WAL 记录 CRC 错误 | 可检测的损坏，包括最新末条 | 启动失败，不跳过记录 |
+| WAL 回收删除失败 | 安全前缀删除停止，后继文件保留 | 下次回收重试，不影响已确认的 Sink |
 | DATA WAL 写入后、MemTable 可见前崩溃 | 有 WAL DATA | replay 到 curMemTable |
 | SST 文件写完、SSTMeta 未写 | 有 orphan SST 文件 | 不注册、不清理、不推进 nextFlushId；由 WAL replay 后的下一次 Flush 原位覆盖 |
 | SSTMeta 写完、flush boundary 未推进 | 有 SST/SSTMeta，但 boundary 未覆盖 | 同上，作为可复用 orphan |
@@ -375,17 +352,17 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 
 当前实现已经完成核心职责拆分：
 
-- WAL 只写 DATA 记录，应用层记录格式已移除 `type` 字段。
+- WAL 只写 `0x42 DATA_BATCH`；恢复统一校验完整 batch，仅容忍最新 DATA 尾部，并在创建 writer 前整理尾部。
 - SST 文件写出后会同步写独立、人工可读的 `sst-*.meta.json`，并在启动时与 SST properties 交叉校验。
 - Sink prepare/success 写入独立 `SinkMetaStore`，文件为可读 metadata，并带校验字段。
-- `SinkCoordinator` 的持久化依赖已经从 `WALManager` 切换到 `SinkMetaStore`。
+- `SinkCoordinator` 通过 `SinkMetaStore` 持久化 prepare/success。
 - 启动恢复通过扫描 SinkMeta 恢复 pending prepare，并用 success meta 推导 sinked SST。
 - 运行期 durable success 之后的本地收尾失败会进入 `FINALIZING`，由 Maintenance 最高优先级重做；该路径只读取原 success metadata，不创建新 Paimon commit。
 - Flush boundary 已使用独立 `flush-boundary.meta`。
 - 运行期 flush boundary 写入失败时，非持久化 FlushFlight 会复用已经发布的 SST 完成重试；进程崩溃后仍按 orphan SST + WAL replay 恢复。
 - `SSTRecoveryPlanner` 已从 storage manager 中抽离目录扫描与恢复判断；可见集合必须构成 flushId 连续后缀，只自动修复 compact、最老 evict 和 boundary orphan 三类正常崩溃状态。
 - retired SST 使用 data-first 删除且不额外 force 目录，data/meta 均成功前不移除 cleanup entry；启动可识别并清理 data 已删、meta 尚存的最老 evict 残留。
-- WAL truncate 已按 `persistedSequenceId` / `maxSequenceId` 维度实现，并在 sink success 或 recovered prepare commit 后触发；删除失败的 WAL 仍保留在候选集合中，后续 truncate 可以重试。
+- WAL truncate 按 `persistedSequenceId` / `highWatermark` 删除安全前缀，在 sink success 或 recovered prepare commit 后触发；遇不可回收项或删除失败停止，失败候选可重试。
 - `SinkMetaPayloadCodec` 作为 SinkMeta 中 prepared/success payload 的内部二进制编解码器使用。
 
 仍需后续补齐的部分：
@@ -408,5 +385,7 @@ walFile.maxSequenceId <= latestPersistedSequenceId
 - success meta 存在但 SSTMeta 仍为 NEW 时恢复为 SINKED。
 - durable success 后本地 metadata fail-once 时进入 `FINALIZING`，在线重试后只存在原 Paimon commit。
 - 多个 SSTMeta 标记中途失败时，已经写成 SINKED 的文件和仍为 NEW 的文件可由同一 finalization 幂等收敛。
-- WAL truncate 只删除 `maxSequenceId <= persistedSequenceId` 的非当前 WAL 文件。
+- WAL truncate 只删除 `highWatermark <= persistedSequenceId` 的非当前安全前缀，包含合法空头文件。
+- 最新尾部半写恢复后再次重启成功；完整 CRC 错、旧文件半写、无效头、文件缺口及 I/O 失败均拒绝启动。
+- FileChannel 短写补全，读取错误与异常关闭不能转成 EOF；roll force 失败传播到 fatal。
 - 人工改坏 metadata checksum 时拒绝加载或降级为 orphan，行为需要按是否越过 boundary 区分。

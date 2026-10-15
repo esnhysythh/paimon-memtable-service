@@ -41,13 +41,15 @@ PMS V1 的测试体系需要回答三类问题：
 | CurMemTable | 并发 put/get、sequence、容量阈值与 freeze |
 | ImmutableMemTable | Freeze 后只读、边界统计、Flush 发布后退出查询路径 |
 | LocalStorageManager | SST 往返、BloomFilter、查询三态、read epoch 延迟删除、多路归并、flushId 与半删除恢复 |
-| WALManager | 写入/回放、CRC、partial write、截断与删除重试 |
+| WALManager / LogReader / LogWriter | 完整 batch 回放、严格 CRC/I/O、最新尾部半写与重复恢复、跨文件水位、安全前缀回收、短写补全与 force 错误 |
 | Bucket Director | Flush/Sink/Compact/Evict 状态机、durable boundary、幂等恢复与流控 |
 | Row/PrimaryKey Codec | Paimon `InternalRow` 编解码、mem-comparable 主键顺序、非法格式与类型拒绝 |
 | Paimon Sink/Lookup | 2PC payload、RowKind/tombstone、snapshot/file view、HIT/DELETED/MISS/UNKNOWN |
 | Protocol/Client | handshake、binary batch envelope、HTTP/2 状态映射、重试与 schema negotiation |
 | Flink Connector | Factory/options、type adapter、primary-key selector、DELETE filter、lookup key 计划、object reuse |
 | Testkit | 环境拒绝规则、owner marker、清理策略、确定性数据、PMS 配置和 admin fence 解析 |
+
+`WALRecoveryTest` 覆盖短物理 header/body、FIRST/MIDDLE 缺 LAST、末条完整 CRC 错、同 block 中段损坏、零后缀和非法 batch；`WalIoTest` 注入短读写、零进展、读取异常及 force 失败；`WalProcessRecoveryTest` 强制终止独立 JVM，验证 FileChannel/mmap 在未执行 close 时的已确认记录恢复。
 
 单元测试统一使用 JUnit 5。核心接口优先使用小型 fake 实现覆盖异常和状态分支，不为简单协作关系引入
 重量级 mock 框架。
@@ -72,7 +74,8 @@ PMS V1 的测试体系需要回答三类问题：
 | Fatal 与 queued writes | WAL 写入后 roll 失败、apply 故障和后台 fatal 均阻止后续 group、完成全部等待请求；已准入 group 可正常收尾，fatal 写入失败统一为 unknown outcome，WAL 恢复不包含被拒绝请求 |
 | 本地 SST 合并与淘汰 | 只处理合法连续 run，read epoch 结束后再物理删除 |
 | SST 半删除恢复 | 可恢复合法尾部残留，保留区间内部缺口必须 fatal |
-| WAL 截断 | persisted boundary 覆盖旧 WAL 时删除，失败候选可在后续重试 |
+| WAL 恢复 | 与可信 flush/sink 边界一致；已 flush 记录仍校验；尾 batch 整体丢弃，保留此前 tombstone；失败不创建后继 WAL |
+| WAL 截断 | persisted boundary 覆盖的最老前缀可删除，合法空头参与；遇不可回收项或首删失败停止，失败候选可重试 |
 | Scheduler | 固定优先级、单步调和、任务合并、重排队与 close 生命周期 |
 | 手动 fence | `/flush`、`/sink` 返回 fence，通过 state boundary 观察异步完成 |
 

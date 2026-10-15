@@ -5,8 +5,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 
 public abstract class SliceOutput
@@ -71,12 +69,6 @@ public abstract class SliceOutput
     public abstract void writeBytes(ByteBuffer source);
 
     public abstract int writeBytes(InputStream in, int length)
-            throws IOException;
-
-    public abstract int writeBytes(ScatteringByteChannel in, int length)
-            throws IOException;
-
-    public abstract int writeBytes(FileChannel in, int position, int length)
             throws IOException;
 
     public abstract void writeZero(int length);

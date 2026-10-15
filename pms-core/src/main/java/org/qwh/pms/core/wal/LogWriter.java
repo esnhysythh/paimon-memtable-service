@@ -12,9 +12,6 @@ public interface LogWriter
     void close()
             throws IOException;
 
-    void delete()
-            throws IOException;
-
     File getFile();
 
     long getFileNumber();

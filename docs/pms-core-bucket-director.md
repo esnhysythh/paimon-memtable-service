@@ -172,7 +172,7 @@ select NEW prefix
 - `PREPARED_RETRY`：durable prepare 已存在，但 durable success 尚不存在。`resumeSinkFlight()` 只重试原 prepared commit。
 - `FINALIZING`：Paimon commit 和 durable success 已存在。`resumeSinkFlight()` 按 batchId 读取原 success，只重做本地 SST metadata、RunState 和 boundary 收尾，绝不再次调用 Paimon prepare/commit。
 
-两种状态都保持最高维护优先级，不得准备新 batch，也不得执行会改变相关 run 的 compact/evict。SST metadata 可能在多个文件之间部分写入，因此本地收尾必须幂等：重试接受目标 run 已经是 NEW 或 SINKED，并最终发布同一组 SINKED run。WAL truncate 是 success 后的空间回收；删除失败保留候选文件供后续 truncate 重试，但不让已经完成的逻辑 Sink 永久占用 flight。
+两种状态都保持最高维护优先级，不得准备新 batch，也不得执行会改变相关 run 的 compact/evict。SST metadata 可能在多个文件之间部分写入，因此本地收尾必须幂等：重试接受目标 run 已经是 NEW 或 SINKED，并最终发布同一组 SINKED run。WAL truncate 是 success 后的空间回收；按编号只删除安全前缀，遇首个不可回收项或删除失败立即停止，失败候选供后续 truncate 重试；不让已经完成的逻辑 Sink 永久占用 flight。
 
 ### 4.4 Local compact
 
@@ -245,9 +245,9 @@ Director 只记录 fatal 并通过操作异常向上传播，由服务层安排�
 
 1. 先加载 SinkMeta success，取得 durable `lastPersistedSequenceId`，并校验未完成 prepare 数量。
 2. 加载 `flush-boundary.meta`，由 storage recovery 扫描全部 SST 文件、构建 flushId 连续的本地可见后缀，并按 `lastPersistedSequenceId` 推导 NEW/SINKED。
-3. 初始化 WAL 并 replay `sequenceId > lastFlushedSequenceId` 的 DATA 到 CurMemTable。
+3. 以可信 flush/sink 边界验证并恢复 WAL，检查完整 batch、连续文件号及水位；只接受最新 DATA 尾部半写/合法零后缀，截断并 force 后再创建 writer，将 `sequenceId > lastFlushedSequenceId` 的 DATA 应用到 CurMemTable。
 4. 在本地 SST reader view 建立后恢复未完成 prepare；V1 只允许一个 durable pending prepare。
 5. 若 recovered commit 推进了 `lastPersistedSequenceId`，再次幂等修正 SST 状态并执行 WAL truncate。
-6. 恢复全局 sequence 水位，并暴露 `recoveredUnpersistedData` 供调度器立即建立可见性 fence。
+6. 发布恢复摘要及 `recoveredUnpersistedData`，供调度器立即建立可见性 fence。
 
 storage recovery 只自动处理 compact 覆盖的旧输入、data-first 最老 evict 残留和尚未推进 boundary 的单 flush orphan。启动时发现保留后缀内部缺口、部分重叠、WAL/SST/SinkMeta 损坏、边界交叉或 prepared metadata 不一致，应拒绝启动；不能将已参与恢复边界的数据静默降级为 miss。运行期后台操作的普通 `RuntimeException` 由 worker 记录并在下一周期重试，积压最终通过 flow control 限制新写入。后台 `Error`、写入提交阶段异常以及无法确定 Sink flight 的 metadata refresh 失败进入 fatal 路径，停止准入并由所属服务关闭实例。

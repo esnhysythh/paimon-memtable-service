@@ -1592,6 +1592,91 @@ class PMSBucketDirectorImplTest {
     // ── Recovery ──
 
     @Test
+    void corruptWalRefusesStartupEvenWhenRecordIsAlreadyFlushed() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+        PMSBucketDirectorImpl original = newDirector(cfg);
+        original.init();
+        original.put("k".getBytes(), "v".getBytes());
+        original.freezeCurMemTable();
+        original.flushImmutableMemTable();
+        original.close();
+        Path wal = tempDir.resolve("wal/wal-000001.log");
+        byte[] bytes = Files.readAllBytes(wal);
+        bytes[27] ^= 1;
+        Files.write(wal, bytes);
+        PMSBucketDirectorImpl recovered = newDirector(cfg);
+        try {
+            IOException error = assertThrows(IOException.class, recovered::init);
+            assertTrue(error.getMessage().contains("CHECKSUM_MISMATCH"));
+            assertFalse(Files.exists(tempDir.resolve("wal/wal-000002.log")));
+        } finally {
+            recovered.close();
+        }
+    }
+
+    @Test
+    void missingWalWithFlushedHistoryRefusesStartup() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+        PMSBucketDirectorImpl original = newDirector(cfg);
+        original.init();
+        original.put("k".getBytes(), "v".getBytes());
+        original.freezeCurMemTable();
+        original.flushImmutableMemTable();
+        original.close();
+        Files.delete(tempDir.resolve("wal/wal-000001.log"));
+        PMSBucketDirectorImpl recovered = newDirector(cfg);
+        try {
+            assertThrows(IOException.class, recovered::init);
+            assertFalse(Files.exists(tempDir.resolve("wal/wal-000001.log")));
+        } finally {
+            recovered.close();
+        }
+    }
+
+    @Test
+    void tornBatchRecoveryPreservesFlushedValuesAndCompleteTombstones() throws IOException {
+        PMSConfig cfg = config(1_000_000, 256);
+        PMSBucketDirectorImpl original = newDirector(cfg);
+        original.init();
+        original.put("kept".getBytes(), "v".getBytes());
+        original.put("deleted".getBytes(), "old".getBytes());
+        original.freezeCurMemTable();
+        original.flushImmutableMemTable();
+        original.delete("deleted".getBytes());
+        Path wal = tempDir.resolve("wal/wal-000001.log");
+        long completeEnd = Files.size(wal);
+        original.writeBatch(List.of(WriteOp.delete("kept".getBytes()),
+            WriteOp.put("partial".getBytes(), new byte[100_000])));
+        original.close();
+        // Model a crash while the final (unacknowledged) batch was being appended.
+        try (var channel = java.nio.channels.FileChannel.open(wal, java.nio.file.StandardOpenOption.WRITE)) {
+            channel.truncate(completeEnd + 40);
+        }
+        PMSBucketDirectorImpl recovered = newDirector(cfg);
+        recovered.init();
+        try {
+            assertArrayEquals("v".getBytes(), recovered.get("kept".getBytes()).orElseThrow());
+            assertTrue(recovered.lookup("deleted".getBytes()).orElseThrow().isTombstone());
+            assertTrue(recovered.get("partial".getBytes()).isEmpty());
+            assertEquals(3, recovered.stateSnapshot().lastAssignedSequenceId());
+            assertEquals(2, recovered.stateSnapshot().lastFlushedSequenceId());
+            assertEquals(completeEnd, Files.size(wal));
+            recovered.put("next".getBytes(), "new".getBytes());
+        } finally {
+            recovered.close();
+        }
+        PMSBucketDirectorImpl again = newDirector(cfg);
+        again.init();
+        try {
+            assertEquals(4, again.stateSnapshot().lastAssignedSequenceId());
+            assertArrayEquals("new".getBytes(), again.get("next".getBytes()).orElseThrow());
+            assertTrue(again.lookup("deleted".getBytes()).orElseThrow().isTombstone());
+        } finally {
+            again.close();
+        }
+    }
+
+    @Test
     void recoverFromWALAfterRestart() throws IOException {
         PMSConfig cfg = config(1_000_000, 256);
 

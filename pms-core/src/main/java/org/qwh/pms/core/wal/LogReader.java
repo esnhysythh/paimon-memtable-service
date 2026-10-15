@@ -2,336 +2,165 @@ package org.qwh.pms.core.wal;
 
 import org.qwh.pms.core.wal.util.DynamicSliceOutput;
 import org.qwh.pms.core.wal.util.Slice;
-import org.qwh.pms.core.wal.util.SliceInput;
-import org.qwh.pms.core.wal.util.SliceOutput;
 import org.qwh.pms.core.wal.util.Slices;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 
-import static org.qwh.pms.core.wal.LogChunkType.BAD_CHUNK;
-import static org.qwh.pms.core.wal.LogChunkType.EOF;
-import static org.qwh.pms.core.wal.LogChunkType.UNKNOWN;
-import static org.qwh.pms.core.wal.LogChunkType.ZERO_TYPE;
-import static org.qwh.pms.core.wal.LogChunkType.getLogChunkTypeByPersistentId;
 import static org.qwh.pms.core.wal.LogConstants.BLOCK_SIZE;
 import static org.qwh.pms.core.wal.LogConstants.HEADER_SIZE;
-import static org.qwh.pms.core.wal.Logs.getChunkChecksum;
 
-public class LogReader
-{
-    private final FileChannel fileChannel;
-
-    private final LogMonitor monitor;
-
-    private final boolean verifyChecksums;
-
-    /**
-     * Offset at which to start looking for the first record to return
-     */
-    private final long initialOffset;
-
-    /**
-     * Have we read to the end of the file?
-     */
-    private boolean eof;
-
-    /**
-     * Offset of the last record returned by readRecord.
-     */
+/** Sequential, checksummed WAL reader. Corruption never resynchronizes to later records. */
+public final class LogReader {
+    private final FileChannel channel;
+    private final boolean tolerateTail;
+    private final ByteBuffer block = ByteBuffer.allocate(BLOCK_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+    private final DynamicSliceOutput scratch = new DynamicSliceOutput(BLOCK_SIZE);
+    private long blockOffset;
+    private long nextBlockOffset;
     private long lastRecordOffset;
+    private long lastRecordEnd;
+    private boolean eof;
+    private boolean finished;
+    private boolean discardedTail;
 
-    /**
-     * Offset of the first location past the end of buffer.
-     */
-    private long endOfBufferOffset;
-
-    /**
-     * Scratch buffer in which the next record is assembled.
-     */
-    private final DynamicSliceOutput recordScratch = new DynamicSliceOutput(BLOCK_SIZE);
-
-    /**
-     * Scratch buffer for current block.  The currentBlock is sliced off the underlying buffer.
-     */
-    private final SliceOutput blockScratch = Slices.allocate(BLOCK_SIZE).output();
-
-    /**
-     * The current block records are being read from.
-     */
-    private SliceInput currentBlock = Slices.EMPTY_SLICE.input();
-
-    /**
-     * Current chunk which is sliced from the current block.
-     */
-    private Slice currentChunk = Slices.EMPTY_SLICE;
-
-    public LogReader(FileChannel fileChannel, LogMonitor monitor, boolean verifyChecksums, long initialOffset)
-    {
-        this.fileChannel = fileChannel;
-        this.monitor = monitor;
-        this.verifyChecksums = verifyChecksums;
-        this.initialOffset = initialOffset;
+    public LogReader(FileChannel channel, boolean tolerateTail) {
+        this.channel = channel;
+        this.tolerateTail = tolerateTail;
+        block.limit(0);
     }
 
-    public long getLastRecordOffset()
-    {
+    public long getLastRecordOffset() {
         return lastRecordOffset;
     }
 
-    /**
-     * Skips all blocks that are completely before "initial_offset_".
-     * <p/>
-     * Handles reporting corruption
-     *
-     * @return true on success.
-     */
-    private boolean skipToInitialBlock()
-    {
-        int offsetInBlock = (int) (initialOffset % BLOCK_SIZE);
-        long blockStartLocation = initialOffset - offsetInBlock;
-
-        // Don't search a block if we'd be in the trailer
-        if (offsetInBlock > BLOCK_SIZE - 6) {
-            blockStartLocation += BLOCK_SIZE;
-        }
-
-        endOfBufferOffset = blockStartLocation;
-
-        // Skip to start of first block that can contain the initial record
-        if (blockStartLocation > 0) {
-            try {
-                fileChannel.position(blockStartLocation);
-            }
-            catch (IOException e) {
-                reportDrop(blockStartLocation, e);
-                return false;
-            }
-        }
-
-        return true;
+    public long getLastRecordEnd() {
+        return lastRecordEnd;
     }
 
-    public Slice readRecord()
-    {
-        recordScratch.reset();
+    public boolean hasDiscardedTail() {
+        return discardedTail;
+    }
 
-        // advance to the first record, if we haven't already
-        if (lastRecordOffset < initialOffset) {
-            if (!skipToInitialBlock()) {
-                return null;
-            }
-        }
-
-        // Record offset of the logical record that we're reading
-        long prospectiveRecordOffset = 0;
-
-        boolean inFragmentedRecord = false;
+    public Slice readRecord() throws IOException {
+        if (finished) return null;
+        scratch.reset();
+        boolean fragmented = false;
+        long recordOffset = -1;
         while (true) {
-            long physicalRecordOffset = endOfBufferOffset - currentChunk.length();
-            LogChunkType chunkType = readNextChunk();
-            switch (chunkType) {
-                case FULL:
-                    if (inFragmentedRecord) {
-                        reportCorruption(recordScratch.size(), "Partial record without end");
-                        // simply return this full block
+            if (block.remaining() < HEADER_SIZE) {
+                if (block.hasRemaining()) {
+                    if (block.limit() != BLOCK_SIZE) {
+                        return incompleteTail(offset(), "truncated chunk header");
                     }
-                    recordScratch.reset();
-                    prospectiveRecordOffset = physicalRecordOffset;
-                    lastRecordOffset = prospectiveRecordOffset;
-                    return currentChunk.copySlice();
-
-                case FIRST:
-                    if (inFragmentedRecord) {
-                        reportCorruption(recordScratch.size(), "Partial record without end");
-                        // clear the scratch and start over from this chunk
-                        recordScratch.reset();
-                    }
-                    prospectiveRecordOffset = physicalRecordOffset;
-                    recordScratch.writeBytes(currentChunk);
-                    inFragmentedRecord = true;
-                    break;
-
-                case MIDDLE:
-                    if (!inFragmentedRecord) {
-                        reportCorruption(recordScratch.size(), "Missing start of fragmented record");
-
-                        // clear the scratch and skip this chunk
-                        recordScratch.reset();
-                    }
-                    else {
-                        recordScratch.writeBytes(currentChunk);
-                    }
-                    break;
-
-                case LAST:
-                    if (!inFragmentedRecord) {
-                        reportCorruption(recordScratch.size(), "Missing start of fragmented record");
-
-                        // clear the scratch and skip this chunk
-                        recordScratch.reset();
-                    }
-                    else {
-                        recordScratch.writeBytes(currentChunk);
-                        lastRecordOffset = prospectiveRecordOffset;
-                        return recordScratch.slice().copySlice();
-                    }
-                    break;
-
-                case EOF:
-                    if (inFragmentedRecord) {
-                        reportCorruption(recordScratch.size(), "Partial record without end");
-
-                        // clear the scratch and return
-                        recordScratch.reset();
-                    }
-                    return null;
-
-                case BAD_CHUNK:
-                    if (inFragmentedRecord) {
-                        reportCorruption(recordScratch.size(), "Error in middle of record");
-                        inFragmentedRecord = false;
-                        recordScratch.reset();
-                    }
-                    break;
-
-                default:
-                    int dropSize = currentChunk.length();
-                    if (inFragmentedRecord) {
-                        dropSize += recordScratch.size();
-                    }
-                    reportCorruption(dropSize, String.format("Unexpected chunk type %s", chunkType));
-                    inFragmentedRecord = false;
-                    recordScratch.reset();
-                    break;
-            }
-        }
-    }
-
-    /**
-     * Return type, or one of the preceding special values
-     */
-    private LogChunkType readNextChunk()
-    {
-        // clear the current chunk
-        currentChunk = Slices.EMPTY_SLICE;
-
-        // read the next block if necessary
-        if (currentBlock.available() < HEADER_SIZE) {
-            if (!readNextBlock()) {
-                if (eof) {
-                    return EOF;
+                    // Only the final 1..6 bytes of a full block can be alignment padding.
+                    requireZeros();
                 }
+                if (!readBlock()) {
+                    if (fragmented) return incompleteTail(recordOffset, "missing LAST chunk");
+                    finished = true;
+                    return null;
+                }
+                continue;
+            }
+
+            long chunkOffset = offset();
+            int bytesInBlock = BLOCK_SIZE - block.position();
+            int checksum = block.getInt();
+            int length = Short.toUnsignedInt(block.getShort());
+            int type = Byte.toUnsignedInt(block.get());
+            if (type == 0 && length == 0 && checksum == 0) {
+                // mmap preallocation is a zero suffix, never a hole followed by more data.
+                requireZeros();
+                while (readBlock()) requireZeros();
+                return incompleteTail(chunkOffset, "zero-filled tail");
+            }
+            if (type < 1 || type > 4) {
+                throw corruption(chunkOffset, "INVALID_FORMAT", "unknown chunk type " + type);
+            }
+            if (length > bytesInBlock - HEADER_SIZE) {
+                throw corruption(chunkOffset, "INVALID_FORMAT", "chunk crosses block boundary");
+            }
+            boolean startsRecord = type == 1 || type == 2;
+            if (startsRecord == fragmented) {
+                throw corruption(chunkOffset, "INVALID_FORMAT", "invalid fragment order");
+            }
+            if (length > block.remaining()) {
+                return incompleteTail(chunkOffset, "truncated chunk body");
+            }
+            int payloadOffset = block.position();
+            if (checksum != Logs.getChunkChecksum(type, block.array(), payloadOffset, length)) {
+                throw corruption(chunkOffset, "CHECKSUM_MISMATCH", "invalid chunk checksum");
+            }
+            block.position(payloadOffset + length);
+            if (type == 1) {
+                lastRecordOffset = chunkOffset;
+                lastRecordEnd = offset();
+                return Slices.wrappedBuffer(block.array()).slice(payloadOffset, length).copySlice();
+            }
+            if (type == 2) {
+                recordOffset = chunkOffset;
+                fragmented = true;
+            }
+            if (scratch.size() > Integer.MAX_VALUE - length) {
+                throw corruption(chunkOffset, "INVALID_FORMAT", "logical record too large");
+            }
+            scratch.writeBytes(block.array(), payloadOffset, length);
+            if (type == 4) {
+                lastRecordOffset = recordOffset;
+                lastRecordEnd = offset();
+                return scratch.slice().copySlice();
             }
         }
-
-        // parse header
-        int expectedChecksum = currentBlock.readInt();
-        int length = currentBlock.readUnsignedByte();
-        length = length | currentBlock.readUnsignedByte() << 8;
-        byte chunkTypeId = currentBlock.readByte();
-        LogChunkType chunkType = getLogChunkTypeByPersistentId(chunkTypeId);
-
-        // verify length
-        if (length > currentBlock.available()) {
-            int dropSize = currentBlock.available() + HEADER_SIZE;
-            reportCorruption(dropSize, "Invalid chunk length");
-            currentBlock = Slices.EMPTY_SLICE.input();
-            return BAD_CHUNK;
-        }
-
-        // skip zero length records
-        if (chunkType == ZERO_TYPE && length == 0) {
-            // Skip zero length record without reporting any drops since
-            // such records are produced by the writing code.
-            currentBlock = Slices.EMPTY_SLICE.input();
-            return BAD_CHUNK;
-        }
-
-        // Skip physical record that started before initialOffset
-        if (endOfBufferOffset - HEADER_SIZE - length < initialOffset) {
-            currentBlock.skipBytes(length);
-            return BAD_CHUNK;
-        }
-
-        // read the chunk
-        currentChunk = currentBlock.readBytes(length);
-
-        if (verifyChecksums) {
-            int actualChecksum = getChunkChecksum(chunkTypeId, currentChunk);
-            if (actualChecksum != expectedChecksum) {
-                // Drop the rest of the buffer since "length" itself may have
-                // been corrupted and if we trust it, we could find some
-                // fragment of a real log record that just happens to look
-                // like a valid log record.
-                int dropSize = currentBlock.available() + HEADER_SIZE;
-                currentBlock = Slices.EMPTY_SLICE.input();
-                reportCorruption(dropSize, "Invalid chunk checksum");
-                return BAD_CHUNK;
-            }
-        }
-
-        // Skip unknown chunk types
-        // Since this comes last so we the, know it is a valid chunk, and is just a type we don't understand
-        if (chunkType == UNKNOWN) {
-            reportCorruption(length, String.format("Unknown chunk type %d", chunkType.getPersistentId()));
-            return BAD_CHUNK;
-        }
-
-        return chunkType;
     }
 
-    public boolean readNextBlock()
-    {
-        if (eof) {
-            return false;
+    private Slice incompleteTail(long offset, String reason) throws IOException {
+        // A missing/partial first record is never a recoverable PMS file header.
+        if (!tolerateTail || lastRecordEnd == 0) {
+            throw corruption(offset, "INCOMPLETE_TAIL", reason);
         }
+        discardedTail = true;
+        finished = true;
+        return null;
+    }
 
-        // clear the block
-        blockScratch.reset();
+    private void requireZeros() throws IOException {
+        while (block.hasRemaining()) {
+            long offset = offset();
+            if (block.get() != 0) {
+                throw corruption(offset, "INVALID_FORMAT", "nonzero data in padding/zero tail");
+            }
+        }
+    }
 
-        // read the next full block
-        while (blockScratch.writableBytes() > 0) {
-            try {
-                int bytesRead = blockScratch.writeBytes(fileChannel, blockScratch.writableBytes());
-                if (bytesRead < 0) {
-                    // no more bytes to read
+    private boolean readBlock() throws IOException {
+        if (eof) return false;
+        block.clear();
+        blockOffset = nextBlockOffset;
+        try {
+            while (block.hasRemaining()) {
+                int read = channel.read(block);
+                if (read < 0) {
                     eof = true;
                     break;
                 }
-                endOfBufferOffset += bytesRead;
+                if (read == 0) throw new IOException("WAL read made no progress");
             }
-            catch (IOException e) {
-                currentBlock = Slices.EMPTY_SLICE.input();
-                reportDrop(BLOCK_SIZE, e);
-                eof = true;
-                return false;
-            }
-
+        } catch (IOException e) {
+            throw new IOException("IO_ERROR at offset " + offset() + ": " + e.getMessage(), e);
         }
-        currentBlock = blockScratch.slice().input();
-        return currentBlock.isReadable();
+        nextBlockOffset += block.position();
+        block.flip();
+        return block.hasRemaining();
     }
 
-    /**
-     * Reports corruption to the monitor.
-     * The buffer must be updated to remove the dropped bytes prior to invocation.
-     */
-    private void reportCorruption(long bytes, String reason)
-    {
-        if (monitor != null) {
-            monitor.corruption(bytes, reason);
-        }
+    private long offset() {
+        return blockOffset + block.position();
     }
 
-    /**
-     * Reports dropped bytes to the monitor.
-     * The buffer must be updated to remove the dropped bytes prior to invocation.
-     */
-    private void reportDrop(long bytes, Throwable reason)
-    {
-        if (monitor != null) {
-            monitor.corruption(bytes, reason);
-        }
+    private static IOException corruption(long offset, String kind, String reason) {
+        return new IOException(kind + " at offset " + offset + ": " + reason);
     }
 }

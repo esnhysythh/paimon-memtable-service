@@ -38,7 +38,7 @@ PMS 在 Paimon 的 LSM 之上，构建了一层基于本地内存和磁盘的 LS
 
 | 机制 | 说明 | 详细文档 |
 |------|------|---------|
-| WAL 与崩溃恢复 | V1 采用单盘 WAL，每条记录带 CRC32 校验和 Magic Number。WAL 只记录数据变更；Flush/Sink 使用独立可读 metadata 记录恢复边界与 Paimon prepare/commit 进度。 | [pms-core.md](docs/pms-core.md) § 5 / [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) |
+| WAL 与崩溃恢复 | V1 采用单盘 DATA batch WAL，chunk 使用 CRC32C，文件头校验 Magic。恢复仅容忍最新有效文件头之后的未完成 DATA 尾部及合法零后缀，其他已检测损坏拒绝启动；Flush/Sink 使用独立 metadata 保存恢复边界与 Paimon 提交进度。 | [pms-core.md](docs/pms-core.md) § 3.3 / [pms-recovery-metadata.md](docs/pms-recovery-metadata.md) |
 | 轻量级 Sequence | 每条写入分配单调递增 sequenceId，作为 freeze/flush/sink/WAL 截断的内部边界坐标。V1 不做 MVCC 多版本。 | [pms-sequence-and-write-boundary.md](docs/pms-sequence-and-write-boundary.md) |
 | 本地 SST 格式 | 参考 LevelDB/RocksDB Block Based Table，保留 Data Block/Index/Footer 结构，不照搬 MVCC InternalKey；SST 查询使用 `Optional<Value>` 表达 miss/put/delete 三态。 | [pms-core-sst-format.md](docs/pms-core-sst-format.md) |
 | SST 当前状态 | 汇总 SST/WAL 恢复边界、已接入的 RowCodec 与真实 Paimon sink。 | [pms-core-sst-current-status.md](docs/pms-core-sst-current-status.md) |

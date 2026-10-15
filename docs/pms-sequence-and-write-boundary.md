@@ -192,16 +192,18 @@ repeated count times:
 
 WAL 文件头保存文件创建时的 `lastSequenceId`。这样即使旧 WAL 文件被截断，而当前 WAL 文件暂时只有文件头而无 DATA 记录，重启后仍能恢复全局 sequence 水位，避免从 1 重新开始分配。
 
+恢复使用完整校验后的 WAL 水位，并验证其不落后于可信 flush/sink 边界；不能只提高 allocator 来掩盖缺失数据。允许丢弃的最新未完成 batch 不推进水位，其未确认 sequence 可以重新分配。文件号连续性与 sequence 数字连续性是两个独立约束。
+
 ### 5.3 Sequence 允许有空洞
 
-sequence 是单调边界坐标，不是连续行号。若某次 WAL 写入失败、进程继续运行，可能出现跳号。只要后续 sequence 单调递增，就不会破坏边界判断。
+sequence 是单调边界坐标，不是连续行号。恢复允许合法的数字空洞，不以相邻 sequence 的差值推断丢失数据。运行期 WAL append/roll 或 MemTable apply 异常进入 fatal，后续 group 不再开始提交。
 
 因此设计要求是：
 
 ```text
 必须单调递增
 不要求无空洞
-不得重复分配已成功写入 WAL 的 sequence
+不得重复分配已验证恢复或已持久化历史中的 sequence
 ```
 
 ## 6. WAL Truncate 与 Persisted Sequence
@@ -231,11 +233,13 @@ SinkSuccessMeta(snapshotId, batchId, persistedSequenceId, sstIds)
 
 当前实现中，Sink prepare/success 不再写入 WAL，而是写入独立 `SinkMeta` 文件。prepare meta 记录本次 sink 覆盖的 `sstIds`、`minSequenceId/maxSequenceId`、prepared commit payload 与外部 file refs；success meta 确认 `persistedSequenceId` 与 `sstIds`。SST 是否 sinked 由 success meta 中的 `sstIds` 与 `persistedSequenceId` 推导，不再依赖 WAL 控制记录。详见 [pms-recovery-metadata.md](pms-recovery-metadata.md)。
 
-安全截断条件应变为：
+按 WAL 文件编号升序回收安全前缀，条件为：
 
 ```text
-walFile.maxSequenceId <= persistedSequenceId
+walFile.highWatermark <= persistedSequenceId
 ```
+
+`highWatermark` 包含文件头与完整 DATA 的最大 sequence，合法空头也参与回收。遇 current 文件、首个不可回收项或首删失败立即停止，避免形成文件号缺口。
 
 `snapshotId` 只能证明 Paimon 外部提交存在，不能单独表达 PMS 内部覆盖边界；因此 WAL 文件删除应以 PMS 内部 `persistedSequenceId` 判断。
 

@@ -212,57 +212,62 @@ CRC32C = masked CRC32C(ChunkType + Payload)
 ```
 
 ```
-PMS 应用层 Payload（由 WALManager 序列化/反序列化）：
+PMS 文件头（每个文件的首个 FULL 逻辑记录，20 bytes）：
+magic("PMS\0", 4) + reserved(8, 必须为 0) + lastSequenceId(8)
 
-DATA:
-┌────────────┬──────────┬──────────┬────────────┬──────────┐
-│ sequenceId │ keyLen   │ key      │ valueLen   │ value    │
-│ (8 byte)   │ (4 byte) │ (N byte) │ (4 byte)   │ (M byte) │
-└────────────┴──────────┴──────────┴────────────┴──────────┘
-  valueLen > 0  → Upsert（value 为 serialized InternalRow）
-  valueLen = 0  → 保留/非法行编码（不表示 tombstone 或业务 NULL）
-  valueLen = -1 → Delete（无 value 字段）
+DATA_BATCH（一个完整逻辑记录）：
+recordType(1, 0x42) + sequenceBegin(8) + count(4)
+重复 count 次：keyLen(4) + key(N) + valueLen(4) + value(M)
+
+整数使用 little-endian。第 i 条记录的 sequenceId = sequenceBegin + i。
+valueLen >= 0 -> Upsert，value 为 opaque bytes
+valueLen = -1 -> Delete，无 value bytes
 ```
+
+WAL 仅接受 DATA_BATCH，不兼容旧的无类型单条 DATA 编码。一个逻辑记录可能包含合批后的多个请求；恢复时必须先验证整个 batch，再回放其中的记录。core 不解码行内容；空 value 不表示 tombstone，行编码约束由 codec/调用方负责。
 
 **接口**：
 
 ```java
 interface WALManager {
-    // 写入数据记录（Upsert: value 为 serialized InternalRow; Delete: value 为 null）
+    // 启动时调用一次；boundary 为可信 flush/sink sequence 边界的最大值。
+    // callback 必须暂存结果，recover 成功后才允许发布。
+    void recover(long durableSequenceId, ReplayCallback callback) throws IOException;
+
     long appendDataRecord(byte[] key, byte[] value);
-
+    long appendDataRecords(List<DataWrite> writes);
     long lastSequenceId();
-
-    // 恢复重放
-    void replay(ReplayCallback callback);
-
-    // 截断（清理已确认提交的旧日志）
     void truncate(long safeSequenceId);
-
-    // 关闭（刷盘缓冲区）
     void close();
-}
 
-interface ReplayCallback {
-    void onDataRecord(byte[] key, byte[] value);
-    default void onDataRecord(long sequenceId, byte[] key, byte[] value) { ... }
+    record DataWrite(byte[] key, byte[] value) {}
 }
 ```
 
-**WAL 文件管理**：
-- 按固定大小滚动（默认 256MB 一个文件）。
-- 每个文件的第一条记录是文件头部，格式为 `magic(4 bytes, "PMS\0") + reserved(8 bytes) + lastSequenceId(8 bytes, 文件创建时的全局 sequence 水位)`。头部记录作为普通 WAL 记录写入（经 LevelDB 传输层封装），而非文件级独立 header。
-- WALManager 扫描文件头和 DATA 记录恢复 `lastSequenceId`，新写入从 `max(sequenceId) + 1` 继续分配；即使旧 WAL 文件被截断，当前空 WAL 文件的头部也能保留 sequence 水位。
+**WAL 文件管理与回收**：
 
-**WAL 截断策略**：
-- 安全截断条件：SinkMeta 中存在已成功提交的 `persistedSequenceId`。
-- 截断时删除所有 `maxSequenceId <= persistedSequenceId` 的 WAL 文件，正在写入的文件永不删除。
-- 截断触发：当前在 sink success 或 recovered prepare commit 后即时触发；后续可增加 server scheduler 定期补偿和 WAL 配额水位触发。
+- 文件按专用编号递增，默认约 256 MiB 滚动。首个文件不必从 1 开始，保留集合内部编号必须连续。
+- 文件头记录创建时的 sequence 水位；相邻文件的 header 水位必须等于前文件完整记录的结束水位。DATA sequence 单调递增，允许数字空洞。
+- 恢复结果不得落后于可信 flush/sink 边界；最老保留文件 header 之前的历史必须由可信持久化状态覆盖。不能只取 metadata 最大值来掩盖丢失的 WAL。
+- 回收按编号升序，只删除 `highWatermark <= lastPersistedSequenceId` 的安全前缀。`highWatermark` 包含文件头和完整 DATA 的最大 sequence；合法 header-only 和水位为 0 的文件也参与回收。
+- 遇到 current 文件、首个不可回收文件或首个删除失败立即停止。删除失败保留候选以便重试，不回滚已经成功的 Sink；current 文件始终保留 sequence 水位。
+- 当前在 sink success 或 recovered prepare commit 后触发回收。回收与 append 仍沿用现有 monitor 串行，不并发删除日志文件。
 
-**WAL 恢复时校验**：
-- 传输层：由 LevelDB LogReader 逐 chunk 校验 CRC32C。尾部不完整 chunk 自动截断，中间 chunk 校验失败报告损坏。
-- 应用层：解析 PMS Payload 时校验 sequenceId、keyLen/valueLen 范围。
-- 中间记录校验失败 → 磁盘损坏 → 报错，人工介入（V1 单盘无法从备盘恢复）。
+**WAL 恢复规则**：
+
+| 情况 | 行为 |
+|---|---|
+| 完整合法文件、合法 header-only 文件 | 正常回放 |
+| 最新文件头有效，末条 DATA 的物理 header/body 或分片未完成 | 丢弃整个未完成 batch |
+| 最新文件合法 chunk 边界后的连续全零后缀 | 验证直到 EOF 都为零后，按预分配尾部处理；未完成 batch 整体丢弃 |
+| 完整 chunk CRC 错、非法类型/分片顺序、完整 batch 内容非法 | 启动失败，即使位于最新文件末尾 |
+| 零字节/短头/错误 magic、旧文件半写或零后缀、内部文件缺口、水位矛盾、读取失败 | 启动失败 |
+
+恢复只读校验全部输入后，才整理允许的最新尾部：截断到最后完整逻辑记录的结束位置并 `force(true)`，然后创建新 writer。输入校验或尾部整理失败不创建后继文件；新 writer 使用 CREATE_NEW，不能覆盖已有文件。物理 block 最后不足 7 字节的零 padding 单独按格式处理，零段后的非零数据不能跳过。
+
+V1 以有限的正常中断形态支持进程恢复，不自动抢救损坏文件。文件创建后 header 尚未写完的窗口可能需要人工处理。CRC 错误不因位于尾部而获得豁免，mmap 半写表现为完整长度 CRC 错时同样失败。
+
+当前格式没有持久化的已完成长度或 WAL manifest，因此不能识别所有整文件/有效后缀删除，也不能证明每个 EOF 半写都来自正常中断。DATA 保持 `force=false`，不承诺每次 ACK 抵御机器掉电。新增完整性校验在启动路径执行；写入端仅补全短写并传播 append/roll I/O 错误，不增加逐请求 fsync 或行内容校验。
 
 ### 3.4 SinkManager 与 Paimon Sink
 

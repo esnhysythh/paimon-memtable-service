@@ -64,11 +64,14 @@ class WALManagerImplTest {
     record DataRecord(long sequenceId, byte[] key, byte[] value) {}
 
     private CollectingCallback writeCloseAndReplay(WALManagerImpl writer, int walFileSizeMb) throws IOException {
+        return writeCloseAndReplay(writer, walFileSizeMb, 0);
+    }
+
+    private CollectingCallback writeCloseAndReplay(WALManagerImpl writer, int walFileSizeMb, long boundary) throws IOException {
         writer.close();
         WALManagerImpl reader = new WALManagerImpl(config(walFileSizeMb));
-        reader.init();
         CollectingCallback cb = new CollectingCallback();
-        reader.replay(cb);
+        reader.recover(boundary, cb);
         reader.close();
         return cb;
     }
@@ -76,7 +79,7 @@ class WALManagerImplTest {
     @Test
     void appendAndReplayDataRecord() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         long sequenceId = wal.appendDataRecord("key1".getBytes(), "value1".getBytes());
 
         CollectingCallback cb = writeCloseAndReplay(wal, 256);
@@ -91,7 +94,7 @@ class WALManagerImplTest {
     @Test
     void appendDataRecordReturnsIncreasingSequenceIds() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         try {
             assertEquals(1L, wal.appendDataRecord("k1".getBytes(), "v1".getBytes()));
             assertEquals(2L, wal.appendDataRecord("k2".getBytes(), "v2".getBytes()));
@@ -104,7 +107,7 @@ class WALManagerImplTest {
     @Test
     void appendDataRecordsWritesSingleBatchWithContiguousSequenceIds() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         long sequenceBegin = wal.appendDataRecords(List.of(
             new WALManager.DataWrite("k1".getBytes(), "v1".getBytes()),
             new WALManager.DataWrite("k2".getBytes(), null),
@@ -127,7 +130,7 @@ class WALManagerImplTest {
     @Test
     void mmapWriterAppendAndReplayDataRecord() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256, true));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.appendDataRecord("key1".getBytes(), "value1".getBytes());
 
         CollectingCallback cb = writeCloseAndReplay(wal, 256);
@@ -140,7 +143,7 @@ class WALManagerImplTest {
     @Test
     void appendAndReplayDelete() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.appendDataRecord("key1".getBytes(), null);
 
         CollectingCallback cb = writeCloseAndReplay(wal, 256);
@@ -152,7 +155,7 @@ class WALManagerImplTest {
     @Test
     void multipleDataRecordsReplayInOrder() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         for (int i = 0; i < 100; i++) {
             wal.appendDataRecord(("key" + i).getBytes(), ("val" + i).getBytes());
         }
@@ -170,7 +173,7 @@ class WALManagerImplTest {
     @Test
     void fileRolling() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(1));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
 
         byte[] largeValue = new byte[64 * 1024];
         Arrays.fill(largeValue, (byte) 'X');
@@ -186,7 +189,7 @@ class WALManagerImplTest {
     @Test
     void truncateRemovesFilesCoveredByPersistedSequence() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(1));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
 
         byte[] padding = new byte[1100 * 1024];
@@ -196,7 +199,7 @@ class WALManagerImplTest {
         wal.appendDataRecord("k2".getBytes(), "v2".getBytes());
         wal.truncate(2L);
 
-        CollectingCallback cb = writeCloseAndReplay(wal, 1);
+        CollectingCallback cb = writeCloseAndReplay(wal, 1, 2);
 
         boolean hasK1 = cb.dataRecords.stream().anyMatch(r -> Arrays.equals(r.key(), "k1".getBytes()));
         boolean hasK2 = cb.dataRecords.stream().anyMatch(r -> Arrays.equals(r.key(), "k2".getBytes()));
@@ -207,7 +210,7 @@ class WALManagerImplTest {
     @Test
     void failedWalDeletionRemainsEligibleForLaterTruncate() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(1));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         Path firstWal = tempDir.resolve("wal-000001.log");
         Path blocker = firstWal.resolve("blocker");
         try {
@@ -237,7 +240,7 @@ class WALManagerImplTest {
     @Test
     void truncateNeverDeletesCurrentFile() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
 
         wal.truncate(200L);
@@ -249,14 +252,13 @@ class WALManagerImplTest {
     @Test
     void initRecoversExistingFiles() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
         wal.close();
 
         WALManagerImpl recovered = new WALManagerImpl(config(256));
-        recovered.init();
         CollectingCallback cb = new CollectingCallback();
-        recovered.replay(cb);
+        recovered.recover(0, cb);
         recovered.close();
 
         assertEquals(1, cb.dataRecords.size());
@@ -266,13 +268,13 @@ class WALManagerImplTest {
     @Test
     void sequenceIdContinuesAfterRestart() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         assertEquals(1L, wal.appendDataRecord("k1".getBytes(), "v1".getBytes()));
         assertEquals(2L, wal.appendDataRecord("k2".getBytes(), "v2".getBytes()));
         wal.close();
 
         WALManagerImpl recovered = new WALManagerImpl(config(256));
-        recovered.init();
+        recovered.recover(0, (k, v) -> {});
         try {
             assertEquals(2L, recovered.lastSequenceId());
             assertEquals(3L, recovered.appendDataRecord("k3".getBytes(), "v3".getBytes()));
@@ -285,7 +287,7 @@ class WALManagerImplTest {
     void sequenceIdContinuesAfterTruncatingPreviousDataFiles() throws IOException {
         PMSConfig cfg = config(1);
         WALManagerImpl wal = new WALManagerImpl(cfg);
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         assertEquals(1L, wal.appendDataRecord("k1".getBytes(), "v1".getBytes()));
 
         byte[] padding = new byte[1100 * 1024];
@@ -295,7 +297,7 @@ class WALManagerImplTest {
         wal.close();
 
         WALManagerImpl recovered = new WALManagerImpl(cfg);
-        recovered.init();
+        recovered.recover(2, (k, v) -> {});
         try {
             assertEquals(2L, recovered.lastSequenceId());
             assertEquals(3L, recovered.appendDataRecord("k2".getBytes(), "v2".getBytes()));
@@ -307,7 +309,7 @@ class WALManagerImplTest {
     @Test
     void appendAfterCloseThrows() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.close();
 
         assertThrows(IllegalStateException.class,
@@ -317,7 +319,7 @@ class WALManagerImplTest {
     @Test
     void emptyWalReplayReturnsNothing() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
 
         CollectingCallback cb = writeCloseAndReplay(wal, 256);
 
@@ -327,15 +329,14 @@ class WALManagerImplTest {
     @Test
     void replayReturnsAllDataRecords() throws IOException {
         WALManagerImpl wal = new WALManagerImpl(config(256));
-        wal.init();
+        wal.recover(0, (k, v) -> {});
         wal.appendDataRecord("k1".getBytes(), "v1".getBytes());
         wal.appendDataRecord("k2".getBytes(), "v2".getBytes());
         wal.close();
 
         WALManagerImpl reader = new WALManagerImpl(config(256));
-        reader.init();
         CollectingCallback cb = new CollectingCallback();
-        reader.replay(cb);
+        reader.recover(0, cb);
         reader.close();
 
         assertEquals(2, cb.dataRecords.size());
@@ -350,20 +351,22 @@ class WALManagerImplTest {
         try {
             writer.addRecord(fileHeader(), true);
 
-            DynamicSliceOutput corrupt = new DynamicSliceOutput(12);
+            DynamicSliceOutput corrupt = new DynamicSliceOutput(25);
+            corrupt.writeByte(0x42);
             corrupt.writeLong(1L);
+            corrupt.writeInt(1);
             corrupt.writeInt(-1);
+            corrupt.writeLong(0);
             writer.addRecord(corrupt.slice(), true);
         } finally {
             writer.close();
         }
 
         WALManagerImpl reader = new WALManagerImpl(config(256));
-        reader.init();
         try {
-            RuntimeException error = assertThrows(RuntimeException.class,
-                () -> reader.replay(new CollectingCallback()));
-            assertTrue(error.getMessage().contains("Corrupt WAL record"));
+            IOException error = assertThrows(IOException.class,
+                () -> reader.recover(0, new CollectingCallback()));
+            assertTrue(error.getMessage().contains("INVALID_FORMAT"));
         } finally {
             reader.close();
         }

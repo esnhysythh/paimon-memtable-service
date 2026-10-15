@@ -4,10 +4,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.ClosedChannelException;
-import java.nio.channels.FileChannel;
-import java.nio.channels.GatheringByteChannel;
-import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.Arrays;
 
@@ -157,14 +153,6 @@ public final class Slice
         out.write(data, index, length);
     }
 
-    public int getBytes(int index, GatheringByteChannel out, int length)
-            throws IOException
-    {
-        checkPositionIndexes(index, index + length, this.length);
-        index += offset;
-        return out.write(ByteBuffer.wrap(data, index, length));
-    }
-
     public void setShort(int index, int value)
     {
         checkPositionIndexes(index, index + SIZE_OF_SHORT, this.length);
@@ -244,72 +232,6 @@ public final class Slice
             index += localReadBytes;
             length -= localReadBytes;
         } while (length > 0);
-
-        return readBytes;
-    }
-
-    public int setBytes(int index, ScatteringByteChannel in, int length)
-            throws IOException
-    {
-        checkPositionIndexes(index, index + length, this.length);
-        index += offset;
-        ByteBuffer buf = ByteBuffer.wrap(data, index, length);
-        int readBytes = 0;
-
-        do {
-            int localReadBytes;
-            try {
-                localReadBytes = in.read(buf);
-            }
-            catch (ClosedChannelException e) {
-                localReadBytes = -1;
-            }
-            if (localReadBytes < 0) {
-                if (readBytes == 0) {
-                    return -1;
-                }
-                else {
-                    break;
-                }
-            }
-            else if (localReadBytes == 0) {
-                break;
-            }
-            readBytes += localReadBytes;
-        } while (readBytes < length);
-
-        return readBytes;
-    }
-
-    public int setBytes(int index, FileChannel in, int position, int length)
-            throws IOException
-    {
-        checkPositionIndexes(index, index + length, this.length);
-        index += offset;
-        ByteBuffer buf = ByteBuffer.wrap(data, index, length);
-        int readBytes = 0;
-
-        do {
-            int localReadBytes;
-            try {
-                localReadBytes = in.read(buf, position + readBytes);
-            }
-            catch (ClosedChannelException e) {
-                localReadBytes = -1;
-            }
-            if (localReadBytes < 0) {
-                if (readBytes == 0) {
-                    return -1;
-                }
-                else {
-                    break;
-                }
-            }
-            else if (localReadBytes == 0) {
-                break;
-            }
-            readBytes += localReadBytes;
-        } while (readBytes < length);
 
         return readBytes;
     }
